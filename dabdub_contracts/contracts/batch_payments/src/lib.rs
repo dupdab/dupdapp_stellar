@@ -2,7 +2,9 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, vec, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Vec,
+};
 
 const MAX_BATCH_SIZE: u32 = 20;
 
@@ -31,7 +33,8 @@ pub struct PaymentInput {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PaymentRecord {
-    /// Unique payment ID (32-byte hash derived from ledger sequence + index).
+    /// Unique payment ID (32-byte hash derived from merchant, a per-contract
+    /// counter, and the payment's contents — see issue #1024).
     pub id: BytesN<32>,
     pub amount: i128,
     pub memo: String,
@@ -134,6 +137,16 @@ impl BatchPaymentContract {
         let mut payment_ids: Vec<BytesN<32>> = vec![&env];
         let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap();
 
+        // Issue #1024: a monotonically increasing per-contract counter,
+        // hashed together with the merchant and payment contents, so two
+        // merchants (or the same merchant twice) landing in the same ledger
+        // can never derive the same payment ID.
+        let mut counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Counter)
+            .unwrap_or(0u64);
+
         for i in 0..count {
             let item = payments.get(i).unwrap();
 
@@ -161,6 +174,11 @@ impl BatchPaymentContract {
         env.storage().instance().set(&DataKey::Counter, &final_counter);
 
         payment_ids
+    }
+
+    /// Returns the on-chain record for a previously created payment, if any.
+    pub fn get_payment(env: Env, id: BytesN<32>) -> Option<PaymentRecord> {
+        env.storage().persistent().get(&DataKey::Payment(id))
     }
 
     /// Returns the maximum allowed batch size.

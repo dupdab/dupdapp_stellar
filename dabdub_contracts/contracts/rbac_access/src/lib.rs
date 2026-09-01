@@ -41,6 +41,7 @@ pub struct RbacAccessContract;
 #[contractimpl]
 impl RbacAccessContract {
     pub fn __constructor(env: Env, super_admin: Address) {
+        // Issue #1026: Store roles in persistent() instead of instance()
         env.storage()
             .persistent()
             .set(&DataKey::Role(super_admin), &Role::SuperAdmin);
@@ -178,6 +179,7 @@ impl RbacAccessContract {
     }
 
     fn require_role(env: &Env, caller: &Address, minimum_role: Role) {
+        // Issue #1026: Use persistent() instead of instance()
         let caller_role = env
             .storage()
             .persistent()

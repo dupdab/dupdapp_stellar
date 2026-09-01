@@ -383,6 +383,17 @@ impl PaymentEscrowContract {
         );
     }
 
+    /// Opens a dispute on a payment still in `Pending` status.
+    ///
+    /// Note (#1023): `release_partial` keeps a payment `Pending` until it is
+    /// fully released, so a payment that already had one or more partial
+    /// releases sent to the merchant can still be disputed here. This is
+    /// intentional: `resolve_dispute` only ever moves `remaining_amount()`
+    /// (`amount - released_amount`) to the winner, so a customer disputing
+    /// after accepting partial delivery recovers only the undelivered
+    /// remainder — funds already released to the merchant are not clawed
+    /// back. See `test_dispute_after_partial_release_resolves_to_customer`
+    /// and `test_dispute_after_partial_release_resolves_to_merchant`.
     pub fn dispute(env: Env, caller: Address, payment_id: BytesN<32>, _reason: String) {
         caller.require_auth();
 
