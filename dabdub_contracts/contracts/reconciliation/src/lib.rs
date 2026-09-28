@@ -4,6 +4,8 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
 
+const MAX_PROOF_DEPTH: u32 = 64;
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MerkleProofNode {
@@ -133,6 +135,7 @@ impl ReconciliationContract {
         payment_id: BytesN<32>,
         proof: Vec<MerkleProofNode>,
     ) -> bool {
+        Self::require_proof_depth(&proof);
         let batch: ReconciliationBatch = env
             .storage()
             .persistent()
@@ -151,7 +154,9 @@ impl ReconciliationContract {
     /// Both behaviours are preserved for existing callers. New integrations
     /// should use [`Self::verify_settlement_proof`], which takes the batch ID
     /// the proof was generated against and returns `true` for a valid proof.
+    #[deprecated(note = "inverted return value — use verify_settlement_proof instead")]
     pub fn verify_settlement(env: Env, payment_id: BytesN<32>, proof: Vec<MerkleProofNode>) -> bool {
+        Self::require_proof_depth(&proof);
         let batch: ReconciliationBatch = env
             .storage()
             .instance()
@@ -194,6 +199,25 @@ impl ReconciliationContract {
             .unwrap_or(0)
     }
 
+    /// Permanently archives batches with IDs below `before_batch_id`, bounded
+    /// by `max_batches` so retention can be applied incrementally. Current and
+    /// newer batches remain available for proof verification.
+    pub fn archive_batches(env: Env, caller: Address, before_batch_id: u32, max_batches: u32) -> u32 {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let upper = before_batch_id.min(Self::batch_count(env.clone()));
+        let mut archived = 0;
+        for batch_id in 0..upper {
+            if archived >= max_batches { break; }
+            let key = DataKey::Batch(batch_id);
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+                archived += 1;
+            }
+        }
+        archived
+    }
+
     /// Walks `proof` up from the leaf for `payment_id` and returns the root it
     /// computes. Shared by both verifiers so they cannot drift apart.
     fn compute_root(
@@ -211,6 +235,10 @@ impl ReconciliationContract {
             };
         }
         current
+    }
+
+    fn require_proof_depth(proof: &Vec<MerkleProofNode>) {
+        if proof.len() > MAX_PROOF_DEPTH { panic!("proof too long"); }
     }
 
     fn require_admin(env: &Env, caller: &Address) {

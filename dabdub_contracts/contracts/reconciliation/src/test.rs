@@ -286,3 +286,28 @@ fn test_current_batch_still_tracks_the_latest_submission() {
     // Existing callers of get_current_batch see no behaviour change.
     assert_eq!(client.get_current_batch().unwrap().merkle_root, newest);
 }
+
+#[test]
+fn test_archive_batches_removes_only_old_history() {
+    let (env, client, admin) = setup_env();
+    client.submit_merkle_root(&admin, &make_id(&env, 1));
+    client.submit_merkle_root(&admin, &make_id(&env, 2));
+    client.submit_merkle_root(&admin, &make_id(&env, 3));
+    assert_eq!(client.archive_batches(&admin, &2, &10), 2);
+    assert!(client.get_batch(&0).is_none());
+    assert!(client.get_batch(&1).is_none());
+    assert!(client.get_batch(&2).is_some());
+}
+
+#[test]
+#[should_panic(expected = "proof too long")]
+fn test_verify_settlement_proof_rejects_excessive_depth() {
+    let (env, client, admin) = setup_env();
+    let payment = make_id(&env, 80);
+    let root = hash_leaf(&env, &payment);
+    let batch = client.submit_merkle_root(&admin, &root);
+    let node = MerkleProofNode { sibling: make_id(&env, 81), is_left: false };
+    let mut proof = vec![&env];
+    for _ in 0..65 { proof.push_back(node.clone()); }
+    client.verify_settlement_proof(&batch, &payment, &proof);
+}

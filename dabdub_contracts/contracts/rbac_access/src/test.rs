@@ -98,3 +98,17 @@ fn test_super_admin_can_revoke_role() {
     client.revoke_role(&super_admin, &compliance_admin);
     assert_eq!(client.get_role(&compliance_admin), None);
 }
+
+#[test]
+fn test_super_admin_count_tracks_grant_revoke_and_transfer() {
+    let (env, client, super_admin, operations_admin, compliance_admin, _read_only) = setup_env();
+    assert_eq!(client.get_super_admin_count(), 1);
+    client.grant_role(&super_admin, &operations_admin, &Role::SuperAdmin);
+    assert_eq!(client.get_super_admin_count(), 2);
+    client.revoke_role(&super_admin, &operations_admin);
+    assert_eq!(client.get_super_admin_count(), 1);
+    client.transfer_super_admin(&super_admin, &compliance_admin);
+    assert_eq!(client.get_super_admin_count(), 1);
+    assert_eq!(client.get_role(&compliance_admin), Some(Role::SuperAdmin));
+    let _ = env;
+}
