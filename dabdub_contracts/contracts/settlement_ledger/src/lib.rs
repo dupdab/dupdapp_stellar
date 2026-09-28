@@ -21,6 +21,16 @@ pub struct SettlementRecord {
     pub fiat_ref: String, // bank / fiat-rail reference ID
 }
 
+/// An append-only correction marker. The original settlement remains readable
+/// and auditable; consumers must exclude voided records from financial totals.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SettlementVoid {
+    pub payment_id: BytesN<32>,
+    pub reason: String,
+    pub voided_at: u64,
+}
+
 #[contracttype]
 enum DataKey {
     Admin,
@@ -28,6 +38,10 @@ enum DataKey {
     Settlement(BytesN<32>),
     /// Vec<BytesN<32>> — ordered list of payment_ids per merchant
     MerchantIndex(Address),
+    /// Vec<BytesN<32>> — platform-wide ordered settlement IDs.
+    AllIndex,
+    /// A void marker keyed by the original payment ID; never overwrites it.
+    Void(BytesN<32>),
 }
 
 // ── events ───────────────────────────────────────────────────────────────────
@@ -99,6 +113,14 @@ impl SettlementLedgerContract {
         index.push_back(payment_id.clone());
         env.storage().persistent().set(&idx_key, &index);
 
+        let mut all: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllIndex)
+            .unwrap_or_else(|| vec![&env]);
+        all.push_back(payment_id.clone());
+        env.storage().persistent().set(&DataKey::AllIndex, &all);
+
         env.events().publish(
             ("SETTLEMENT_LEDGER", "settlement_recorded"),
             SettlementRecordedEvent {
@@ -118,6 +140,23 @@ impl SettlementLedgerContract {
             .persistent()
             .get(&DataKey::Settlement(payment_id))
             .expect("settlement not found")
+    }
+
+    /// Marks a settlement as void without mutating or deleting the original
+    /// immutable record. A corrected settlement must be recorded under a new
+    /// payment ID and can reference this one in its fiat reference.
+    pub fn void_settlement(env: Env, caller: Address, payment_id: BytesN<32>, reason: String) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        assert!(env.storage().persistent().has(&DataKey::Settlement(payment_id.clone())), "settlement not found");
+        let key = DataKey::Void(payment_id.clone());
+        assert!(!env.storage().persistent().has(&key), "settlement already voided");
+        env.storage().persistent().set(&key, &SettlementVoid { payment_id, reason, voided_at: env.ledger().timestamp() });
+    }
+
+    /// Returns the void marker for a settlement, if it was corrected.
+    pub fn get_settlement_void(env: Env, payment_id: BytesN<32>) -> Option<SettlementVoid> {
+        env.storage().persistent().get(&DataKey::Void(payment_id))
     }
 
     /// Paginated list of settlement records for a merchant.
@@ -158,6 +197,25 @@ impl SettlementLedgerContract {
             .get::<_, Vec<BytesN<32>>>(&idx_key)
             .map(|v| v.len())
             .unwrap_or(0)
+    }
+
+    /// Paginated platform-wide settlement list. This avoids off-chain event
+    /// reconstruction for accounting while retaining the merchant index.
+    pub fn list_all_settlements(env: Env, page: u32) -> Vec<SettlementRecord> {
+        let index: Vec<BytesN<32>> = env.storage().persistent().get(&DataKey::AllIndex).unwrap_or_else(|| vec![&env]);
+        let start = page.saturating_mul(PAGE_SIZE);
+        if start >= index.len() { return vec![&env]; }
+        let end = (start + PAGE_SIZE).min(index.len());
+        let mut results = vec![&env];
+        for i in start..end {
+            let payment_id = index.get(i).unwrap();
+            results.push_back(env.storage().persistent().get(&DataKey::Settlement(payment_id)).unwrap());
+        }
+        results
+    }
+
+    pub fn total_settlement_count(env: Env) -> u32 {
+        env.storage().persistent().get::<_, Vec<BytesN<32>>>(&DataKey::AllIndex).map(|index| index.len()).unwrap_or(0)
     }
 
     fn require_admin(env: &Env, caller: &Address) {
