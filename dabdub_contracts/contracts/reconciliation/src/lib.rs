@@ -65,6 +65,13 @@ impl ReconciliationContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
+    /// Transfers reconciliation authority to `new_admin`.
+    pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
     /// Records a new reconciliation batch and returns the ID it was stored
     /// under.
     ///
@@ -87,11 +94,7 @@ impl ReconciliationContract {
             submitted_ledger: env.ledger().sequence(),
         };
 
-        let batch_id: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextBatchId)
-            .unwrap_or(0);
+        let batch_id = Self::latest_batch_id(&env).map(|id| id + 1).unwrap_or(0);
 
         env.storage().persistent().set(&DataKey::Batch(batch_id), &batch);
         env.storage().instance().set(&DataKey::CurrentBatch, &batch);
@@ -175,11 +178,7 @@ impl ReconciliationContract {
     /// The ID is what a caller needs in order to verify a proof against this
     /// root later, once further batches have been submitted.
     pub fn get_latest_stored_batch(env: Env) -> Option<StoredBatch> {
-        let next_id: u32 = env.storage().instance().get(&DataKey::NextBatchId)?;
-        if next_id == 0 {
-            return None;
-        }
-        let batch_id = next_id - 1;
+        let batch_id = Self::latest_batch_id(&env)?;
         env.storage()
             .persistent()
             .get(&DataKey::Batch(batch_id))
@@ -196,6 +195,11 @@ impl ReconciliationContract {
 
     /// Walks `proof` up from the leaf for `payment_id` and returns the root it
     /// computes. Shared by both verifiers so they cannot drift apart.
+    fn latest_batch_id(env: &Env) -> Option<u32> {
+        let next_id: u32 = env.storage().instance().get(&DataKey::NextBatchId)?;
+        next_id.checked_sub(1)
+    }
+
     fn compute_root(
         env: &Env,
         payment_id: &BytesN<32>,
@@ -220,12 +224,12 @@ impl ReconciliationContract {
         }
     }
 
-    fn hash_leaf(env: &Env, payment_id: &BytesN<32>) -> BytesN<32> {
+    pub(crate) fn hash_leaf(env: &Env, payment_id: &BytesN<32>) -> BytesN<32> {
         let id_arr = payment_id.to_array();
         env.crypto().sha256(&Bytes::from_slice(env, &id_arr)).into()
     }
 
-    fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+    pub(crate) fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
         let left_arr = left.to_array();
         let right_arr = right.to_array();
 

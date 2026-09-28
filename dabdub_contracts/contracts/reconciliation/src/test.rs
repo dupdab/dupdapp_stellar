@@ -5,7 +5,7 @@ use crate::{
 };
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    vec, Address, Bytes, BytesN, Env, IntoVal, TryFromVal,
+    vec, Address, BytesN, Env, IntoVal, TryFromVal,
 };
 
 fn setup_env() -> (Env, ReconciliationContractClient<'static>, Address) {
@@ -23,20 +23,8 @@ fn make_id(env: &Env, seed: u8) -> BytesN<32> {
     BytesN::from_array(env, &[seed; 32])
 }
 
-fn hash_leaf(env: &Env, payment_id: &BytesN<32>) -> BytesN<32> {
-    let arr = payment_id.to_array();
-    env.crypto().sha256(&Bytes::from_slice(env, &arr)).into()
-}
-
-fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
-    let left_arr = left.to_array();
-    let right_arr = right.to_array();
-
-    let mut combined = [0u8; 64];
-    combined[..32].copy_from_slice(&left_arr);
-    combined[32..].copy_from_slice(&right_arr);
-    env.crypto().sha256(&Bytes::from_slice(env, &combined)).into()
-}
+fn hash_leaf(env: &Env, payment_id: &BytesN<32>) -> BytesN<32> { ReconciliationContract::hash_leaf(env, payment_id) }
+fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> { ReconciliationContract::hash_pair(env, left, right) }
 
 #[test]
 fn test_admin_can_submit_merkle_root_and_store_batch() {
@@ -111,6 +99,14 @@ fn test_non_admin_cannot_submit_merkle_root() {
     let random = Address::generate(&env);
     let root = make_id(&env, 42);
     client.submit_merkle_root(&random, &root);
+}
+
+#[test]
+fn test_admin_can_transfer_admin() {
+    let (env, client, admin) = setup_env();
+    let new_admin = Address::generate(&env);
+    client.transfer_admin(&admin, &new_admin);
+    client.submit_merkle_root(&new_admin, &make_id(&env, 9));
 }
 
 #[test]
@@ -217,6 +213,16 @@ fn test_verify_settlement_proof_returns_true_for_a_valid_proof() {
 
     // Note the polarity: true means verified, unlike `verify_settlement`.
     assert!(client.verify_settlement_proof(&batch_id, &payment_a, &proof));
+}
+
+#[test]
+fn test_verify_settlement_proof_single_leaf_empty_proof() {
+    let (env, client, admin) = setup_env();
+    let payment = make_id(&env, 77);
+    let root = hash_leaf(&env, &payment);
+    let batch_id = client.submit_merkle_root(&admin, &root);
+    let proof = vec![&env];
+    assert!(client.verify_settlement_proof(&batch_id, &payment, &proof));
 }
 
 #[test]
