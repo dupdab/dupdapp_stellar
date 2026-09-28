@@ -67,6 +67,20 @@ fn test_record_and_get() {
     assert_eq!(r.timestamp, 1_700_000_000u64);
 }
 
+// ── administration ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_admin_rotation_allows_new_admin_to_record() {
+    let (env, admin, client) = setup();
+    let new_admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    client.transfer_admin(&admin, &new_admin);
+    record(&client, &new_admin, &env, 5, &merchant, 10_000, 200);
+
+    assert_eq!(client.settlement_count(&merchant), 1);
+}
+
 // ── immutability: duplicate write must panic ──────────────────────────────────
 
 #[test]
