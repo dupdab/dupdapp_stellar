@@ -57,6 +57,7 @@ enum DataKey {
     ConfirmationCount,          // required ledger-close count (u32)
     PaymentConfs(BytesN<32>),   // confirmed count so far for a payment (u32)
     PaymentFirstLedger(BytesN<32>), // ledger_seq of the first confirmation
+    PaymentLastLedger(BytesN<32>),  // ledger_seq of the most recent confirmation
     PaymentSettling(BytesN<32>),    // bool — already transitioned
     PaymentEscrowContract,      // Address of the payment_escrow contract (optional)
 }
@@ -125,6 +126,15 @@ impl StellarConfirmationsContract {
             assert!(payment.merchant == merchant, "merchant mismatch with payment_escrow record");
         }
 
+        // Guard: ledger_seq must not be in the future relative to the actual chain state
+        assert!(ledger_seq <= env.ledger().sequence(), "ledger_seq exceeds current ledger");
+
+        // Guard: ledger_seq must not regress relative to the last one recorded for this payment
+        let last_key = DataKey::PaymentLastLedger(payment_id.clone());
+        if let Some(last_seen) = env.storage().persistent().get::<_, u32>(&last_key) {
+            assert!(ledger_seq >= last_seen, "ledger_seq precedes last recorded ledger");
+        }
+
         // Guard: already settling — idempotent no-op after threshold
         let settling_key = DataKey::PaymentSettling(payment_id.clone());
         if env.storage().persistent().get::<_, bool>(&settling_key).unwrap_or(false) {
@@ -142,6 +152,9 @@ impl StellarConfirmationsContract {
         if !env.storage().persistent().has(&first_key) {
             env.storage().persistent().set(&first_key, &ledger_seq);
         }
+
+        // Record last-seen ledger for the monotonicity check above
+        env.storage().persistent().set(&last_key, &ledger_seq);
 
         let required: u32 = env.storage().instance().get(&DataKey::ConfirmationCount).unwrap();
 
