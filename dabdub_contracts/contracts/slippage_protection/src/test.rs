@@ -114,3 +114,10 @@ fn test_non_admin_cannot_set_slippage() {
     let random = Address::generate(&env);
     client.set_max_slippage(&random, &200);
 }
+
+#[test]
+#[should_panic(expected = "bps must be <= 10000")]
+fn test_set_max_slippage_rejects_out_of_range_bps() {
+    let (_env, client, admin) = setup_env();
+    client.set_max_slippage(&admin, &10_001);
+}
