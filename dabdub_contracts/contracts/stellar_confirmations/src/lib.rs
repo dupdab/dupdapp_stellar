@@ -58,6 +58,7 @@ enum DataKey {
     PaymentConfs(BytesN<32>),   // confirmed count so far for a payment (u32)
     PaymentFirstLedger(BytesN<32>), // ledger_seq of the first confirmation
     PaymentLastLedger(BytesN<32>),  // ledger_seq of the most recent confirmation
+    PaymentRequiredConfs(BytesN<32>), // required count snapshotted at first confirmation
     PaymentSettling(BytesN<32>),    // bool — already transitioned
     PaymentEscrowContract,      // Address of the payment_escrow contract (optional)
 }
@@ -156,7 +157,19 @@ impl StellarConfirmationsContract {
         // Record last-seen ledger for the monotonicity check above
         env.storage().persistent().set(&last_key, &ledger_seq);
 
-        let required: u32 = env.storage().instance().get(&DataKey::ConfirmationCount).unwrap();
+        // Snapshot the required confirmation count at first confirmation so
+        // later admin changes to the global ConfirmationCount don't retroactively
+        // move the threshold for payments already accumulating confirmations.
+        let required_key = DataKey::PaymentRequiredConfs(payment_id.clone());
+        let required: u32 = match env.storage().persistent().get(&required_key) {
+            Some(snapshotted) => snapshotted,
+            None => {
+                let current: u32 =
+                    env.storage().instance().get(&DataKey::ConfirmationCount).unwrap();
+                env.storage().persistent().set(&required_key, &current);
+                current
+            }
+        };
 
         env.events().publish(
             ("STELLAR_CONFS", "confirmation_recorded"),
