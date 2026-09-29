@@ -115,7 +115,10 @@ impl RbacAccessContract {
             }
             env.storage()
                 .persistent()
-                .set(&DataKey::SuperAdminCount, &(count - 1));
+                .set(
+                    &DataKey::SuperAdminCount,
+                    &count.checked_sub(1).expect("SuperAdminCount underflow"),
+                );
         }
 
         env.storage().persistent().remove(&key);
@@ -133,18 +136,36 @@ impl RbacAccessContract {
     }
 
     /// Sensitive operation requiring minimum `OperationsAdmin`.
+    ///
+    /// Reference implementation of the role-gating pattern: it enforces
+    /// `require_auth()` plus the minimum role and performs no business logic.
+    /// There is intentionally no state mutation or event emission -- integrators
+    /// should model real sensitive operations on this pattern and add their own
+    /// logic after the gate.
     pub fn execute_operations_task(env: Env, caller: Address) {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::OperationsAdmin);
     }
 
     /// Sensitive operation requiring minimum `ComplianceAdmin`.
+    ///
+    /// Reference implementation of the role-gating pattern: it enforces
+    /// `require_auth()` plus the minimum role and performs no business logic.
+    /// There is intentionally no state mutation or event emission -- integrators
+    /// should model real sensitive operations on this pattern and add their own
+    /// logic after the gate.
     pub fn execute_compliance_task(env: Env, caller: Address) {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::ComplianceAdmin);
     }
 
     /// Sensitive operation requiring minimum `ReadOnly`.
+    ///
+    /// Reference implementation of the role-gating pattern: it enforces
+    /// `require_auth()` plus the minimum role and performs no business logic.
+    /// There is intentionally no state mutation or event emission -- integrators
+    /// should model real sensitive operations on this pattern and add their own
+    /// logic after the gate.
     pub fn execute_read_task(env: Env, caller: Address) {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::ReadOnly);
@@ -158,11 +179,9 @@ impl RbacAccessContract {
             panic!("cannot transfer to self");
         }
 
+        // `require_role` above already guarantees the caller has an assigned
+        // role record, so no separate existence check is needed here.
         let caller_key = DataKey::Role(caller.clone());
-        if !env.storage().persistent().has(&caller_key) {
-            panic!("caller is not an admin");
-        }
-
         env.storage()
             .persistent()
             .set(&DataKey::Role(new_admin.clone()), &Role::SuperAdmin);
