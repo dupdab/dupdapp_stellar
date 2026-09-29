@@ -21,6 +21,12 @@ struct SlippageExceededEvent {
     max_bps: u32,
 }
 
+#[contracttype]
+struct MaxSlippageUpdatedEvent {
+    old_bps: u32,
+    new_bps: u32,
+}
+
 #[contract]
 pub struct SlippageProtectionContract;
 
@@ -58,7 +64,17 @@ impl SlippageProtectionContract {
     pub fn set_max_slippage(env: Env, caller: soroban_sdk::Address, bps: u32) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+
+        let old_bps = Self::global_max_slippage(&env);
         env.storage().instance().set(&DataKey::MaxSlippageBps, &bps);
+
+        env.events().publish(
+            ("SLIPPAGE_PROTECTION", "max_slippage_set"),
+            MaxSlippageUpdatedEvent {
+                old_bps,
+                new_bps: bps,
+            },
+        );
     }
 
     /// Admin: set a per-pair override for the maximum allowed slippage in
