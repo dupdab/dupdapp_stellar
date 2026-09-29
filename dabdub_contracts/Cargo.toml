@@ -9,6 +9,23 @@ soroban-sdk = { version = "22.0.0" }
 
 [profile.release]
 opt-level = "z"
+# LOAD-BEARING: several contracts perform raw (non-`checked_`/non-`saturating_`)
+# integer arithmetic on counters that are trusted not to silently wrap around
+# in production. This is only safe because `overflow-checks = true` here
+# forces those additions/subtractions to panic on overflow/underflow instead
+# of wrapping, even though it is NOT the Soroban WASM release default.
+#
+# Contracts that rely on this today:
+#   - contracts/platform_stats/src/lib.rs: `prev + 1` (TotalMerchants),
+#     `tp + 1` (TotalPayments) and `count + 1` (rolling 24h ActiveBucket)
+#   - contracts/rbac_access/src/lib.rs: `count - 1` in `revoke_role`
+#     (SuperAdminCount)
+#
+# Do NOT remove or flip this flag (e.g. to shrink WASM size or speed up
+# builds) without first migrating the above call sites to explicit
+# `checked_add`/`checked_sub`/`saturating_*` arithmetic — otherwise these
+# counters can wrap silently with no compiler warning and no existing test
+# would catch it.
 overflow-checks = true
 debug = false
 strip = "symbols"
