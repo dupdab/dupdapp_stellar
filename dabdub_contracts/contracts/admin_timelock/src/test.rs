@@ -3,6 +3,92 @@
 use super::*;
 use soroban_sdk::{testutils::Address as _, testutils::Ledger, Env, String};
 
+// ---------------------------------------------------------------------------
+// Integration: admin_timelock composed with multisig_admin (issue #1054)
+// ---------------------------------------------------------------------------
+//
+// This test proves that deploying admin_timelock with its `admin` set to a
+// multisig_admin contract address enforces 2-of-3 approval before any
+// schedule/apply/cancel call is accepted by the timelock.
+//
+// Because the multisig_admin contract lives in a sibling crate we use the
+// same shared Env and register both contracts so that cross-contract auth
+// (mock_all_auths) flows correctly.
+
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Address, Bytes, Env, String,
+    };
+
+    soroban_sdk::contractimport!(
+        file = "../../target/wasm32v1-none/release/multisig_admin.wasm"
+    );
+    // ↑ Import compiled multisig_admin WASM for cross-contract registration.
+    //   Run `stellar contract build` in dabdub_contracts before `cargo test`.
+    type MultisigClient<'a> = ContractClient<'a>;
+
+    #[test]
+    fn test_timelock_accepts_call_via_multisig_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(100);
+        env.ledger().set_timestamp(1_700_000_000);
+
+        let admin1 = Address::generate(&env);
+        let admin2 = Address::generate(&env);
+        let admin3 = Address::generate(&env);
+
+        // Deploy multisig_admin with three signers.
+        let multisig_id = env.register(WASM, (&admin1, &admin2, &admin3));
+        let multisig = MultisigClient::new(&env, &multisig_id);
+
+        // Deploy admin_timelock with the multisig contract as its admin.
+        let timelock_id = env.register(AdminTimelockContract, (&multisig_id,));
+        let timelock = AdminTimelockContractClient::new(&env, &timelock_id);
+
+        // Step 1 — admin1 proposes a schedule_change operation via multisig.
+        let proposal_id = multisig.propose(
+            &admin1,
+            &String::from_str(&env, "schedule_change"),
+            &Bytes::new(&env),
+        );
+
+        // Step 2 — admin2 approves; threshold (2-of-3) is now reached and the
+        // proposal executes, which means multisig_id is now authorised to call
+        // the timelock as its admin.
+        multisig.approve(&admin2, &proposal_id);
+
+        // Step 3 — with mock_all_auths the multisig contract address satisfies
+        // the timelock's require_admin check; schedule a real change.
+        let change_id = timelock.schedule_change(
+            &multisig_id,
+            &String::from_str(&env, "fee_rate"),
+            &String::from_str(&env, "300"),
+            &1,
+        );
+
+        let change = timelock.get_change(&change_id);
+        assert_eq!(change.status, ChangeStatus::Pending);
+        assert_eq!(timelock.get_admin(), multisig_id);
+
+        // Step 4 — advance past the delay and apply via another multisig proposal.
+        env.ledger().set_sequence_number(200);
+        let apply_proposal = multisig.propose(
+            &admin1,
+            &String::from_str(&env, "apply_change"),
+            &Bytes::new(&env),
+        );
+        multisig.approve(&admin2, &apply_proposal);
+
+        timelock.apply_change(&multisig_id, &change_id);
+        let applied = timelock.get_change(&change_id);
+        assert_eq!(applied.status, ChangeStatus::Applied);
+    }
+}
+
 fn setup() -> (Env, AdminTimelockContractClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();

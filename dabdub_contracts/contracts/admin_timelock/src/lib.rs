@@ -1,3 +1,26 @@
+//! # admin_timelock
+//!
+//! A delay-gated change-scheduling contract. A single `Admin` address may
+//! schedule, apply, and cancel parameter changes, subject to a minimum
+//! timelock delay.
+//!
+//! ## Composing with multisig_admin
+//!
+//! Deploying this contract with its `admin` set to an EOA (externally-owned
+//! account / single key) rather than to a `multisig_admin` contract address
+//! means that one compromised private key is sufficient to schedule **and**
+//! subsequently apply any change once the delay elapses — defeating the
+//! purpose of multi-party review.
+//!
+//! **Recommended deployment**: set the `admin` constructor argument to the
+//! deployed address of a `multisig_admin` instance (2-of-3). Every call to
+//! `schedule_change`, `apply_change`, and `cancel_change` then requires a
+//! `multisig_admin` proposal to reach the 2-of-3 approval threshold before
+//! `admin_timelock` will accept it, providing the independent second check
+//! the timelock is designed to enforce.
+//!
+//! See `test.rs` for an integration test that demonstrates this composition.
+
 #![no_std]
 
 mod test;
@@ -131,6 +154,16 @@ impl AdminTimelockContract {
     }
 
     /// Execute a queued change after the delay has elapsed.
+    ///
+    /// # Important — attestation only
+    ///
+    /// This contract is a **pure attestation / signaling contract**. Calling
+    /// `apply_change` does **not** make any on-chain state change to another
+    /// contract. It flips the change status to `Applied` and emits a
+    /// `change_applied` event. Applying the actual change to a target contract
+    /// (e.g. updating `fee_calculator`'s fee tiers) is the sole responsibility
+    /// of an **external relayer** that listens for `change_applied` events and
+    /// then invokes the target contract directly.
     pub fn apply_change(env: Env, caller: Address, change_id: BytesN<32>) {
         caller.require_auth();
         Self::require_admin(&env, &caller);

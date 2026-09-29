@@ -15,6 +15,7 @@ enum DataKey {
     MinAmount,
     MaxAmount,
     Counter,
+    Payment(BytesN<32>),
 }
 
 /// A single payment input in the batch.
@@ -160,6 +161,16 @@ impl BatchPaymentContract {
                 .crypto()
                 .sha256(&seed_bytes)
                 .into();
+
+            let record = PaymentRecord {
+                id: id_bytes.clone(),
+                amount: item.amount,
+                memo: item.memo.clone(),
+                merchant: merchant.clone(),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(id_bytes.clone()), &record);
 
             // Emit PaymentCreated event — one per batch entry.
             env.events().publish(
