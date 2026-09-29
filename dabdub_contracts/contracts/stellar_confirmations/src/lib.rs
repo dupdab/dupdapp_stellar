@@ -2,7 +2,52 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, BytesN, Env, Address};
+use soroban_sdk::{
+    contract, contractclient, contractimpl, contracttype, Address, BytesN, Env, String,
+};
+
+// ── payment_escrow cross-contract interface ─────────────────────────────────
+//
+// Minimal mirror of payment_escrow's `PaymentEscrow` record and `get_payment`
+// entry point, following the same local-trait pattern liquidity_router uses
+// for its AmmClient (see contracts/liquidity_router/src/lib.rs). Field names,
+// types, and order must stay in sync with payment_escrow::PaymentEscrow.
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PaymentEscrowAssetType {
+    Xlm,
+    Usdc,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PaymentEscrowStatus {
+    Pending,
+    Disputed,
+    Released,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PaymentEscrowRecord {
+    pub payment_id: BytesN<32>,
+    pub amount: i128,
+    pub released_amount: i128,
+    pub merchant: Address,
+    pub customer: Address,
+    pub status: PaymentEscrowStatus,
+    pub expiry: u32,
+    pub dispute_window_end: u32,
+    pub dispute_reason: Option<String>,
+    pub asset_type: PaymentEscrowAssetType,
+}
+
+#[contractclient(name = "PaymentEscrowClient")]
+pub trait PaymentEscrowInterface {
+    fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrowRecord;
+}
 
 // ── storage keys ────────────────────────────────────────────────────────────
 
@@ -13,6 +58,7 @@ enum DataKey {
     PaymentConfs(BytesN<32>),   // confirmed count so far for a payment (u32)
     PaymentFirstLedger(BytesN<32>), // ledger_seq of the first confirmation
     PaymentSettling(BytesN<32>),    // bool — already transitioned
+    PaymentEscrowContract,      // Address of the payment_escrow contract (optional)
 }
 
 // ── events ───────────────────────────────────────────────────────────────────
@@ -62,6 +108,22 @@ impl StellarConfirmationsContract {
     ) -> u32 {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+
+        // Cross-contract check: if a payment_escrow contract is linked, verify
+        // `amount`/`merchant` against the real on-chain payment record for
+        // `payment_id` before recording this confirmation. This closes the gap
+        // where a compromised/malfunctioning monitor could fabricate
+        // confirmation/settlement events for arbitrary amount/merchant values.
+        if let Some(escrow_address) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::PaymentEscrowContract)
+        {
+            let escrow_client = PaymentEscrowClient::new(&env, &escrow_address);
+            let payment = escrow_client.get_payment(&payment_id);
+            assert!(payment.amount == amount, "amount mismatch with payment_escrow record");
+            assert!(payment.merchant == merchant, "merchant mismatch with payment_escrow record");
+        }
 
         // Guard: already settling — idempotent no-op after threshold
         let settling_key = DataKey::PaymentSettling(payment_id.clone());
@@ -121,6 +183,24 @@ impl StellarConfirmationsContract {
 
     pub fn get_confirmation_count(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::ConfirmationCount).unwrap()
+    }
+
+    /// Admin: link the payment_escrow contract used to cross-check
+    /// `amount`/`merchant` in `confirm_payment`. Pass `None` to unlink.
+    pub fn set_payment_escrow_contract(env: Env, caller: Address, contract: Option<Address>) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        match contract {
+            Some(addr) => env
+                .storage()
+                .instance()
+                .set(&DataKey::PaymentEscrowContract, &addr),
+            None => env.storage().instance().remove(&DataKey::PaymentEscrowContract),
+        }
+    }
+
+    pub fn get_payment_escrow_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PaymentEscrowContract)
     }
 
     pub fn get_payment_confirmations(env: Env, payment_id: BytesN<32>) -> u32 {
