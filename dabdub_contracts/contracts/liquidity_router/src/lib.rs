@@ -39,6 +39,8 @@ pub struct LiquidityRouter;
 impl LiquidityRouter {
     // Issue #1025: Constructor to initialize admin
     pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
+
         env.storage().persistent().set(&DataKey::Admin, &admin);
         let pools: Vec<Address> = Vec::new(&env);
         env.storage().persistent().set(&DataKey::ApprovedPools, &pools);
