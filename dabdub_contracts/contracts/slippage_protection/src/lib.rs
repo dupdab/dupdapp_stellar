@@ -52,11 +52,17 @@ impl SlippageProtectionContract {
             expected - actual
         };
 
-        let deviation_bps = diff
+        let deviation_bps_i128 = diff
             .checked_mul(10_000)
             .expect("overflow")
             .checked_div(expected)
-            .expect("div by zero") as u32;
+            .expect("div by zero");
+
+        // Saturate instead of truncating-casting: an i128 deviation that
+        // overflows u32 is always far beyond any sane max_bps, so clamping
+        // to u32::MAX preserves the "reject extreme deviation" behavior
+        // instead of silently wrapping into a small, passable value.
+        let deviation_bps: u32 = deviation_bps_i128.try_into().unwrap_or(u32::MAX);
 
         if deviation_bps > max_bps {
             env.events().publish(
