@@ -129,3 +129,44 @@ fn test_add_pool_rejects_duplicate() {
     router_client.add_pool(&pool_address);
     assert_eq!(router_client.get_pools().len(), 1);
 }
+
+#[test]
+fn test_add_pool_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let router_id = env.register_contract(None, LiquidityRouter);
+    let router_client = LiquidityRouterClient::new(&env, &router_id);
+
+    let pool_address = env.register_contract(None, MockAmm);
+    router_client.add_pool(&pool_address);
+
+    // The allowlist change must be observable on-chain.
+    let events = env.events().all();
+    assert!(events.len() >= 1);
+
+    let event = events.last().unwrap();
+    assert_eq!(event.0, router_id);
+    assert_eq!(event.1.len(), 1);
+}
+
+#[test]
+fn test_remove_pool_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let router_id = env.register_contract(None, LiquidityRouter);
+    let router_client = LiquidityRouterClient::new(&env, &router_id);
+
+    let pool_address = env.register_contract(None, MockAmm);
+    router_client.add_pool(&pool_address);
+    router_client.remove_pool(&pool_address);
+
+    // The allowlist removal must be observable on-chain.
+    let events = env.events().all();
+    assert!(events.len() >= 1);
+
+    let event = events.last().unwrap();
+    assert_eq!(event.0, router_id);
+    assert_eq!(event.1.len(), 1);
+}

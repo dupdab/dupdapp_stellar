@@ -31,6 +31,20 @@ pub struct FallbackRouteUsed {
     pub reserve: i128,
 }
 
+// Issue #1083: Event emitted when a pool is added to the allowlist
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolAddedEvent {
+    pub pool_id: Address,
+}
+
+// Issue #1083: Event emitted when a pool is removed from the allowlist
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolRemovedEvent {
+    pub pool_id: Address,
+}
+
 #[soroban_sdk::contractclient(name = "AmmClient")]
 pub trait AmmInterface {
     fn get_reserves(env: Env) -> (i128, i128);
@@ -68,8 +82,14 @@ impl LiquidityRouter {
             if pools.len() >= MAX_POOLS {
                 panic!("max pools reached");
             }
-            pools.push_back(pool);
+            pools.push_back(pool.clone());
             env.storage().persistent().set(&DataKey::ApprovedPools, &pools);
+
+            // Issue #1083: Emit event for the allowlist change
+            env.events().publish(
+                (Symbol::new(&env, "PoolAddedEvent"),),
+                PoolAddedEvent { pool_id: pool },
+            );
         }
     }
 
@@ -89,12 +109,23 @@ impl LiquidityRouter {
 
         // Remove the pool if it exists
         let mut new_pools = Vec::new(&env);
+        let mut removed = false;
         for p in pools.iter() {
             if p != pool {
                 new_pools.push_back(p);
+            } else {
+                removed = true;
             }
         }
         env.storage().persistent().set(&DataKey::ApprovedPools, &new_pools);
+
+        // Issue #1083: Emit event only when a pool was actually removed
+        if removed {
+            env.events().publish(
+                (Symbol::new(&env, "PoolRemovedEvent"),),
+                PoolRemovedEvent { pool_id: pool },
+            );
+        }
     }
 
     /// Checks if the AMM pool has sufficient depth for a swap.
