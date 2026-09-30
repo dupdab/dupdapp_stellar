@@ -272,9 +272,142 @@ impl MerchantRegistryContract {
         );
     }
 
-    /// Set the KYC verification status for a merchant.  Admin-only.
+    /// Update the KYC verification flag for a merchant.  Callable by admin only.
     pub fn set_kyc_status(env: Env, caller: Address, merchant: Address, verified: bool) {
         caller.require_auth();
-      
+        Self::require_admin(&env, &caller);
 
-/* … truncated 5419 chars — edit only what you need near the top … */
+        let key = DataKey::Merchant(merchant.clone());
+        let mut record: MerchantRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Merchant not found");
+
+        record.kyc_verified = verified;
+        env.storage().persistent().set(&key, &record);
+
+        env.events().publish(
+            ("REGISTRY", "kyc_status_updated"),
+            KYCStatusUpdatedEvent { merchant: merchant.clone(), verified },
+        );
+    }
+
+    /// Update the negotiated fee tier for a merchant.  Callable by admin only.
+    pub fn update_fee_tier(env: Env, caller: Address, merchant: Address, fee_bps: u32) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        if fee_bps > MAX_FEE_BPS {
+            panic!("Fee exceeds maximum");
+        }
+
+        let key = DataKey::Merchant(merchant.clone());
+        let mut record: MerchantRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Merchant not found");
+
+        record.fee_bps = fee_bps;
+        env.storage().persistent().set(&key, &record);
+
+        env.events().publish(
+            ("REGISTRY", "fee_tier_updated"),
+            FeeTierUpdatedEvent { merchant: merchant.clone(), fee_bps },
+        );
+    }
+
+    /// Transfer admin rights to a new address.  Callable by the current admin.
+    pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.events().publish(
+            ("REGISTRY", "admin_transferred"),
+            AdminTransferredEvent { old_admin, new_admin },
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Queries
+    // ------------------------------------------------------------------
+
+    /// Fetch a single merchant record.  Returns `None` if not registered.
+    pub fn get_merchant(env: Env, merchant: Address) -> Option<MerchantRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Merchant(merchant))
+    }
+
+    /// Return the total number of registered merchants.
+    pub fn merchant_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantCount)
+            .unwrap_or(0)
+    }
+
+    /// Paginated listing of registered merchants.
+    ///
+    /// Cost is bounded by `page_size`, not by the total number of merchants:
+    /// the index is stored as one entry per position (`DataKey::MerchantAt`),
+    /// so only the `page_size` slots in the requested window are read. The
+    /// full index is never loaded, and no per-entry persistent record read is
+    /// performed — each slot already holds the merchant's address.
+    pub fn merchants(env: Env, page: u32, page_size: u32) -> Vec<Address> {
+        let mut result = Vec::new(&env);
+        if page_size == 0 {
+            return result;
+        }
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantCount)
+            .unwrap_or(0);
+
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return result;
+        }
+
+        let end = start.saturating_add(page_size).min(total);
+        let mut i = start;
+        while i < end {
+            if let Some(addr) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::MerchantAt(i))
+            {
+                result.push_back(addr);
+            }
+            i += 1;
+        }
+
+        result
+    }
+
+    // ------------------------------------------------------------------
+    // Internal helpers
+    // ------------------------------------------------------------------
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if &admin != caller {
+            panic!("Caller is not admin");
+        }
+    }
+}
