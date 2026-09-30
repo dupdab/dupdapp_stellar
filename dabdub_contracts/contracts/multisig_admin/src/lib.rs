@@ -4,7 +4,6 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Bytes, Env, String, Vec};
 
-const THRESHOLD: u32 = 2;
 const EXPIRY_SECONDS: u64 = 24 * 60 * 60; // 24 hours
 
 #[contracttype]
@@ -24,6 +23,7 @@ pub struct Proposal {
 #[derive(Clone)]
 pub enum DataKey {
     Admins,
+    Threshold,
     NextProposalId,
     Proposal(u64),
 }
@@ -64,6 +64,7 @@ impl MultisigAdminContract {
 
         let admins = vec![&env, admin1, admin2, admin3];
         env.storage().instance().set(&DataKey::Admins, &admins);
+        env.storage().instance().set(&DataKey::Threshold, &2u32);
         env.storage().instance().set(&DataKey::NextProposalId, &0u64);
     }
 
@@ -153,6 +154,10 @@ impl MultisigAdminContract {
         env.storage().instance().get(&DataKey::Admins).unwrap()
     }
 
+    pub fn get_threshold(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::Threshold).unwrap_or(2)
+    }
+
     pub fn get_proposal(env: Env, proposal_id: u64) -> Option<Proposal> {
         env.storage().persistent().get(&DataKey::Proposal(proposal_id))
     }
@@ -184,8 +189,10 @@ impl MultisigAdminContract {
         if env.ledger().timestamp() > proposal.expires_at {
             panic!("proposal expired");
         }
-        if proposal.approvals.len() >= THRESHOLD {
+        let threshold = Self::get_threshold(env.clone());
+        if proposal.approvals.len() >= threshold {
             proposal.executed = true;
+            Self::apply_operation(env, proposal);
             env.events().publish(
                 ("MULTISIG", "proposal_executed"),
                 ProposalExecutedEvent {
@@ -194,5 +201,64 @@ impl MultisigAdminContract {
                 },
             );
         }
+    }
+
+    fn apply_operation(env: &Env, proposal: &Proposal) {
+        let op = proposal.operation.clone();
+        if op == String::from_str(env, "add_admin") {
+            let new_admin = Self::decode_address(env, &proposal.args);
+            let mut admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
+            if Self::contains_address(&admins, &new_admin) {
+                panic!("admin already exists");
+            }
+            admins.push_back(new_admin);
+            env.storage().instance().set(&DataKey::Admins, &admins);
+        } else if op == String::from_str(env, "remove_admin") {
+            let target = Self::decode_address(env, &proposal.args);
+            let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
+            if !Self::contains_address(&admins, &target) {
+                panic!("admin not found");
+            }
+            if admins.len() <= 1 {
+                panic!("cannot remove last admin");
+            }
+            let mut updated = vec![env];
+            for i in 0..admins.len() {
+                let a = admins.get(i).unwrap();
+                if a != target {
+                    updated.push_back(a);
+                }
+            }
+            let threshold = Self::get_threshold(env.clone());
+            if threshold > updated.len() {
+                panic!("threshold exceeds admin count");
+            }
+            env.storage().instance().set(&DataKey::Admins, &updated);
+        } else if op == String::from_str(env, "set_threshold") {
+            let new_threshold = Self::decode_u32(env, &proposal.args);
+            let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
+            if new_threshold == 0 || new_threshold > admins.len() {
+                panic!("invalid threshold");
+            }
+            env.storage().instance().set(&DataKey::Threshold, &new_threshold);
+        }
+    }
+
+    fn decode_address(env: &Env, args: &Bytes) -> Address {
+        let mut buf = [0u8; 32];
+        if args.len() != 32 {
+            panic!("invalid address args");
+        }
+        args.copy_into_slice(&mut buf);
+        Address::from_string_bytes(&String::from_bytes(env, &Bytes::from_slice(env, &buf)))
+    }
+
+    fn decode_u32(env: &Env, args: &Bytes) -> u32 {
+        let mut buf = [0u8; 4];
+        if args.len() != 4 {
+            panic!("invalid u32 args");
+        }
+        args.copy_into_slice(&mut buf);
+        u32::from_be_bytes(buf)
     }
 }
