@@ -3,10 +3,10 @@
 mod test;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String,
+    contract, contractimpl, contracttype, vec, Address, Bytes, BytesN, Env, String, Vec,
 };
 
-const MIN_DELAY_LEDGERS: u32 = 1;
+const MIN_DELAY_LEDGERS: u32 = 17_280;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +34,7 @@ pub enum DataKey {
     Admin,
     Counter,
     Change(BytesN<32>),
+    PendingList,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,12 @@ struct ChangeCancelledEvent {
     param: String,
 }
 
+#[contracttype]
+struct AdminRotatedEvent {
+    old_admin: Address,
+    new_admin: Address,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -73,10 +80,13 @@ impl AdminTimelockContract {
     pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Counter, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingList, &Vec::<BytesN<32>>::new(&env));
     }
 
     /// Queue a parameter change. Returns the change_id.
-    /// delay_ledgers must be at least 17_280 (~24 hours at 5 s/ledger).
+    /// delay_ledgers must be at least MIN_DELAY_LEDGERS (~24 hours at 5 s/ledger).
     pub fn schedule_change(
         env: Env,
         caller: Address,
@@ -117,6 +127,16 @@ impl AdminTimelockContract {
             .persistent()
             .set(&DataKey::Change(change_id.clone()), &change);
 
+        let mut pending: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingList)
+            .unwrap_or_else(|| Vec::new(&env));
+        pending.push_back(change_id.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingList, &pending);
+
         env.events().publish(
             ("TIMELOCK", "change_scheduled"),
             ChangeScheduledEvent {
@@ -149,6 +169,8 @@ impl AdminTimelockContract {
             .persistent()
             .set(&DataKey::Change(change_id.clone()), &change);
 
+        Self::remove_from_pending(&env, &change_id);
+
         env.events().publish(
             ("TIMELOCK", "change_applied"),
             ChangeAppliedEvent {
@@ -175,12 +197,45 @@ impl AdminTimelockContract {
             .persistent()
             .set(&DataKey::Change(change_id.clone()), &change);
 
+        Self::remove_from_pending(&env, &change_id);
+
         env.events().publish(
             ("TIMELOCK", "change_cancelled"),
             ChangeCancelledEvent {
                 change_id,
                 param: change.param,
             },
+        );
+    }
+
+    /// Remove a completed (Applied or Cancelled) change from persistent storage.
+    /// Admin-only to prevent griefing. Only non-Pending changes may be pruned.
+    pub fn prune_change(env: Env, caller: Address, change_id: BytesN<32>) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let change = Self::get_change(env.clone(), change_id.clone());
+
+        if change.status == ChangeStatus::Pending {
+            panic!("Cannot prune a pending change");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Change(change_id));
+    }
+
+    /// Transfer admin authority to a new address. Irreversible without the new admin's key.
+    pub fn rotate_admin(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let old_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.events().publish(
+            ("TIMELOCK", "admin_rotated"),
+            AdminRotatedEvent { old_admin, new_admin },
         );
     }
 
@@ -199,6 +254,14 @@ impl AdminTimelockContract {
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
+    /// Return the IDs of all currently pending changes.
+    pub fn list_pending(env: Env) -> Vec<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
@@ -208,5 +271,23 @@ impl AdminTimelockContract {
         if caller != &admin {
             panic!("Not admin");
         }
+    }
+
+    fn remove_from_pending(env: &Env, change_id: &BytesN<32>) {
+        let pending: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingList)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut updated = Vec::new(env);
+        for id in pending.iter() {
+            if &id != change_id {
+                updated.push_back(id);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingList, &updated);
     }
 }
