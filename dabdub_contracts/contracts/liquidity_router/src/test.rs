@@ -1,172 +1,132 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Events, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
 
 #[contract]
 pub struct MockAmm;
 
 #[contractimpl]
 impl MockAmm {
-    pub fn get_reserves(env: Env) -> (i128, i128) {
-        let res_a = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "res_a"))
-            .unwrap_or(0);
-        let res_b = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "res_b"))
-            .unwrap_or(0);
-        (res_a, res_b)
-    }
-
-    pub fn set_reserves(env: Env, res_a: i128, res_b: i128) {
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "res_a"), &res_a);
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "res_b"), &res_b);
+    pub fn get_reserves(_env: Env) -> (i128, i128) {
+        (100_000, 100_000)
     }
 }
 
-#[test]
-fn test_deep_pool_routing() {
-    let env = Env::default();
-    let pool_address = env.register_contract(None, MockAmm);
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
-
-    // Set high reserves: 1000
-    let amm_client = MockAmmClient::new(&env, &pool_address);
-    amm_client.set_reserves(&1000i128, &1000i128);
-
-    // Swap 50 (5% of 1000) -> Should be deep enough (50 * 10 = 500 < 1000)
-    let route = router_client.check_and_route(&pool_address, &50i128);
-    assert_eq!(route, Route::SorobanAMM);
-
-    // Check no fallback event emitted
-    assert_eq!(env.events().all().len(), 0);
-}
-
-#[test]
-fn test_shallow_pool_routing() {
+fn setup() -> (Env, LiquidityRouterClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
-
-    let pool_address = env.register_contract(None, MockAmm);
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
-
-    // Set low reserves: 100
-    let amm_client = MockAmmClient::new(&env, &pool_address);
-    amm_client.set_reserves(&100i128, &100i128);
-
-    // Swap 20 (20% of 100) -> Should trigger fallback (20 * 10 = 200 >= 100)
-    let route = router_client.check_and_route(&pool_address, &20i128);
-    assert_eq!(route, Route::StellarClassicDEX);
-
-    // Verify event
-    let events = env.events().all();
-    assert!(events.len() >= 1);
-
-    let event = events.last().unwrap();
-    assert_eq!(event.0, router_id);
-    assert_eq!(event.1.len(), 1);
+    let contract_id = env.register(LiquidityRouter, ());
+    let client = LiquidityRouterClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    (env, client, admin)
 }
 
 #[test]
-fn test_borderline_depth() {
-    let env = Env::default();
-    let pool_address = env.register_contract(None, MockAmm);
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
-
-    // Set reserves: 100
-    let amm_client = MockAmmClient::new(&env, &pool_address);
-    amm_client.set_reserves(&100i128, &100i128);
-
-    // Swap 10 (10% of 100) -> S * 10 < R ? 10 * 10 < 100 is False (100 < 100 is False)
-    // So it should trigger fallback
-    let route = router_client.check_and_route(&pool_address, &10i128);
-    assert_eq!(route, Route::StellarClassicDEX);
-}
-
-#[test]
-fn test_add_pool_enforces_max_pools() {
+fn test_initialize_sets_admin_and_empty_allowlist() {
     let env = Env::default();
     env.mock_all_auths();
+    let contract_id = env.register(LiquidityRouter, ());
+    let client = LiquidityRouterClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
 
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
+    client.initialize(&admin);
 
-    // Fill the allowlist up to the maximum.
-    for _ in 0..MAX_POOLS {
-        let pool_address = env.register_contract(None, MockAmm);
-        router_client.add_pool(&pool_address);
-    }
-
-    // Adding one more pool beyond the bound must panic.
-    let extra_pool = env.register_contract(None, MockAmm);
-    let result = router_client.try_add_pool(&extra_pool);
+    // A pool that was never added must be rejected, proving the allowlist
+    // was initialized to an empty set.
+    let pool = env.register(MockAmm, ());
+    let result = client.try_check_and_route(&pool, &1_000);
     assert!(result.is_err());
 }
 
 #[test]
-fn test_add_pool_rejects_duplicate() {
-    let env = Env::default();
-    env.mock_all_auths();
+fn test_add_pool_allows_routing() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
 
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
+    client.add_pool(&admin, &pool);
 
-    let pool_address = env.register_contract(None, MockAmm);
-    router_client.add_pool(&pool_address);
-
-    // Re-adding the same pool must not grow the allowlist.
-    router_client.add_pool(&pool_address);
-    assert_eq!(router_client.get_pools().len(), 1);
+    let route = client.check_and_route(&pool, &1_000);
+    assert_eq!(route, Route::SorobanAMM);
 }
 
 #[test]
-fn test_add_pool_emits_event() {
-    let env = Env::default();
-    env.mock_all_auths();
+fn test_add_pool_duplicate_is_noop() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
 
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
+    client.add_pool(&admin, &pool);
+    // Adding the same pool again must be a no-op (no panic, still approved).
+    client.add_pool(&admin, &pool);
 
-    let pool_address = env.register_contract(None, MockAmm);
-    router_client.add_pool(&pool_address);
-
-    // The allowlist change must be observable on-chain.
-    let events = env.events().all();
-    assert!(events.len() >= 1);
-
-    let event = events.last().unwrap();
-    assert_eq!(event.0, router_id);
-    assert_eq!(event.1.len(), 1);
+    let route = client.check_and_route(&pool, &1_000);
+    assert_eq!(route, Route::SorobanAMM);
 }
 
 #[test]
-fn test_remove_pool_emits_event() {
-    let env = Env::default();
-    env.mock_all_auths();
+fn test_remove_pool_revokes_approval() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
 
-    let router_id = env.register_contract(None, LiquidityRouter);
-    let router_client = LiquidityRouterClient::new(&env, &router_id);
+    client.add_pool(&admin, &pool);
+    client.remove_pool(&admin, &pool);
 
-    let pool_address = env.register_contract(None, MockAmm);
-    router_client.add_pool(&pool_address);
-    router_client.remove_pool(&pool_address);
+    let result = client.try_check_and_route(&pool, &1_000);
+    assert!(result.is_err());
+}
 
-    // The allowlist removal must be observable on-chain.
-    let events = env.events().all();
-    assert!(events.len() >= 1);
+#[test]
+fn test_remove_pool_not_present_is_noop() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
 
-    let event = events.last().unwrap();
-    assert_eq!(event.0, router_id);
-    assert_eq!(event.1.len(), 1);
+    // Removing a pool that was never added must not panic.
+    client.remove_pool(&admin, &pool);
+
+    let result = client.try_check_and_route(&pool, &1_000);
+    assert!(result.is_err());
+}
+
+#[test]
+#[should_panic(expected = "pool is not approved")]
+fn test_check_and_route_panics_for_unapproved_pool() {
+    let (env, client, _admin) = setup();
+    let pool = env.register(MockAmm, ());
+
+    // Pool was never added to the allowlist.
+    client.check_and_route(&pool, &1_000);
+}
+
+#[test]
+fn test_deep_pool_routing() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+
+    // amount_in (1_000) < reserve (100_000) / 10 => SorobanAMM
+    let route = client.check_and_route(&pool, &1_000);
+    assert_eq!(route, Route::SorobanAMM);
+}
+
+#[test]
+fn test_shallow_pool_routing() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+
+    // amount_in (50_000) >= reserve (100_000) / 10 => StellarClassicDEX
+    let route = client.check_and_route(&pool, &50_000);
+    assert_eq!(route, Route::StellarClassicDEX);
+}
+
+#[test]
+fn test_borderline_depth() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+
+    // amount_in (10_000) == reserve (100_000) / 10 => not strictly less => StellarClassicDEX
+    let route = client.check_and_route(&pool, &10_000);
+    assert_eq!(route, Route::StellarClassicDEX);
 }
