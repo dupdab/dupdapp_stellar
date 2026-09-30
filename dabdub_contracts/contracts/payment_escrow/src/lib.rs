@@ -57,6 +57,9 @@ pub enum DataKey {
     EmergencyTreasury,
     EmergencyCooldownLedgers,
     EmergencyLastDrainLedger,
+    UpgradeDelayLedgers,
+    PendingUpgradeHash,
+    PendingUpgradeLedger,
     Payment(BytesN<32>),
     Version,
     MaxDisputeWindowLedgers,
@@ -97,11 +100,23 @@ struct LimitUpdatedEvent {
     new: u32,
 }
 
+#[contracttype]
+struct UpgradeScheduledEvent {
+    new_wasm_hash: BytesN<32>,
+    apply_ledger: u32,
+}
+
+#[contracttype]
+struct UpgradeCancelledEvent {
+    new_wasm_hash: BytesN<32>,
+}
+
 /// Defaults used until the admin overrides them via `set_max_dispute_window_ledgers`
 /// / `set_max_ttl_ledgers`.
 const DEFAULT_MAX_DISPUTE_WINDOW_LEDGERS: u32 = 51_840;
 const DEFAULT_MAX_TTL_LEDGERS: u32 = 518_400;
 const EMERGENCY_SIGNER_COUNT: u32 = 3;
+const DEFAULT_UPGRADE_DELAY_LEDGERS: u32 = 17_280;
 
 #[contract]
 pub struct PaymentEscrowContract;
@@ -159,14 +174,92 @@ impl PaymentEscrowContract {
             .instance()
             .set(&DataKey::EmergencyLastDrainLedger, &0u32);
 
+        // Initialize the upgrade timelock delay to a safe default.
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeDelayLedgers, &DEFAULT_UPGRADE_DELAY_LEDGERS);
+
         // Initialize contract version to 1.
         env.storage().instance().set(&DataKey::Version, &1u32);
     }
 
-    /// Upgrade the contract WASM. Only callable by the admin.
-    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
+    /// Schedule a WASM upgrade. Admin-only. The upgrade does not take effect
+    /// immediately: it must wait out the configured timelock delay and then be
+    /// applied via `apply_upgrade`. This gives affected parties time to notice
+    /// and react before new code can control escrowed funds.
+    pub fn schedule_upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+
+        let delay: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeDelayLedgers)
+            .unwrap_or(DEFAULT_UPGRADE_DELAY_LEDGERS);
+        let apply_ledger = env.ledger().sequence().saturating_add(delay);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgradeHash, &new_wasm_hash);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgradeLedger, &apply_ledger);
+
+        env.events().publish(
+            ("ESCROW", "upgrade_scheduled"),
+            UpgradeScheduledEvent {
+                new_wasm_hash,
+                apply_ledger,
+            },
+        );
+    }
+
+    /// Cancel a previously scheduled upgrade. Admin-only.
+    pub fn cancel_upgrade(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let pending: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeHash)
+            .unwrap_or_else(|| panic!("No pending upgrade"));
+
+        env.storage().instance().remove(&DataKey::PendingUpgradeHash);
+        env.storage().instance().remove(&DataKey::PendingUpgradeLedger);
+
+        env.events().publish(
+            ("ESCROW", "upgrade_cancelled"),
+            UpgradeCancelledEvent {
+                new_wasm_hash: pending,
+            },
+        );
+    }
+
+    /// Apply a previously scheduled upgrade once the timelock delay has
+    /// elapsed. Admin-only. Reverts if no upgrade is pending or the delay has
+    /// not yet passed.
+    pub fn apply_upgrade(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let new_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeHash)
+            .unwrap_or_else(|| panic!("No pending upgrade"));
+        let apply_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeLedger)
+            .unwrap_or_else(|| panic!("No pending upgrade"));
+
+        if env.ledger().sequence() < apply_ledger {
+            panic!("Upgrade timelock has not elapsed");
+        }
+
+        env.storage().instance().remove(&DataKey::PendingUpgradeHash);
+        env.storage().instance().remove(&DataKey::PendingUpgradeLedger);
 
         let version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
         env.storage().instance().set(&DataKey::Version, &(version + 1));
@@ -177,6 +270,22 @@ impl PaymentEscrowContract {
     /// Return the current contract version.
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Version).unwrap_or(0)
+    }
+
+    /// Return the currently pending upgrade hash and its apply ledger, if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<(BytesN<32>, u32)> {
+        let hash: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeHash);
+        let apply_ledger: Option<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeLedger);
+        match (hash, apply_ledger) {
+            (Some(h), Some(l)) => Some((h, l)),
+            _ => None,
+        }
     }
 
     /// Update (or remove) the merchant registry address.  Admin-only.
@@ -357,10 +466,7 @@ impl PaymentEscrowContract {
         let mut payment = Self::get_payment(env.clone(), payment_id.clone());
         Self::require_releasable(&env, &payment);
 
-        let remaining = Self::remaining_amount(&payment);
-        if remaining <= 0 {
-            panic!("Payment fully released");
-        }
+        let remaini
 
         Self::transfer_from_contract(&env, &payment.merchant, remaining, &payment.asset_type);
         payment.released_amount = payment.amount;

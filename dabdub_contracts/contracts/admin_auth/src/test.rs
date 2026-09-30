@@ -81,3 +81,33 @@ fn test_revoke_unknown_admin_panics() {
     let stranger = Address::generate(&env);
     client.revoke_admin(&super_admin, &stranger);
 }
+
+#[test]
+fn test_deactivate_admin() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+    assert!(client.is_admin(&admin));
+    client.deactivate_admin(&super_admin, &admin);
+    assert!(!client.is_admin(&admin));
+    let user = client.get_admin(&admin).unwrap();
+    assert!(!user.active);
+}
+
+#[test]
+#[should_panic(expected = "not super admin")]
+fn test_deactivate_admin_requires_super_admin() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+    client.deactivate_admin(&attacker, &admin);
+}
+
+#[test]
+#[should_panic(expected = "admin not found")]
+fn test_deactivate_unknown_admin_panics() {
+    let (env, client, super_admin) = setup();
+    let stranger = Address::generate(&env);
+    client.deactivate_admin(&super_admin, &stranger);
+}
