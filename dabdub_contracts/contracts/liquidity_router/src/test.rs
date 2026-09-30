@@ -93,3 +93,33 @@ fn test_borderline_depth() {
     let route = router_client.check_and_route(&pool_address, &10i128);
     assert_eq!(route, Route::StellarClassicDEX);
 }
+
+#[test]
+#[should_panic(expected = "invalid pool reserves")]
+fn test_negative_reserves_rejected() {
+    let env = Env::default();
+    let pool_address = env.register_contract(None, MockAmm);
+    let router_id = env.register_contract(None, LiquidityRouter);
+    let router_client = LiquidityRouterClient::new(&env, &router_id);
+
+    // A misbehaving pool returns a negative reserve
+    let amm_client = MockAmmClient::new(&env, &pool_address);
+    amm_client.set_reserves(&-100i128, &100i128);
+
+    router_client.check_and_route(&pool_address, &50i128);
+}
+
+#[test]
+#[should_panic(expected = "invalid pool reserves")]
+fn test_zero_reserves_rejected() {
+    let env = Env::default();
+    let pool_address = env.register_contract(None, MockAmm);
+    let router_id = env.register_contract(None, LiquidityRouter);
+    let router_client = LiquidityRouterClient::new(&env, &router_id);
+
+    // A pool with zero reserves is nonsensical and must be rejected
+    let amm_client = MockAmmClient::new(&env, &pool_address);
+    amm_client.set_reserves(&0i128, &100i128);
+
+    router_client.check_and_route(&pool_address, &50i128);
+}

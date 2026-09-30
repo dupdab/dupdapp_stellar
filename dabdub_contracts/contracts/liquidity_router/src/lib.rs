@@ -105,6 +105,13 @@ impl LiquidityRouter {
         let amm_client = AmmClient::new(&env, &pool_address);
         let (reserve_a, _reserve_b) = amm_client.get_reserves();
 
+        // Issue #1081: Validate the cross-contract AMM response before trusting it.
+        // A misbehaving or malicious pool could return a negative or nonsensical
+        // reserve, which would otherwise be used uncritically in the depth check.
+        if reserve_a <= 0 {
+            panic!("invalid pool reserves");
+        }
+
         // Depth check: amount_in must be less than 10% of reserves
         // S < R / 10
         if amount_in < reserve_a / 10 {
