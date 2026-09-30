@@ -4,6 +4,10 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
+// Issue #1082: Upper bound on the approved pool allowlist to keep
+// add_pool/remove_pool/check_and_route from scaling without limit.
+const MAX_POOLS: u32 = 100;
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Route {
@@ -60,6 +64,10 @@ impl LiquidityRouter {
 
         // Prevent duplicates
         if !pools.iter().any(|p| p == pool) {
+            // Issue #1082: Enforce a maximum allowlist size before inserting
+            if pools.len() >= MAX_POOLS {
+                panic!("max pools reached");
+            }
             pools.push_back(pool);
             env.storage().persistent().set(&DataKey::ApprovedPools, &pools);
         }

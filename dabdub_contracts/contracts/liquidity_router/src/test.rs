@@ -93,3 +93,39 @@ fn test_borderline_depth() {
     let route = router_client.check_and_route(&pool_address, &10i128);
     assert_eq!(route, Route::StellarClassicDEX);
 }
+
+#[test]
+fn test_add_pool_enforces_max_pools() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let router_id = env.register_contract(None, LiquidityRouter);
+    let router_client = LiquidityRouterClient::new(&env, &router_id);
+
+    // Fill the allowlist up to the maximum.
+    for _ in 0..MAX_POOLS {
+        let pool_address = env.register_contract(None, MockAmm);
+        router_client.add_pool(&pool_address);
+    }
+
+    // Adding one more pool beyond the bound must panic.
+    let extra_pool = env.register_contract(None, MockAmm);
+    let result = router_client.try_add_pool(&extra_pool);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_add_pool_rejects_duplicate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let router_id = env.register_contract(None, LiquidityRouter);
+    let router_client = LiquidityRouterClient::new(&env, &router_id);
+
+    let pool_address = env.register_contract(None, MockAmm);
+    router_client.add_pool(&pool_address);
+
+    // Re-adding the same pool must not grow the allowlist.
+    router_client.add_pool(&pool_address);
+    assert_eq!(router_client.get_pools().len(), 1);
+}
