@@ -26,7 +26,40 @@ pub struct MerchantRecord {
     /// Negotiated fee rate for this merchant, in basis points (1/100th of a
     /// percent). Defaults to `DEFAULT_FEE_BPS` at registration and can be
     /// overridden per-merchant by the admin via `update_fee_tier`.
+    ///
+    /// `0` is a valid, intentional fee rate (0%) and is distinct from an
+    /// "unset" value: every registered merchant always has an explicit
+    /// `fee_bps` (seeded with `DEFAULT_FEE_BPS` at registration), so a `0`
+    /// read back from `get_fee_tier`/`get_merchant` means the admin
+    /// deliberately set this merchant's rate to 0% via `update_fee_tier`
+    /// (e.g. a VIP or promotional arrangement), not that no fee was ever
+    /// configured.
     pub fee_bps: u32,
+}
+
+/// Rich merchant status query result.
+///
+/// Unlike the boolean conveniences (`is_approved`, `is_merchant_active`,
+/// `is_kyc_verified`), which collapse "unregistered" and "registered but not
+/// meeting the condition" into the same `false`, this struct lets callers
+/// distinguish the exact reason a merchant is not usable.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MerchantStatusInfo {
+    /// `true` if a merchant record exists for the queried address.
+    pub registered: bool,
+    /// Lifecycle state; `None` when the merchant is not registered.
+    pub status: Option<MerchantStatus>,
+    /// `true` only when registered and `status == Active`.
+    pub is_active: bool,
+    /// `true` only when registered and `status == Suspended`.
+    pub is_suspended: bool,
+    /// `true` only when registered and `status == Terminated`.
+    pub is_terminated: bool,
+    /// `true` only when registered and KYC verified.
+    pub is_kyc_verified: bool,
+    /// `true` only when registered, active, and KYC verified.
+    pub is_approved: bool,
 }
 
 /// Default fee rate applied to newly registered merchants: 150 bps (1.5%).
@@ -39,9 +72,18 @@ const MAX_FEE_BPS: u32 = 1000;
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
+    /// Pending admin proposed via `propose_admin`, awaiting `accept_admin`.
+    PendingAdmin,
     Merchant(Address),
     /// Index of all registered merchant addresses, for paginated listing.
     Merchants,
+    /// Number of merchants registered so far. Stored as a single scalar so
+    /// registration never has to read/rewrite the full merchant index.
+    MerchantCount,
+    /// Per-merchant index slot: maps a merchant's position to its address.
+    /// Each entry is written independently, so registering merchant N does
+    /// not touch any prior merchant's entry.
+    MerchantAt(u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +113,12 @@ struct KYCStatusUpdatedEvent {
 }
 
 #[contracttype]
+struct AdminTransferProposedEvent {
+    current_admin: Address,
+    pending_admin: Address,
+}
+
+#[contracttype]
 struct AdminTransferredEvent {
     old_admin: Address,
     new_admin: Address,
@@ -90,6 +138,7 @@ struct MerchantTerminatedEvent {
 #[contracttype]
 struct MerchantUpdatedEvent {
     merchant: Address,
+    old_name: String,
     name: String,
 }
 
@@ -108,9 +157,70 @@ impl MerchantRegistryContract {
 
     pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::MerchantCount, &0u32);
+    }
+
+    // ------------------------------------------------------------------
+    // Admin – two-step handover
+    // ------------------------------------------------------------------
+
+    /// Propose a new admin. Callable by the current admin only.
+    ///
+    /// The proposal does not take effect until the proposed address calls
+    /// `accept_admin`, so a typo'd or unreachable `new_admin` cannot lock the
+    /// registry: the current admin stays in control and can re-propose (or
+    /// correct) the pending address at any time.
+    pub fn propose_admin(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
         env.storage()
             .instance()
-            .set(&DataKey::Merchants, &Vec::<Address>::new(&env));
+            .set(&DataKey::PendingAdmin, &new_admin);
+
+        env.events().publish(
+            ("REGISTRY", "admin_transfer_proposed"),
+            AdminTransferProposedEvent {
+                current_admin: caller,
+                pending_admin: new_admin,
+            },
+        );
+    }
+
+    /// Complete a pending admin transfer. Callable by the pending admin only.
+    ///
+    /// Requires the pending admin's own `require_auth`, so the transfer only
+    /// takes effect once the proposed address proves control of itself.
+    pub fn accept_admin(env: Env) {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .expect("No pending admin transfer");
+
+        pending.require_auth();
+
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events().publish(
+            ("REGISTRY", "admin_transferred"),
+            AdminTransferredEvent {
+                old_admin,
+                new_admin: pending,
+            },
+        );
+    }
+
+    /// Read the pending admin, if a transfer has been proposed.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     // ------------------------------------------------------------------
@@ -136,13 +246,20 @@ impl MerchantRegistryContract {
         };
         env.storage().persistent().set(&key, &record);
 
-        let mut merchants: Vec<Address> = env
+        // Append to the index in O(1): read the scalar count, write the new
+        // address into its own slot, then bump the count. No prior merchant
+        // entry is read or rewritten, and no single value grows with N.
+        let count: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::Merchants)
-            .unwrap();
-        merchants.push_back(merchant.clone());
-        env.storage().instance().set(&DataKey::Merchants, &merchants);
+            .get(&DataKey::MerchantCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantAt(count), &merchant.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantCount, &(count + 1));
 
         env.events().publish(
             ("REGISTRY", "merchant_registered"),
@@ -155,6 +272,10 @@ impl MerchantRegistryContract {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
+        if name.len() == 0 {
+            panic!("Merchant name cannot be empty");
+        }
+
         let key = DataKey::Merchant(merchant.clone());
         let mut record: MerchantRecord = env
             .storage()
@@ -162,6 +283,7 @@ impl MerchantRegistryContract {
             .get(&key)
             .expect("Merchant not found");
 
+        let old_name = record.name.clone();
         record.name = name.clone();
         env.storage().persistent().set(&key, &record);
 
@@ -169,6 +291,7 @@ impl MerchantRegistryContract {
             ("REGISTRY", "merchant_updated"),
             MerchantUpdatedEvent {
                 merchant,
+                old_name,
                 name,
             },
         );
@@ -220,8 +343,7 @@ impl MerchantRegistryContract {
             panic!("Merchant already active");
         }
         if record.status == MerchantStatus::Terminated {
-            panic!("Cannot reactivate terminated merchant");
-        }
+            panic!("Cannot reac
 
         record.status = MerchantStatus::Active;
         env.storage().persistent().set(&key, &record);
@@ -260,7 +382,7 @@ impl MerchantRegistryContract {
         );
     }
 
-    /// Set the KYC verification status for a merchant.  Admin-only.
+    /// Update the KYC verification flag for a merchant.  Callable by admin only.
     pub fn set_kyc_status(env: Env, caller: Address, merchant: Address, verified: bool) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
@@ -281,14 +403,13 @@ impl MerchantRegistryContract {
         );
     }
 
-    /// Set a merchant's negotiated fee rate, in basis points. Admin-only.
-    /// Panics if `fee_bps` exceeds `MAX_FEE_BPS` (1000 bps / 10%).
+    /// Update the negotiated fee tier for a merchant.  Callable by admin only.
     pub fn update_fee_tier(env: Env, caller: Address, merchant: Address, fee_bps: u32) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
         if fee_bps > MAX_FEE_BPS {
-            panic!("fee_bps exceeds maximum of 1000");
+            panic!("Fee exceeds maximum");
         }
 
         let key = DataKey::Merchant(merchant.clone());
@@ -307,92 +428,17 @@ impl MerchantRegistryContract {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Queries
-    // ------------------------------------------------------------------
-
-    pub fn get_merchant(env: Env, merchant: Address) -> MerchantRecord {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Merchant(merchant))
-            .expect("Merchant not found")
-    }
-
-    /// Paginated list of all registered merchants.
-    pub fn merchants(env: Env, page: u32, page_size: u32) -> Vec<MerchantRecord> {
-        if page_size == 0 {
-            panic!("page size must be > 0");
-        }
-        let all: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Merchants)
-            .unwrap_or(Vec::new(&env));
-
-        let start = (page as u64).saturating_mul(page_size as u64).min(all.len() as u64) as u32;
-        let end = (start as u64 + page_size as u64).min(all.len() as u64) as u32;
-
-        let mut out = Vec::new(&env);
-        let iter = all.slice(start..end);
-        for addr in iter.iter() {
-            out.push_back(Self::get_merchant(env.clone(), addr));
-        }
-        out
-    }
-
-    /// Returns `true` when the merchant is registered and Active.
-    pub fn is_merchant_active(env: Env, merchant: Address) -> bool {
-        let key = DataKey::Merchant(merchant);
-        if !env.storage().persistent().has(&key) {
-            return false;
-        }
-        let record: MerchantRecord = env.storage().persistent().get(&key).unwrap();
-        record.status == MerchantStatus::Active
-    }
-
-    /// Returns `true` when the merchant is registered, Active, and KYC verified.
-    /// Used by callers (e.g. payment_escrow) to gate deposits on merchant approval.
-    /// Returns `false` for unregistered merchants.
-    pub fn is_approved(env: Env, merchant: Address) -> bool {
-        let key = DataKey::Merchant(merchant);
-        if !env.storage().persistent().has(&key) {
-            return false;
-        }
-        let record: MerchantRecord = env.storage().persistent().get(&key).unwrap();
-        record.status == MerchantStatus::Active && record.kyc_verified
-    }
-
-    /// Returns `true` when the merchant is KYC verified.
-    /// Returns `false` for unregistered merchants.
-    pub fn is_kyc_verified(env: Env, merchant: Address) -> bool {
-        let key = DataKey::Merchant(merchant);
-        if !env.storage().persistent().has(&key) {
-            return false;
-        }
-        let record: MerchantRecord = env.storage().persistent().get(&key).unwrap();
-        record.kyc_verified
-    }
-
-    /// Returns the merchant's current fee rate in basis points.
-    /// Panics if the merchant is not registered.
-    pub fn get_fee_tier(env: Env, merchant: Address) -> u32 {
-        Self::get_merchant(env, merchant).fee_bps
-    }
-
-    pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
-    }
-
-    // ------------------------------------------------------------------
-    // Admin management
-    // ------------------------------------------------------------------
-
-    /// Transfer admin to a new address.  Callable by current admin only.
+    /// Transfer admin rights to a new address.  Callable by the current admin.
     pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
-        let old_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+
         env.storage().instance().set(&DataKey::Admin, &new_admin);
 
         env.events().publish(
@@ -402,13 +448,76 @@ impl MerchantRegistryContract {
     }
 
     // ------------------------------------------------------------------
+    // Queries
+    // ------------------------------------------------------------------
+
+    /// Fetch a single merchant record.  Returns `None` if not registered.
+    pub fn get_merchant(env: Env, merchant: Address) -> Option<MerchantRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Merchant(merchant))
+    }
+
+    /// Return the total number of registered merchants.
+    pub fn merchant_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantCount)
+            .unwrap_or(0)
+    }
+
+    /// Paginated listing of registered merchants.
+    ///
+    /// Cost is bounded by `page_size`, not by the total number of merchants:
+    /// the index is stored as one entry per position (`DataKey::MerchantAt`),
+    /// so only the `page_size` slots in the requested window are read. The
+    /// full index is never loaded, and no per-entry persistent record read is
+    /// performed — each slot already holds the merchant's address.
+    pub fn merchants(env: Env, page: u32, page_size: u32) -> Vec<Address> {
+        let mut result = Vec::new(&env);
+        if page_size == 0 {
+            return result;
+        }
+
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantCount)
+            .unwrap_or(0);
+
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return result;
+        }
+
+        let end = start.saturating_add(page_size).min(total);
+        let mut i = start;
+        while i < end {
+            if let Some(addr) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::MerchantAt(i))
+            {
+                result.push_back(addr);
+            }
+            i += 1;
+        }
+
+        result
+    }
+
+    // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
 
     fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != &admin {
-            panic!("Not admin");
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if &admin != caller {
+            panic!("Caller is not admin");
         }
     }
 }

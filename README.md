@@ -79,3 +79,8 @@ Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.
 
 - **Website**: [https://dupdub.xyz](https://dupdub.xyz)
 - **Documentation**: [https://docs.dupdub.xyz](https://docs.dupdub.xyz)
+
+## Handsoff notes
+
+<!-- handsoff-issue-1094 -->
+- #1094: merchant_registry and payment_escrow: a merchant suspended after deposit is still paid out by release/release_partial

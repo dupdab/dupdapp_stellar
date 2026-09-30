@@ -4,6 +4,13 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
+// Issue #1082: Upper bound on the approved pool allowlist to keep
+// add_pool/remove_pool/check_and_route from scaling without limit.
+const MAX_POOLS: u32 = 100;
+
+// Issue #1085: Default AMM depth threshold (10% impact) in basis points.
+const DEFAULT_DEPTH_THRESHOLD_BPS: u32 = 1000;
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Route {
@@ -17,6 +24,8 @@ pub enum Route {
 pub enum DataKey {
     Admin,
     ApprovedPools,
+    // Issue #1085: Admin-configurable AMM depth threshold in basis points
+    DepthThresholdBps,
 }
 
 #[contracttype]
@@ -25,6 +34,20 @@ pub struct FallbackRouteUsed {
     pub pool_id: Address,
     pub amount: i128,
     pub reserve: i128,
+}
+
+// Issue #1083: Event emitted when a pool is added to the allowlist
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolAddedEvent {
+    pub pool_id: Address,
+}
+
+// Issue #1083: Event emitted when a pool is removed from the allowlist
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolRemovedEvent {
+    pub pool_id: Address,
 }
 
 #[soroban_sdk::contractclient(name = "AmmClient")]
@@ -38,10 +61,21 @@ pub struct LiquidityRouter;
 #[contractimpl]
 impl LiquidityRouter {
     // Issue #1025: Constructor to initialize admin
+    // Issue #1079: Require auth and guard against re-initialization
+    // Issue #1080: Store config singletons in instance() storage so their TTL
+    // is bumped automatically with every contract call.
     pub fn initialize(env: Env, admin: Address) {
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+        admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
         let pools: Vec<Address> = Vec::new(&env);
-        env.storage().persistent().set(&DataKey::ApprovedPools, &pools);
+        env.storage().instance().set(&DataKey::ApprovedPools, &pools);
+        // Issue #1085: Seed the depth threshold with the previous hardcoded default
+        env.storage().instance().set(&DataKey::DepthThresholdBps, &DEFAULT_DEPTH_THRESHOLD_BPS);
     }
 
     // Issue #1025: Add pool to allowlist (admin-gated)
@@ -49,19 +83,29 @@ impl LiquidityRouter {
         admin.require_auth();
 
         // Verify caller is the admin
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin)
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
             .expect("admin not set");
         if admin != stored_admin {
             panic!("only admin can add pools");
         }
 
-        let mut pools: Vec<Address> = env.storage().persistent().get(&DataKey::ApprovedPools)
+        let mut pools: Vec<Address> = env.storage().instance().get(&DataKey::ApprovedPools)
             .unwrap_or_else(|| Vec::new(&env));
 
         // Prevent duplicates
         if !pools.iter().any(|p| p == pool) {
-            pools.push_back(pool);
-            env.storage().persistent().set(&DataKey::ApprovedPools, &pools);
+            // Issue #1082: Enforce a maximum allowlist size before inserting
+            if pools.len() >= MAX_POOLS {
+                panic!("max pools reached");
+            }
+            pools.push_back(pool.clone());
+            env.storage().instance().set(&DataKey::ApprovedPools, &pools);
+
+            // Issue #1083: Emit event for the allowlist change
+            env.events().publish(
+                (Symbol::new(&env, "PoolAddedEvent"),),
+                PoolAddedEvent { pool_id: pool },
+            );
         }
     }
 
@@ -70,44 +114,113 @@ impl LiquidityRouter {
         admin.require_auth();
 
         // Verify caller is the admin
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin)
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
             .expect("admin not set");
         if admin != stored_admin {
             panic!("only admin can remove pools");
         }
 
-        let mut pools: Vec<Address> = env.storage().persistent().get(&DataKey::ApprovedPools)
+        let mut pools: Vec<Address> = env.storage().instance().get(&DataKey::ApprovedPools)
             .unwrap_or_else(|| Vec::new(&env));
 
         // Remove the pool if it exists
         let mut new_pools = Vec::new(&env);
+        let mut removed = false;
         for p in pools.iter() {
             if p != pool {
                 new_pools.push_back(p);
+            } else {
+                removed = true;
             }
         }
-        env.storage().persistent().set(&DataKey::ApprovedPools, &new_pools);
+        env.storage().instance().set(&DataKey::ApprovedPools, &new_pools);
+
+        // Issue #1083: Emit event only when a pool was actually removed
+        if removed {
+            env.events().publish(
+                (Symbol::new(&env, "PoolRemovedEvent"),),
+                PoolRemovedEvent { pool_id: pool },
+            );
+        }
+    }
+
+    // Issue #1085: Admin-gated setter for the AMM depth threshold (in bps)
+    pub fn set_depth_threshold_bps(env: Env, admin: Address, threshold_bps: u32) {
+        admin.require_auth();
+
+        // Verify caller is the admin
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin)
+            .expect("admin not set");
+        if admin != stored_admin {
+            panic!("only admin can set depth threshold");
+        }
+
+        if threshold_bps == 0 || threshold_bps > 10_000 {
+            panic!("invalid depth threshold");
+        }
+
+        env.storage().instance().set(&DataKey::DepthThresholdBps, &threshold_bps);
     }
 
     /// Checks if the AMM pool has sufficient depth for a swap.
-    /// Returns SorobanAMM if depth is sufficient (< 10% impact),
-    /// otherwise returns StellarClassicDEX and emits an event.
+    /// Returns SorobanAMM if depth is sufficient (impact below the configured
+    /// threshold), otherwise returns StellarClassicDEX and emits an event.
     pub fn check_and_route(env: Env, pool_address: Address, amount_in: i128) -> Route {
         // Issue #1025: Validate pool_address against allowlist before calling get_reserves
-        let pools: Vec<Address> = env.storage().persistent().get(&DataKey::ApprovedPools)
+        let pools: Vec<Address> = env.storage().instance().get(&DataKey::ApprovedPools)
             .unwrap_or_else(|| Vec::new(&env));
 
         if !pools.iter().any(|p| p == pool_address) {
             panic!("pool is not approved");
         }
 
-        // Query AMM reserves via cross-contract call
+        // Issue #1086: Query AMM reserves via cross-contract call using the
+        // fallible `try_get_reserves` pattern. A previously-approved pool may
+        // have been upgraded to a contract that no longer implements
+        // `AmmInterface`, or may simply revert. In that case we must not let
+        // the raw panic propagate and break every `check_and_route` call.
+        //
+        // Expected behavior: a failed `get_reserves` call is treated the same
+        // as a shallow pool — we fall back to `Route::StellarClassicDEX` and
+        // emit `FallbackRouteUsed` (with reserve = 0, since no reserve could
+        // be read) rather than propagating the error.
         let amm_client = AmmClient::new(&env, &pool_address);
-        let (reserve_a, _reserve_b) = amm_client.get_reserves();
+        let reserves = match amm_client.try_get_reserves() {
+            Ok(Ok((reserve_a, _reserve_b))) => Some(reserve_a),
+            Ok(Err(_)) | Err(_) => None,
+        };
 
-        // Depth check: amount_in must be less than 10% of reserves
-        // S < R / 10
-        if amount_in < reserve_a / 10 {
+        let reserve_a = match reserves {
+            Some(r) => r,
+            None => {
+                // Cross-contract call failed or reverted: degrade gracefully to
+                // the classic DEX fallback instead of panicking.
+                env.events().publish(
+                    (Symbol::new(&env, "FallbackRouteUsed"),),
+                    FallbackRouteUsed {
+                        pool_id: pool_address,
+                        amount: amount_in,
+                        reserve: 0,
+                    },
+                );
+                return Route::StellarClassicDEX;
+            }
+        };
+
+        // Issue #1081: Validate the cross-contract AMM response before trusting it.
+        // A misbehaving or malicious pool could return a negative or nonsensical
+        // reserve, which would otherwise be used uncritically in the depth check.
+        if reserve_a <= 0 {
+            panic!("invalid pool reserves");
+        }
+
+        // Issue #1085: Depth check against the admin-configurable threshold.
+        // amount_in must be less than threshold_bps of reserves: S < R * bps / 10000
+        let threshold_bps: u32 = env.storage().instance()
+            .get(&DataKey::DepthThresholdBps)
+            .unwrap_or(DEFAULT_DEPTH_THRESHOLD_BPS);
+
+        if amount_in < reserve_a * (threshold_bps as i128) / 10_000 {
             Route::SorobanAMM
         } else {
             // Emit FallbackRouteUsed event
