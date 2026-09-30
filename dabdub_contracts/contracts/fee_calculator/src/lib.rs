@@ -52,15 +52,22 @@ impl FeeCalculatorContract {
     }
 
     pub fn set_fee_tiers(env: Env, caller: Address, tiers: Vec<FeeTier>) {
-    pub fn set_settlement_caller(env: Env, caller: Address, settlement_caller: Address) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        env.storage().instance().set(&DataKey::SettlementCaller, &settlement_caller);
-    }
         caller.require_auth();
         Self::require_admin(&env, &caller);
         Self::validate_tiers(&tiers);
         env.storage().instance().set(&DataKey::FeeTiers, &tiers);
+    }
+
+    pub fn set_settlement_caller(env: Env, caller: Address, settlement_caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::SettlementCaller, &settlement_caller);
+    }
+
+    pub fn get_settlement_caller(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::SettlementCaller)
     }
 
     pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
@@ -70,7 +77,14 @@ impl FeeCalculatorContract {
             .unwrap_or(vec![&env, FeeTier { threshold_usdc: 0, fee_bps: 0 }])
     }
 
-    pub fn calculate_fee(env: Env, merchant: Address, amount: i128) -> (i128, i128, u32) {
+    pub fn calculate_fee(
+        env: Env,
+        caller: Address,
+        merchant: Address,
+        amount: i128,
+    ) -> (i128, i128, u32) {
+        caller.require_auth();
+        Self::require_authorized_caller(&env, &caller);
         if amount <= 0 {
             panic!("amount must be > 0");
         }
@@ -125,6 +139,23 @@ impl FeeCalculatorContract {
         if &admin != caller {
             panic!("Not admin");
         }
+    }
+
+    fn require_authorized_caller(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller == &admin {
+            return;
+        }
+        if let Some(settlement_caller) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::SettlementCaller)
+        {
+            if caller == &settlement_caller {
+                return;
+            }
+        }
+        panic!("Not authorized");
     }
 
     fn validate_tiers(tiers: &Vec<FeeTier>) {

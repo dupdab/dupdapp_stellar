@@ -102,6 +102,25 @@ fn test_duplicate_record_panics() {
     assert!(result.is_err());
 }
 
+#[test]
+#[should_panic(expected = "not admin")]
+fn test_record_settlement_unauthorized_caller_panics() {
+    let (env, _admin, client) = setup();
+    let caller = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    record(&client, &caller, &env, 8, &merchant, 1_000, 20);
+}
+
+#[test]
+fn test_void_preserves_original_settlement() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    record(&client, &admin, &env, 7, &merchant, 1_000, 20);
+    client.void_settlement(&admin, &pid(&env, 7), &fiat_ref(&env, "operator correction"));
+    assert_eq!(client.get_settlement(&pid(&env, 7)).amount, 1_000);
+    assert_eq!(client.get_settlement_void(&pid(&env, 7)).unwrap().reason, fiat_ref(&env, "operator correction"));
+}
+
 // ── fee + net must equal amount ───────────────────────────────────────────────
 
 #[test]
@@ -183,6 +202,17 @@ fn test_merchant_isolation() {
 
     assert_eq!(client.settlement_count(&m1), 2);
     assert_eq!(client.settlement_count(&m2), 1);
+}
+
+#[test]
+fn test_platform_wide_index_lists_every_merchant() {
+    let (env, admin, client) = setup();
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    record(&client, &admin, &env, 60, &first, 1_000, 20);
+    record(&client, &admin, &env, 61, &second, 2_000, 40);
+    assert_eq!(client.total_settlement_count(), 2);
+    assert_eq!(client.list_all_settlements(&0).len(), 2);
 }
 
 // ── get on unknown payment_id panics ─────────────────────────────────────────

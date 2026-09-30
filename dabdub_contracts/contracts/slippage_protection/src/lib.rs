@@ -75,6 +75,9 @@ impl SlippageProtectionContract {
     pub fn set_max_slippage(env: Env, caller: soroban_sdk::Address, bps: u32) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        if bps > 10_000 {
+            panic!("bps must be <= 10000");
+        }
         env.storage().instance().set(&DataKey::MaxSlippageBps, &bps);
     }
 

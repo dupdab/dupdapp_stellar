@@ -4,6 +4,8 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
 
+const MAX_PROOF_DEPTH: u32 = 64;
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MerkleProofNode {
@@ -65,6 +67,13 @@ impl ReconciliationContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
+    /// Transfers reconciliation authority to `new_admin`.
+    pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
     /// Records a new reconciliation batch and returns the ID it was stored
     /// under.
     ///
@@ -87,11 +96,7 @@ impl ReconciliationContract {
             submitted_ledger: env.ledger().sequence(),
         };
 
-        let batch_id: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextBatchId)
-            .unwrap_or(0);
+        let batch_id = Self::latest_batch_id(&env).map(|id| id + 1).unwrap_or(0);
 
         env.storage().persistent().set(&DataKey::Batch(batch_id), &batch);
         env.storage().instance().set(&DataKey::CurrentBatch, &batch);
@@ -133,6 +138,7 @@ impl ReconciliationContract {
         payment_id: BytesN<32>,
         proof: Vec<MerkleProofNode>,
     ) -> bool {
+        Self::require_proof_depth(&proof);
         let batch: ReconciliationBatch = env
             .storage()
             .persistent()
@@ -155,6 +161,7 @@ impl ReconciliationContract {
         note = "inverted return value and latest-batch-only semantics — use verify_settlement_proof instead"
     )]
     pub fn verify_settlement(env: Env, payment_id: BytesN<32>, proof: Vec<MerkleProofNode>) -> bool {
+        Self::require_proof_depth(&proof);
         let batch: ReconciliationBatch = env
             .storage()
             .instance()
@@ -178,11 +185,7 @@ impl ReconciliationContract {
     /// The ID is what a caller needs in order to verify a proof against this
     /// root later, once further batches have been submitted.
     pub fn get_latest_stored_batch(env: Env) -> Option<StoredBatch> {
-        let next_id: u32 = env.storage().instance().get(&DataKey::NextBatchId)?;
-        if next_id == 0 {
-            return None;
-        }
-        let batch_id = next_id - 1;
+        let batch_id = Self::latest_batch_id(&env)?;
         env.storage()
             .persistent()
             .get(&DataKey::Batch(batch_id))
@@ -197,8 +200,32 @@ impl ReconciliationContract {
             .unwrap_or(0)
     }
 
+    /// Permanently archives batches with IDs below `before_batch_id`, bounded
+    /// by `max_batches` so retention can be applied incrementally. Current and
+    /// newer batches remain available for proof verification.
+    pub fn archive_batches(env: Env, caller: Address, before_batch_id: u32, max_batches: u32) -> u32 {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let upper = before_batch_id.min(Self::batch_count(env.clone()));
+        let mut archived = 0;
+        for batch_id in 0..upper {
+            if archived >= max_batches { break; }
+            let key = DataKey::Batch(batch_id);
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+                archived += 1;
+            }
+        }
+        archived
+    }
+
     /// Walks `proof` up from the leaf for `payment_id` and returns the root it
     /// computes. Shared by both verifiers so they cannot drift apart.
+    fn latest_batch_id(env: &Env) -> Option<u32> {
+        let next_id: u32 = env.storage().instance().get(&DataKey::NextBatchId)?;
+        next_id.checked_sub(1)
+    }
+
     fn compute_root(
         env: &Env,
         payment_id: &BytesN<32>,
@@ -216,6 +243,10 @@ impl ReconciliationContract {
         current
     }
 
+    fn require_proof_depth(proof: &Vec<MerkleProofNode>) {
+        if proof.len() > MAX_PROOF_DEPTH { panic!("proof too long"); }
+    }
+
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if &admin != caller {
@@ -223,12 +254,12 @@ impl ReconciliationContract {
         }
     }
 
-    fn hash_leaf(env: &Env, payment_id: &BytesN<32>) -> BytesN<32> {
+    pub(crate) fn hash_leaf(env: &Env, payment_id: &BytesN<32>) -> BytesN<32> {
         let id_arr = payment_id.to_array();
         env.crypto().sha256(&Bytes::from_slice(env, &id_arr)).into()
     }
 
-    fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+    pub(crate) fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
         let left_arr = left.to_array();
         let right_arr = right.to_array();
 

@@ -54,25 +54,23 @@ impl RbacAccessContract {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::SuperAdmin);
 
-        let is_new_super_admin = role == Role::SuperAdmin
-            && !env
-                .storage()
-                .persistent()
-                .has(&DataKey::Role(account.clone()));
+        let key = DataKey::Role(account.clone());
+        let previous: Option<Role> = env.storage().persistent().get(&key);
+        let was_super_admin = previous == Some(Role::SuperAdmin);
+        let is_super_admin = role == Role::SuperAdmin;
 
         env.storage()
             .persistent()
             .set(&DataKey::Role(account.clone()), &role);
 
-        if is_new_super_admin {
+        if was_super_admin != is_super_admin {
             let count: u32 = env
                 .storage()
                 .persistent()
                 .get(&DataKey::SuperAdminCount)
                 .unwrap_or(0);
-            env.storage()
-                .persistent()
-                .set(&DataKey::SuperAdminCount, &(count + 1));
+            let next = if is_super_admin { count + 1 } else { count - 1 };
+            env.storage().persistent().set(&DataKey::SuperAdminCount, &next);
         }
 
         env.events().publish(
@@ -132,6 +130,11 @@ impl RbacAccessContract {
         env.storage().persistent().get(&DataKey::Role(account))
     }
 
+    /// Number of accounts currently holding the SuperAdmin role.
+    pub fn get_super_admin_count(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::SuperAdminCount).unwrap_or(0)
+    }
+
     /// Sensitive operation requiring minimum `OperationsAdmin`.
     pub fn execute_operations_task(env: Env, caller: Address) {
         caller.require_auth();
@@ -163,10 +166,15 @@ impl RbacAccessContract {
             panic!("caller is not an admin");
         }
 
+        let new_role: Option<Role> = env.storage().persistent().get(&DataKey::Role(new_admin.clone()));
         env.storage()
             .persistent()
             .set(&DataKey::Role(new_admin.clone()), &Role::SuperAdmin);
         env.storage().persistent().remove(&caller_key);
+        if new_role == Some(Role::SuperAdmin) {
+            let count = Self::get_super_admin_count(env.clone());
+            env.storage().persistent().set(&DataKey::SuperAdminCount, &(count - 1));
+        }
 
         env.events().publish(
             ("RBAC", "super_admin_transferred"),
