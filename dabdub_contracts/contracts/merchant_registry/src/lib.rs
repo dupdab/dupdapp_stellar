@@ -37,6 +37,31 @@ pub struct MerchantRecord {
     pub fee_bps: u32,
 }
 
+/// Rich merchant status query result.
+///
+/// Unlike the boolean conveniences (`is_approved`, `is_merchant_active`,
+/// `is_kyc_verified`), which collapse "unregistered" and "registered but not
+/// meeting the condition" into the same `false`, this struct lets callers
+/// distinguish the exact reason a merchant is not usable.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MerchantStatusInfo {
+    /// `true` if a merchant record exists for the queried address.
+    pub registered: bool,
+    /// Lifecycle state; `None` when the merchant is not registered.
+    pub status: Option<MerchantStatus>,
+    /// `true` only when registered and `status == Active`.
+    pub is_active: bool,
+    /// `true` only when registered and `status == Suspended`.
+    pub is_suspended: bool,
+    /// `true` only when registered and `status == Terminated`.
+    pub is_terminated: bool,
+    /// `true` only when registered and KYC verified.
+    pub is_kyc_verified: bool,
+    /// `true` only when registered, active, and KYC verified.
+    pub is_approved: bool,
+}
+
 /// Default fee rate applied to newly registered merchants: 150 bps (1.5%).
 const DEFAULT_FEE_BPS: u32 = 150;
 /// Upper bound on the fee rate an admin can set for a merchant: 1000 bps (10%).
@@ -265,11 +290,103 @@ impl MerchantRegistryContract {
         record.status = MerchantStatus::Terminated;
         env.storage().persistent().set(&key, &record);
 
-        // Remove the terminated merchant from the listing index so that
-        // `merchants()` no longer returns it.
+        // Remove from the listing index so `merchants()` no longer lists it.
         let merchants: Vec<Address> = env
             .storage()
             .instance()
+            .get(&DataKey::Merchants)
+            .unwrap();
+        let mut updated = Vec::<Address>::new(&env);
+        for addr in merchants.iter() {
+            if addr != merchant {
+                updated.push_back(addr);
+            }
+        }
+        env.storage().instance().set(&DataKey::Merchants, &updated);
 
+        env.events().publish(
+            ("REGISTRY", "merchant_terminated"),
+            MerchantTerminatedEvent { merchant: merchant.clone() },
+        );
+    }
 
-/* … truncated 776 chars — edit only what you need near the top … */
+    // ------------------------------------------------------------------
+    // Status queries
+    // ------------------------------------------------------------------
+
+    /// Rich status query that distinguishes an unregistered merchant from a
+    /// registered merchant that is suspended, terminated, or not KYC
+    /// verified.  The boolean conveniences below remain available and keep
+    /// their existing semantics.
+    pub fn get_merchant_status(env: Env, merchant: Address) -> MerchantStatusInfo {
+        let key = DataKey::Merchant(merchant.clone());
+        match env.storage().persistent().get::<DataKey, MerchantRecord>(&key) {
+            None => MerchantStatusInfo {
+                registered: false,
+                status: None,
+                is_active: false,
+                is_suspended: false,
+                is_terminated: false,
+                is_kyc_verified: false,
+                is_approved: false,
+            },
+            Some(record) => {
+                let is_active = record.status == MerchantStatus::Active;
+                let is_suspended = record.status == MerchantStatus::Suspended;
+                let is_terminated = record.status == MerchantStatus::Terminated;
+                MerchantStatusInfo {
+                    registered: true,
+                    status: Some(record.status.clone()),
+                    is_active,
+                    is_suspended,
+                    is_terminated,
+                    is_kyc_verified: record.kyc_verified,
+                    is_approved: is_active && record.kyc_verified,
+                }
+            }
+        }
+    }
+
+    /// Returns `true` only when the merchant is registered, active, and KYC
+    /// verified.  Returns `false` for unregistered, suspended, terminated,
+    /// or not-KYC-verified merchants; use `get_merchant_status` to tell those
+    /// cases apart.
+    pub fn is_approved(env: Env, merchant: Address) -> bool {
+        let key = DataKey::Merchant(merchant.clone());
+        match env.storage().persistent().get::<DataKey, MerchantRecord>(&key) {
+            None => false,
+            Some(record) => {
+                record.status == MerchantStatus::Active && record.kyc_verified
+            }
+        }
+    }
+
+    /// Returns `true` only when the merchant is registered and active.
+    pub fn is_merchant_active(env: Env, merchant: Address) -> bool {
+        let key = DataKey::Merchant(merchant.clone());
+        match env.storage().persistent().get::<DataKey, MerchantRecord>(&key) {
+            None => false,
+            Some(record) => record.status == MerchantStatus::Active,
+        }
+    }
+
+    /// Returns `true` only when the merchant is registered and KYC verified.
+    pub fn is_kyc_verified(env: Env, merchant: Address) -> bool {
+        let key = DataKey::Merchant(merchant.clone());
+        match env.storage().persistent().get::<DataKey, MerchantRecord>(&key) {
+            None => false,
+            Some(record) => record.kyc_verified,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Internal helpers
+    // ------------------------------------------------------------------
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if &admin != caller {
+            panic!("Caller is not admin");
+        }
+    }
+}
