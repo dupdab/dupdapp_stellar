@@ -91,3 +91,48 @@ fn test_proposer_cannot_approve_own_proposal_twice() {
 
     client.approve(&admin1, &proposal_id);
 }
+
+#[test]
+fn test_admin_rotation_requires_threshold_approval() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
+    let new_admin = Address::generate(&env);
+
+    let proposal_id = client.propose_admin_change(&admin1, &new_admin, &true);
+
+    let proposal_before = client.get_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal_before.approvals.len(), 1);
+    assert!(!proposal_before.executed);
+
+    client.approve(&admin2, &proposal_id);
+
+    let proposal_after = client.get_proposal(&proposal_id).unwrap();
+    assert!(proposal_after.executed);
+    assert!(client.is_admin(&new_admin));
+}
+
+#[test]
+fn test_threshold_change_requires_threshold_approval() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
+
+    let proposal_id = client.propose_threshold_change(&admin1, &3);
+
+    let proposal_before = client.get_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal_before.approvals.len(), 1);
+    assert!(!proposal_before.executed);
+
+    client.approve(&admin2, &proposal_id);
+
+    let proposal_after = client.get_proposal(&proposal_id).unwrap();
+    assert!(proposal_after.executed);
+    assert_eq!(client.get_threshold(), 3);
+}
+
+#[test]
+#[should_panic(expected = "Not admin")]
+fn test_non_admin_cannot_propose_admin_change() {
+    let (env, client, _admin1, _admin2, _admin3) = setup_env();
+    let outsider = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin_change(&outsider, &new_admin, &true);
+}

@@ -147,9 +147,51 @@ fn test_payment_created_events_emitted() {
 #[test]
 fn test_max_batch_size_is_20() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, BatchPaymentContract);
-    let client = BatchPaymentContractClient::new(&env, &contract_id);
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
     assert_eq!(client.max_batch_size(), 20);
+}
+
+#[test]
+fn test_get_payment_returns_record_after_create_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+
+    let merchant = Address::generate(&env);
+    let payments = soroban_sdk::vec![
+        &env,
+        make_payment(&env, 500, "order-abc"),
+        make_payment(&env, 750, "order-def"),
+    ];
+
+    let ids = client.create_batch(&merchant, &payments);
+    assert_eq!(ids.len(), 2);
+
+    let id0 = ids.get(0).unwrap();
+    let record0 = client.get_payment(&id0).unwrap();
+    assert_eq!(record0.id, id0);
+    assert_eq!(record0.amount, 500);
+    assert_eq!(record0.memo, String::from_str(&env, "order-abc"));
+    assert_eq!(record0.merchant, merchant);
+
+    let id1 = ids.get(1).unwrap();
+    let record1 = client.get_payment(&id1).unwrap();
+    assert_eq!(record1.id, id1);
+    assert_eq!(record1.amount, 750);
+    assert_eq!(record1.memo, String::from_str(&env, "order-def"));
+    assert_eq!(record1.merchant, merchant);
+}
+
+#[test]
+fn test_admin_can_set_max_batch_size() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+
+    assert_eq!(client.max_batch_size(), 20);
+    client.set_max_batch_size(&10);
+    assert_eq!(client.max_batch_size(), 10);
 }
 
 #[test]

@@ -61,10 +61,19 @@ pub struct LiquidityRouter;
 #[contractimpl]
 impl LiquidityRouter {
     // Issue #1025: Constructor to initialize admin
+    // Issue #1079: Require auth and guard against re-initialization
+    // Issue #1080: Store config singletons in instance() storage so their TTL
+    // is bumped automatically with every contract call.
     pub fn initialize(env: Env, admin: Address) {
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+        admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
         let pools: Vec<Address> = Vec::new(&env);
-        env.storage().persistent().set(&DataKey::ApprovedPools, &pools);
+        env.storage().instance().set(&DataKey::ApprovedPools, &pools);
         // Issue #1085: Seed the depth threshold with the previous hardcoded default
         env.storage().instance().set(&DataKey::DepthThresholdBps, &DEFAULT_DEPTH_THRESHOLD_BPS);
     }
@@ -74,13 +83,13 @@ impl LiquidityRouter {
         admin.require_auth();
 
         // Verify caller is the admin
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin)
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
             .expect("admin not set");
         if admin != stored_admin {
             panic!("only admin can add pools");
         }
 
-        let mut pools: Vec<Address> = env.storage().persistent().get(&DataKey::ApprovedPools)
+        let mut pools: Vec<Address> = env.storage().instance().get(&DataKey::ApprovedPools)
             .unwrap_or_else(|| Vec::new(&env));
 
         // Prevent duplicates
@@ -90,7 +99,7 @@ impl LiquidityRouter {
                 panic!("max pools reached");
             }
             pools.push_back(pool.clone());
-            env.storage().persistent().set(&DataKey::ApprovedPools, &pools);
+            env.storage().instance().set(&DataKey::ApprovedPools, &pools);
 
             // Issue #1083: Emit event for the allowlist change
             env.events().publish(
@@ -105,13 +114,13 @@ impl LiquidityRouter {
         admin.require_auth();
 
         // Verify caller is the admin
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin)
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
             .expect("admin not set");
         if admin != stored_admin {
             panic!("only admin can remove pools");
         }
 
-        let mut pools: Vec<Address> = env.storage().persistent().get(&DataKey::ApprovedPools)
+        let mut pools: Vec<Address> = env.storage().instance().get(&DataKey::ApprovedPools)
             .unwrap_or_else(|| Vec::new(&env));
 
         // Remove the pool if it exists
@@ -124,7 +133,7 @@ impl LiquidityRouter {
                 removed = true;
             }
         }
-        env.storage().persistent().set(&DataKey::ApprovedPools, &new_pools);
+        env.storage().instance().set(&DataKey::ApprovedPools, &new_pools);
 
         // Issue #1083: Emit event only when a pool was actually removed
         if removed {
@@ -158,7 +167,7 @@ impl LiquidityRouter {
     /// threshold), otherwise returns StellarClassicDEX and emits an event.
     pub fn check_and_route(env: Env, pool_address: Address, amount_in: i128) -> Route {
         // Issue #1025: Validate pool_address against allowlist before calling get_reserves
-        let pools: Vec<Address> = env.storage().persistent().get(&DataKey::ApprovedPools)
+        let pools: Vec<Address> = env.storage().instance().get(&DataKey::ApprovedPools)
             .unwrap_or_else(|| Vec::new(&env));
 
         if !pools.iter().any(|p| p == pool_address) {
