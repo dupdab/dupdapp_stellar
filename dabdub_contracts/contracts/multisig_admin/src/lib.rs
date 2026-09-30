@@ -200,10 +200,14 @@ impl MultisigAdminContract {
     }
 
     fn require_admin(env: &Env, caller: &Address) {
-        let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
-        if !Self::contains_address(&admins, caller) {
+        if !Self::is_admin(env, caller) {
             panic!("Not admin");
         }
+    }
+
+    fn is_admin(env: &Env, caller: &Address) -> bool {
+        let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
+        Self::contains_address(&admins, caller)
     }
 
     fn contains_address(list: &Vec<Address>, addr: &Address) -> bool {
