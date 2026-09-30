@@ -57,6 +57,9 @@ pub enum DataKey {
     EmergencyTreasury,
     EmergencyCooldownLedgers,
     EmergencyLastDrainLedger,
+    UpgradeDelayLedgers,
+    PendingUpgradeHash,
+    PendingUpgradeLedger,
     Payment(BytesN<32>),
     Version,
 }
@@ -82,9 +85,21 @@ struct EmergencyDrainEvent {
     caller: Address,
 }
 
+#[contracttype]
+struct UpgradeScheduledEvent {
+    new_wasm_hash: BytesN<32>,
+    apply_ledger: u32,
+}
+
+#[contracttype]
+struct UpgradeCancelledEvent {
+    new_wasm_hash: BytesN<32>,
+}
+
 const MAX_DISPUTE_WINDOW_LEDGERS: u32 = 51_840;
 const MAX_TTL_LEDGERS: u32 = 518_400;
 const EMERGENCY_SIGNER_COUNT: u32 = 3;
+const DEFAULT_UPGRADE_DELAY_LEDGERS: u32 = 17_280;
 
 #[contract]
 pub struct PaymentEscrowContract;
@@ -142,14 +157,92 @@ impl PaymentEscrowContract {
             .instance()
             .set(&DataKey::EmergencyLastDrainLedger, &0u32);
 
+        // Initialize the upgrade timelock delay to a safe default.
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeDelayLedgers, &DEFAULT_UPGRADE_DELAY_LEDGERS);
+
         // Initialize contract version to 1.
         env.storage().instance().set(&DataKey::Version, &1u32);
     }
 
-    /// Upgrade the contract WASM. Only callable by the admin.
-    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
+    /// Schedule a WASM upgrade. Admin-only. The upgrade does not take effect
+    /// immediately: it must wait out the configured timelock delay and then be
+    /// applied via `apply_upgrade`. This gives affected parties time to notice
+    /// and react before new code can control escrowed funds.
+    pub fn schedule_upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+
+        let delay: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeDelayLedgers)
+            .unwrap_or(DEFAULT_UPGRADE_DELAY_LEDGERS);
+        let apply_ledger = env.ledger().sequence().saturating_add(delay);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgradeHash, &new_wasm_hash);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgradeLedger, &apply_ledger);
+
+        env.events().publish(
+            ("ESCROW", "upgrade_scheduled"),
+            UpgradeScheduledEvent {
+                new_wasm_hash,
+                apply_ledger,
+            },
+        );
+    }
+
+    /// Cancel a previously scheduled upgrade. Admin-only.
+    pub fn cancel_upgrade(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let pending: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeHash)
+            .unwrap_or_else(|| panic!("No pending upgrade"));
+
+        env.storage().instance().remove(&DataKey::PendingUpgradeHash);
+        env.storage().instance().remove(&DataKey::PendingUpgradeLedger);
+
+        env.events().publish(
+            ("ESCROW", "upgrade_cancelled"),
+            UpgradeCancelledEvent {
+                new_wasm_hash: pending,
+            },
+        );
+    }
+
+    /// Apply a previously scheduled upgrade once the timelock delay has
+    /// elapsed. Admin-only. Reverts if no upgrade is pending or the delay has
+    /// not yet passed.
+    pub fn apply_upgrade(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let new_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeHash)
+            .unwrap_or_else(|| panic!("No pending upgrade"));
+        let apply_ledger: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeLedger)
+            .unwrap_or_else(|| panic!("No pending upgrade"));
+
+        if env.ledger().sequence() < apply_ledger {
+            panic!("Upgrade timelock has not elapsed");
+        }
+
+        env.storage().instance().remove(&DataKey::PendingUpgradeHash);
+        env.storage().instance().remove(&DataKey::PendingUpgradeLedger);
 
         let version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
         env.storage().instance().set(&DataKey::Version, &(version + 1));
@@ -160,6 +253,22 @@ impl PaymentEscrowContract {
     /// Return the current contract version.
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Version).unwrap_or(0)
+    }
+
+    /// Return the currently pending upgrade hash and its apply ledger, if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<(BytesN<32>, u32)> {
+        let hash: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeHash);
+        let apply_ledger: Option<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgradeLedger);
+        match (hash, apply_ledger) {
+            (Some(h), Some(l)) => Some((h, l)),
+            _ => None,
+        }
     }
 
     /// Update (or remove) the merchant registry address.  Admin-only.
@@ -275,356 +384,6 @@ impl PaymentEscrowContract {
         let mut payment = Self::get_payment(env.clone(), payment_id.clone());
         Self::require_releasable(&env, &payment);
 
-        let remaining = Self::remaining_amount(&payment);
-        if remaining <= 0 {
-            panic!("Payment fully released");
-        }
+        let remaini
 
-        Self::transfer_from_contract(&env, &payment.merchant, remaining, &payment.asset_type);
-        payment.released_amount = payment.amount;
-        payment.status = PaymentStatus::Released;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
-
-        env.events().publish(
-            ("ESCROW", "release"),
-            EscrowStateEvent {
-                payment_id,
-                amount: remaining,
-            },
-        );
-    }
-
-    pub fn release_partial(env: Env, caller: Address, payment_id: BytesN<32>, amount: i128) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        if amount <= 0 {
-            panic!("Release amount must be > 0");
-        }
-
-        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
-        Self::require_releasable(&env, &payment);
-
-        let remaining = Self::remaining_amount(&payment);
-        if remaining <= 0 {
-            panic!("Payment fully released");
-        }
-        if amount > remaining {
-            panic!("Release amount exceeds remaining balance");
-        }
-
-        Self::transfer_from_contract(&env, &payment.merchant, amount, &payment.asset_type);
-        payment.released_amount += amount;
-        if payment.released_amount == payment.amount {
-            payment.status = PaymentStatus::Released;
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
-
-        env.events().publish(
-            ("ESCROW", "release"),
-            EscrowStateEvent {
-                payment_id,
-                amount,
-            },
-        );
-    }
-
-    pub fn expire(env: Env, payment_id: BytesN<32>) {
-        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
-        Self::require_expirable(&env, &payment);
-
-        let remaining = Self::remaining_amount(&payment);
-        if remaining <= 0 {
-            panic!("Payment fully released");
-        }
-        Self::transfer_from_contract(&env, &payment.customer, remaining, &payment.asset_type);
-
-        payment.released_amount = payment.amount;
-        payment.status = PaymentStatus::Expired;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
-
-        env.events().publish(
-            ("ESCROW", "expired"),
-            EscrowStateEvent {
-                payment_id,
-                amount: remaining,
-            },
-        );
-    }
-
-    pub fn refund(env: Env, payment_id: BytesN<32>) {
-        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
-        Self::require_expirable(&env, &payment);
-
-        let remaining = Self::remaining_amount(&payment);
-        if remaining <= 0 {
-            panic!("Payment fully released");
-        }
-
-        Self::transfer_from_contract(&env, &payment.customer, remaining, &payment.asset_type);
-        payment.released_amount = payment.amount;
-        payment.status = PaymentStatus::Expired;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
-
-        env.events().publish(
-            ("ESCROW", "refund"),
-            EscrowStateEvent {
-                payment_id,
-                amount: remaining,
-            },
-        );
-    }
-
-    /// Opens a dispute on a payment still in `Pending` status.
-    ///
-    /// Note (#1023): `release_partial` keeps a payment `Pending` until it is
-    /// fully released, so a payment that already had one or more partial
-    /// releases sent to the merchant can still be disputed here. This is
-    /// intentional: `resolve_dispute` only ever moves `remaining_amount()`
-    /// (`amount - released_amount`) to the winner, so a customer disputing
-    /// after accepting partial delivery recovers only the undelivered
-    /// remainder — funds already released to the merchant are not clawed
-    /// back. See `test_dispute_after_partial_release_resolves_to_customer`
-    /// and `test_dispute_after_partial_release_resolves_to_merchant`.
-    pub fn dispute(env: Env, caller: Address, payment_id: BytesN<32>, _reason: String) {
-        caller.require_auth();
-
-        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
-        if payment.status == PaymentStatus::Disputed {
-            panic!("Dispute already open");
-        }
-        if payment.status != PaymentStatus::Pending {
-            panic!("Payment is not pending");
-        }
-        if caller != payment.customer && caller != payment.merchant {
-            panic!("Not payment participant");
-        }
-        if env.ledger().sequence() > payment.dispute_window_end {
-            panic!("Dispute window expired");
-        }
-
-        payment.status = PaymentStatus::Disputed;
-        payment.dispute_reason = Some(_reason.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
-
-        env.events().publish(
-            ("ESCROW", "dispute"),
-            EscrowStateEvent {
-                payment_id,
-                amount: Self::remaining_amount(&payment),
-            },
-        );
-    }
-
-    pub fn resolve_dispute(env: Env, caller: Address, payment_id: BytesN<32>, winner: Address) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
-        if payment.status != PaymentStatus::Disputed {
-            panic!("Dispute is not open");
-        }
-        if winner != payment.customer && winner != payment.merchant {
-            panic!("Invalid dispute winner");
-        }
-
-        let remaining = Self::remaining_amount(&payment);
-        if remaining <= 0 {
-            panic!("Payment fully released");
-        }
-
-        Self::transfer_from_contract(&env, &winner, remaining, &payment.asset_type);
-        payment.status = if winner == payment.merchant {
-            PaymentStatus::Released
-        } else {
-            PaymentStatus::Expired
-        };
-        payment.released_amount = payment.amount;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
-
-        let topic = if winner == payment.merchant {
-            "release"
-        } else {
-            "refund"
-        };
-        env.events().publish(
-            ("ESCROW", topic),
-            EscrowStateEvent {
-                payment_id,
-                amount: remaining,
-            },
-        );
-    }
-
-    pub fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrow {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Payment(payment_id))
-            .expect("Payment not found")
-    }
-
-    pub fn get_balance(env: Env, payment_id: BytesN<32>) -> i128 {
-        let payment = Self::get_payment(env, payment_id);
-        Self::remaining_amount(&payment)
-    }
-
-    pub fn get_expiry(env: Env, payment_id: BytesN<32>) -> u32 {
-        Self::get_payment(env, payment_id).expiry
-    }
-
-    pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
-    }
-
-    pub fn get_xlm_token(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::XlmToken).unwrap()
-    }
-
-    pub fn get_usdc_token(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::UsdcToken).unwrap()
-    }
-
-    pub fn get_default_ttl_ledgers(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::DefaultTtlLedgers)
-            .unwrap()
-    }
-
-    pub fn get_max_dispute_window_ledgers(_env: Env) -> u32 {
-        MAX_DISPUTE_WINDOW_LEDGERS
-    }
-
-    pub fn get_max_ttl_ledgers(_env: Env) -> u32 {
-        MAX_TTL_LEDGERS
-    }
-
-    pub fn emergency_drain(env: Env, caller: Address, signer_one: Address, signer_two: Address) -> i128 {
-        caller.require_auth();
-        if signer_one == signer_two {
-            panic!("Emergency signers must be distinct");
-        }
-        signer_one.require_auth();
-        signer_two.require_auth();
-        Self::require_emergency_signer(&env, &signer_one);
-        Self::require_emergency_signer(&env, &signer_two);
-
-        let current_ledger = env.ledger().sequence();
-        let last_drain_ledger: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::EmergencyLastDrainLedger)
-            .unwrap_or(0);
-        let cooldown_ledgers: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::EmergencyCooldownLedgers)
-            .unwrap();
-        if last_drain_ledger != 0
-            && current_ledger < last_drain_ledger.saturating_add(cooldown_ledgers)
-        {
-            panic!("Emergency drain cooldown active");
-        }
-
-        let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
-        let treasury: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::EmergencyTreasury)
-            .unwrap();
-        let token_client = token::Client::new(&env, &usdc_token);
-        let contract_address = env.current_contract_address();
-        let amount = token_client.balance(&contract_address);
-        if amount <= 0 {
-            panic!("No escrow funds to drain");
-        }
-
-        token_client.transfer(&contract_address, &treasury, &amount);
-        env.storage()
-            .instance()
-            .set(&DataKey::EmergencyLastDrainLedger, &current_ledger);
-        env.events().publish(
-            ("ESCROW", "emergency_drain"),
-            EmergencyDrainEvent { amount, caller },
-        );
-
-        amount
-    }
-
-    fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != &admin {
-            panic!("Not admin");
-        }
-    }
-
-    fn require_releasable(env: &Env, payment: &PaymentEscrow) {
-        if payment.status == PaymentStatus::Disputed {
-            panic!("Dispute is open");
-        }
-        if payment.status == PaymentStatus::Released {
-            panic!("Payment fully released");
-        }
-        if payment.status == PaymentStatus::Expired {
-            panic!("Payment expired");
-        }
-        if env.ledger().sequence() > payment.expiry {
-            panic!("Payment expired");
-        }
-    }
-
-    fn require_expirable(env: &Env, payment: &PaymentEscrow) {
-        if payment.status == PaymentStatus::Disputed {
-            panic!("Dispute is open");
-        }
-        if payment.status == PaymentStatus::Released {
-            panic!("Payment fully released");
-        }
-        if payment.status != PaymentStatus::Pending {
-            panic!("Payment is not pending");
-        }
-        if env.ledger().sequence() <= payment.expiry {
-            panic!("Payment has not expired");
-        }
-    }
-
-    fn remaining_amount(payment: &PaymentEscrow) -> i128 {
-        payment.amount.saturating_sub(payment.released_amount)
-    }
-
-    fn token_address(env: &Env, asset_type: &AssetType) -> Address {
-        match asset_type {
-            AssetType::Xlm => env.storage().instance().get(&DataKey::XlmToken).unwrap(),
-            AssetType::Usdc => env.storage().instance().get(&DataKey::UsdcToken).unwrap(),
-        }
-    }
-
-    fn transfer_from_contract(env: &Env, recipient: &Address, amount: i128, asset_type: &AssetType) {
-        let token_addr = Self::token_address(env, asset_type);
-        token::Client::new(env, &token_addr)
-            .transfer(&env.current_contract_address(), recipient, &amount);
-    }
-
-    fn require_emergency_signer(env: &Env, signer: &Address) {
-        let signers: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::EmergencySigners)
-            .unwrap();
-        if signers.iter().all(|configured| configured != *signer) {
-            panic!("Not emergency signer");
-        }
-    }
-}
+/* … truncated 12049 chars — edit only what you need near the top … */
