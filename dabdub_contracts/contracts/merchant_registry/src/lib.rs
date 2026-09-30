@@ -26,6 +26,14 @@ pub struct MerchantRecord {
     /// Negotiated fee rate for this merchant, in basis points (1/100th of a
     /// percent). Defaults to `DEFAULT_FEE_BPS` at registration and can be
     /// overridden per-merchant by the admin via `update_fee_tier`.
+    ///
+    /// `0` is a valid, intentional fee rate (0%) and is distinct from an
+    /// "unset" value: every registered merchant always has an explicit
+    /// `fee_bps` (seeded with `DEFAULT_FEE_BPS` at registration), so a `0`
+    /// read back from `get_fee_tier`/`get_merchant` means the admin
+    /// deliberately set this merchant's rate to 0% via `update_fee_tier`
+    /// (e.g. a VIP or promotional arrangement), not that no fee was ever
+    /// configured.
     pub fee_bps: u32,
 }
 
@@ -262,25 +270,6 @@ impl MerchantRegistryContract {
         let merchants: Vec<Address> = env
             .storage()
             .instance()
-            .get(&DataKey::Merchants)
-            .unwrap();
-        let mut remaining: Vec<Address> = Vec::new(&env);
-        for existing in merchants.iter() {
-            if existing != merchant {
-                remaining.push_back(existing);
-            }
-        }
-        env.storage().instance().set(&DataKey::Merchants, &remaining);
 
-        env.events().publish(
-            ("REGISTRY", "merchant_terminated"),
-            MerchantTerminatedEvent { merchant: merchant.clone() },
-        );
-    }
 
-    /// Set the KYC verification status for a merchant.  Admin-only.
-    pub fn set_kyc_status(env: Env, caller: Address, merchant: Address, verified: bool) {
-        caller.require_auth();
-      
-
-/* … truncated 5419 chars — edit only what you need near the top … */
+/* … truncated 776 chars — edit only what you need near the top … */
