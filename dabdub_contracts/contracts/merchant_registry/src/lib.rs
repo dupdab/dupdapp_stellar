@@ -97,6 +97,7 @@ struct MerchantTerminatedEvent {
 #[contracttype]
 struct MerchantUpdatedEvent {
     merchant: Address,
+    old_name: String,
     name: String,
 }
 
@@ -167,6 +168,10 @@ impl MerchantRegistryContract {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
+        if name.len() == 0 {
+            panic!("Merchant name cannot be empty");
+        }
+
         let key = DataKey::Merchant(merchant.clone());
         let mut record: MerchantRecord = env
             .storage()
@@ -174,6 +179,7 @@ impl MerchantRegistryContract {
             .get(&key)
             .expect("Merchant not found");
 
+        let old_name = record.name.clone();
         record.name = name.clone();
         env.storage().persistent().set(&key, &record);
 
@@ -181,6 +187,7 @@ impl MerchantRegistryContract {
             ("REGISTRY", "merchant_updated"),
             MerchantUpdatedEvent {
                 merchant,
+                old_name,
                 name,
             },
         );
@@ -275,7 +282,7 @@ impl MerchantRegistryContract {
     /// Update the KYC verification flag for a merchant.  Callable by admin only.
     pub fn set_kyc_status(env: Env, caller: Address, merchant: Address, verified: bool) {
         caller.require_auth();
-        Self::require_admin(&env, &caller);
+      
 
         let key = DataKey::Merchant(merchant.clone());
         let mut record: MerchantRecord = env

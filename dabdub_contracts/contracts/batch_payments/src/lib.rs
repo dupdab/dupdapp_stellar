@@ -6,7 +6,7 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, vec, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Vec,
 };
 
-const MAX_BATCH_SIZE: u32 = 20;
+const DEFAULT_MAX_BATCH_SIZE: u32 = 20;
 
 #[contracttype]
 #[derive(Clone)]
@@ -14,7 +14,9 @@ enum DataKey {
     Admin,
     MinAmount,
     MaxAmount,
+    MaxBatchSize,
     Counter,
+    Payment(BytesN<32>),
 }
 
 /// A single payment input in the batch.
@@ -62,6 +64,7 @@ impl BatchPaymentContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MinAmount, &min_amount);
         env.storage().instance().set(&DataKey::MaxAmount, &max_amount);
+        env.storage().instance().set(&DataKey::MaxBatchSize, &DEFAULT_MAX_BATCH_SIZE);
         env.storage().instance().set(&DataKey::Counter, &0u64);
     }
 
@@ -89,7 +92,27 @@ impl BatchPaymentContract {
         );
     }
 
-    /// Create up to 20 payments atomically in a single contract invocation.
+    /// Update the maximum batch size. Admin-only.
+    pub fn set_max_batch_size(env: Env, new_max: u32) {
+        if new_max == 0 {
+            panic!("max batch size must be > 0");
+        }
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("contract not initialized"));
+        admin.require_auth();
+
+        env.storage().instance().set(&DataKey::MaxBatchSize, &new_max);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "MaxBatchSizeUpdated"),),
+            (new_max,),
+        );
+    }
+
+    /// Create up to max_batch_size payments atomically in a single contract invocation.
     ///
     /// Validates every input before any state is written — if any item is
     /// invalid the entire batch reverts. Emits a `PaymentCreated` event for
@@ -113,13 +136,18 @@ impl BatchPaymentContract {
             .instance()
             .get(&DataKey::MaxAmount)
             .unwrap_or_else(|| panic!("contract not initialized"));
+        let max_batch_size: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxBatchSize)
+            .unwrap_or(DEFAULT_MAX_BATCH_SIZE);
 
         let count = payments.len();
         if count == 0 {
             panic!("batch must contain at least one payment");
         }
-        if count > MAX_BATCH_SIZE {
-            panic!("batch exceeds maximum of 20 payments");
+        if count > max_batch_size {
+            panic!("batch exceeds maximum of {} payments", max_batch_size);
         }
 
         // ── Validation pass (all items checked before any state write) ────────
@@ -135,12 +163,6 @@ impl BatchPaymentContract {
 
         // ── Creation pass ─────────────────────────────────────────────────────
         let mut payment_ids: Vec<BytesN<32>> = vec![&env];
-        let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap();
-
-        // Issue #1024: a monotonically increasing per-contract counter,
-        // hashed together with the merchant and payment contents, so two
-        // merchants (or the same merchant twice) landing in the same ledger
-        // can never derive the same payment ID.
         let mut counter: u64 = env
             .storage()
             .instance()
@@ -151,17 +173,48 @@ impl BatchPaymentContract {
             let item = payments.get(i).unwrap();
 
             let new_counter = counter + i as u64;
-            let mut seed_bytes = soroban_sdk::vec![&env];
+            let mut seed_bytes = Bytes::new(&env);
             seed_bytes.extend_from_array(&(env.ledger().sequence() as u64).to_be_bytes());
             seed_bytes.extend_from_array(&new_counter.to_be_bytes());
-            seed_bytes.extend_from_array(&merchant.clone().to_xdr(&env).to_bytes().as_ref());
+            seed_bytes.append(&merchant.clone().to_xdr(&env));
 
-            let id_bytes: BytesN<32> = env
-                .crypto()
-                .sha256(&seed_bytes)
-                .into();
+            let id_bytes: BytesN<32> = env.crypto().sha256(&seed_bytes).into();
+
+            let record = PaymentRecord {
+                id: id_bytes.clone(),
+                amount: item.amount,
+                memo: item.memo.clone(),
+                merchant: merchant.clone(),
+            };
+            env.storage().persistent().set(&DataKey::Payment(id_bytes.clone()), &record);
+
+            let record = PaymentRecord {
+                id: id_bytes.clone(),
+                amount: item.amount,
+                memo: item.memo.clone(),
+                merchant: merchant.clone(),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(id_bytes.clone()), &record);
 
             // Emit PaymentCreated event — one per batch entry.
+            env.events().publish(
+                (soroban_sdk::Symbol::new(&env, "PaymentCreated"),),
+                (id_bytes.clone(), merchant.clone(), item.amount, item.memo.clone()),
+            );
+
+            payment_ids.push_back(id_bytes);
+        }
+
+        let final_counter = counter + count as u64;
+        env.storage().instance().set(&DataKey::Counter, &final_counter);
+
+        payment_ids
+    }
+
+    /// Returns the on-chain record for a previously created payment, if any.
+    pub
             env.events().publish(
                 (soroban_sdk::Symbol::new(&env, "PaymentCreated"),),
                 (id_bytes.clone(), merchant.clone(), item.amount, item.memo.clone()),
@@ -182,8 +235,11 @@ impl BatchPaymentContract {
     }
 
     /// Returns the maximum allowed batch size.
-    pub fn max_batch_size(_env: Env) -> u32 {
-        MAX_BATCH_SIZE
+    pub fn max_batch_size(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxBatchSize)
+            .unwrap_or(DEFAULT_MAX_BATCH_SIZE)
     }
 
     /// Return the currently configured min and max payment amounts.
