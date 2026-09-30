@@ -101,9 +101,38 @@ impl LiquidityRouter {
             panic!("pool is not approved");
         }
 
-        // Query AMM reserves via cross-contract call
+        // Issue #1086: Query AMM reserves via cross-contract call using the
+        // fallible `try_get_reserves` pattern. A previously-approved pool may
+        // have been upgraded to a contract that no longer implements
+        // `AmmInterface`, or may simply revert. In that case we must not let
+        // the raw panic propagate and break every `check_and_route` call.
+        //
+        // Expected behavior: a failed `get_reserves` call is treated the same
+        // as a shallow pool — we fall back to `Route::StellarClassicDEX` and
+        // emit `FallbackRouteUsed` (with reserve = 0, since no reserve could
+        // be read) rather than propagating the error.
         let amm_client = AmmClient::new(&env, &pool_address);
-        let (reserve_a, _reserve_b) = amm_client.get_reserves();
+        let reserves = match amm_client.try_get_reserves() {
+            Ok(Ok((reserve_a, _reserve_b))) => Some(reserve_a),
+            Ok(Err(_)) | Err(_) => None,
+        };
+
+        let reserve_a = match reserves {
+            Some(r) => r,
+            None => {
+                // Cross-contract call failed or reverted: degrade gracefully to
+                // the classic DEX fallback instead of panicking.
+                env.events().publish(
+                    (Symbol::new(&env, "FallbackRouteUsed"),),
+                    FallbackRouteUsed {
+                        pool_id: pool_address,
+                        amount: amount_in,
+                        reserve: 0,
+                    },
+                );
+                return Route::StellarClassicDEX;
+            }
+        };
 
         // Issue #1081: Validate the cross-contract AMM response before trusting it.
         // A misbehaving or malicious pool could return a negative or nonsensical
