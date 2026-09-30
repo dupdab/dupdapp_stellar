@@ -130,3 +130,62 @@ fn test_borderline_depth() {
     let route = client.check_and_route(&pool, &10_000);
     assert_eq!(route, Route::StellarClassicDEX);
 }
+
+#[test]
+fn test_default_depth_threshold_is_1000_bps() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+
+    // With no explicit configuration the threshold defaults to 1000 bps (10%),
+    // preserving the previous hardcoded behavior.
+    assert_eq!(client.get_depth_threshold_bps(), 1000);
+
+    // amount_in (1_000) < reserve (100_000) * 1000 / 10_000 => SorobanAMM
+    let route = client.check_and_route(&pool, &1_000);
+    assert_eq!(route, Route::SorobanAMM);
+}
+
+#[test]
+fn test_set_depth_threshold_bps_updates_routing() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+
+    // Raise the threshold to 5000 bps (50%).
+    client.set_depth_threshold_bps(&admin, &5_000);
+    assert_eq!(client.get_depth_threshold_bps(), 5_000);
+
+    // amount_in (50_000) < reserve (100_000) * 5000 / 10_000 (50_000) is false,
+    // so it still routes to the classic DEX at the boundary.
+    let route = client.check_and_route(&pool, &50_000);
+    assert_eq!(route, Route::StellarClassicDEX);
+
+    // amount_in (40_000) < 50_000 => SorobanAMM under the raised threshold.
+    let route = client.check_and_route(&pool, &40_000);
+    assert_eq!(route, Route::SorobanAMM);
+}
+
+#[test]
+fn test_set_depth_threshold_bps_lowers_threshold() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+
+    // Lower the threshold to 100 bps (1%).
+    client.set_depth_threshold_bps(&admin, &100);
+
+    // amount_in (1_000) < reserve (100_000) * 100 / 10_000 (1_000) is false,
+    // so it now routes to the classic DEX.
+    let route = client.check_and_route(&pool, &1_000);
+    assert_eq!(route, Route::StellarClassicDEX);
+}
+
+#[test]
+fn test_set_depth_threshold_bps_rejects_out_of_range() {
+    let (_env, client, admin) = setup();
+
+    // A threshold above 100% (10_000 bps) is invalid.
+    let result = client.try_set_depth_threshold_bps(&admin, &10_001);
+    assert!(result.is_err());
+}

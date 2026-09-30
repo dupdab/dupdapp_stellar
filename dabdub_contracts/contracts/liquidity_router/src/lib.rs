@@ -8,6 +8,9 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Ve
 // add_pool/remove_pool/check_and_route from scaling without limit.
 const MAX_POOLS: u32 = 100;
 
+// Issue #1085: Default AMM depth threshold (10% impact) in basis points.
+const DEFAULT_DEPTH_THRESHOLD_BPS: u32 = 1000;
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Route {
@@ -21,6 +24,8 @@ pub enum Route {
 pub enum DataKey {
     Admin,
     ApprovedPools,
+    // Issue #1085: Admin-configurable AMM depth threshold in basis points
+    DepthThresholdBps,
 }
 
 #[contracttype]
@@ -60,6 +65,8 @@ impl LiquidityRouter {
         env.storage().persistent().set(&DataKey::Admin, &admin);
         let pools: Vec<Address> = Vec::new(&env);
         env.storage().persistent().set(&DataKey::ApprovedPools, &pools);
+        // Issue #1085: Seed the depth threshold with the previous hardcoded default
+        env.storage().instance().set(&DataKey::DepthThresholdBps, &DEFAULT_DEPTH_THRESHOLD_BPS);
     }
 
     // Issue #1025: Add pool to allowlist (admin-gated)
@@ -128,9 +135,27 @@ impl LiquidityRouter {
         }
     }
 
+    // Issue #1085: Admin-gated setter for the AMM depth threshold (in bps)
+    pub fn set_depth_threshold_bps(env: Env, admin: Address, threshold_bps: u32) {
+        admin.require_auth();
+
+        // Verify caller is the admin
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin)
+            .expect("admin not set");
+        if admin != stored_admin {
+            panic!("only admin can set depth threshold");
+        }
+
+        if threshold_bps == 0 || threshold_bps > 10_000 {
+            panic!("invalid depth threshold");
+        }
+
+        env.storage().instance().set(&DataKey::DepthThresholdBps, &threshold_bps);
+    }
+
     /// Checks if the AMM pool has sufficient depth for a swap.
-    /// Returns SorobanAMM if depth is sufficient (< 10% impact),
-    /// otherwise returns StellarClassicDEX and emits an event.
+    /// Returns SorobanAMM if depth is sufficient (impact below the configured
+    /// threshold), otherwise returns StellarClassicDEX and emits an event.
     pub fn check_and_route(env: Env, pool_address: Address, amount_in: i128) -> Route {
         // Issue #1025: Validate pool_address against allowlist before calling get_reserves
         let pools: Vec<Address> = env.storage().persistent().get(&DataKey::ApprovedPools)
@@ -144,9 +169,13 @@ impl LiquidityRouter {
         let amm_client = AmmClient::new(&env, &pool_address);
         let (reserve_a, _reserve_b) = amm_client.get_reserves();
 
-        // Depth check: amount_in must be less than 10% of reserves
-        // S < R / 10
-        if amount_in < reserve_a / 10 {
+        // Issue #1085: Depth check against the admin-configurable threshold.
+        // amount_in must be less than threshold_bps of reserves: S < R * bps / 10000
+        let threshold_bps: u32 = env.storage().instance()
+            .get(&DataKey::DepthThresholdBps)
+            .unwrap_or(DEFAULT_DEPTH_THRESHOLD_BPS);
+
+        if amount_in < reserve_a * (threshold_bps as i128) / 10_000 {
             Route::SorobanAMM
         } else {
             // Emit FallbackRouteUsed event
