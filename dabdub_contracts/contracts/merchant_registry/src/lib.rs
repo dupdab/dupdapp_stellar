@@ -72,6 +72,8 @@ const MAX_FEE_BPS: u32 = 1000;
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
+    /// Pending admin proposed via `propose_admin`, awaiting `accept_admin`.
+    PendingAdmin,
     Merchant(Address),
     /// Index of all registered merchant addresses, for paginated listing.
     Merchants,
@@ -101,6 +103,12 @@ struct MerchantReactivatedEvent {
 struct KYCStatusUpdatedEvent {
     merchant: Address,
     verified: bool,
+}
+
+#[contracttype]
+struct AdminTransferProposedEvent {
+    current_admin: Address,
+    pending_admin: Address,
 }
 
 #[contracttype]
@@ -144,6 +152,69 @@ impl MerchantRegistryContract {
         env.storage()
             .instance()
             .set(&DataKey::Merchants, &Vec::<Address>::new(&env));
+    }
+
+    // ------------------------------------------------------------------
+    // Admin – two-step handover
+    // ------------------------------------------------------------------
+
+    /// Propose a new admin. Callable by the current admin only.
+    ///
+    /// The proposal does not take effect until the proposed address calls
+    /// `accept_admin`, so a typo'd or unreachable `new_admin` cannot lock the
+    /// registry: the current admin stays in control and can re-propose (or
+    /// correct) the pending address at any time.
+    pub fn propose_admin(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+
+        env.events().publish(
+            ("REGISTRY", "admin_transfer_proposed"),
+            AdminTransferProposedEvent {
+                current_admin: caller,
+                pending_admin: new_admin,
+            },
+        );
+    }
+
+    /// Complete a pending admin transfer. Callable by the pending admin only.
+    ///
+    /// Requires the pending admin's own `require_auth`, so the transfer only
+    /// takes effect once the proposed address proves control of itself.
+    pub fn accept_admin(env: Env) {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .expect("No pending admin transfer");
+
+        pending.require_auth();
+
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events().publish(
+            ("REGISTRY", "admin_transferred"),
+            AdminTransferredEvent {
+                old_admin,
+                new_admin: pending,
+            },
+        );
+    }
+
+    /// Read the pending admin, if a transfer has been proposed.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     // ------------------------------------------------------------------
@@ -253,140 +324,6 @@ impl MerchantRegistryContract {
             panic!("Merchant already active");
         }
         if record.status == MerchantStatus::Terminated {
-            panic!("Cannot reactivate terminated merchant");
-        }
+            panic!("Cannot reac
 
-        record.status = MerchantStatus::Active;
-        env.storage().persistent().set(&key, &record);
-
-        env.events().publish(
-            ("REGISTRY", "merchant_reactivated"),
-            MerchantReactivatedEvent { merchant: merchant.clone() },
-        );
-    }
-
-    /// Permanently terminate a merchant.  Callable by admin only.
-    /// Unlike suspension, termination is irreversible: a terminated
-    /// merchant can never be reactivated (see `reactivate_merchant`) or
-    /// suspended again (see `suspend_merchant`).
-    ///
-    /// The terminated merchant's address is also removed from the
-    /// `DataKey::Merchants` index so that `merchants()` no longer lists it.
-    pub fn terminate_merchant(env: Env, caller: Address, merchant: Address) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let key = DataKey::Merchant(merchant.clone());
-        let mut record: MerchantRecord = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Merchant not found");
-
-        if record.status == MerchantStatus::Terminated {
-            panic!("Merchant already terminated");
-        }
-
-        record.status = MerchantStatus::Terminated;
-        env.storage().persistent().set(&key, &record);
-
-        // Remove from the listing index so `merchants()` no longer lists it.
-        let merchants: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Merchants)
-            .unwrap();
-        let mut updated = Vec::<Address>::new(&env);
-        for addr in merchants.iter() {
-            if addr != merchant {
-                updated.push_back(addr);
-            }
-        }
-        env.storage().instance().set(&DataKey::Merchants, &updated);
-
-        env.events().publish(
-            ("REGISTRY", "merchant_terminated"),
-            MerchantTerminatedEvent { merchant: merchant.clone() },
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Status queries
-    // ------------------------------------------------------------------
-
-    /// Rich status query that distinguishes an unregistered merchant from a
-    /// registered merchant that is suspended, terminated, or not KYC
-    /// verified.  The boolean conveniences below remain available and keep
-    /// their existing semantics.
-    pub fn get_merchant_status(env: Env, merchant: Address) -> MerchantStatusInfo {
-        let key = DataKey::Merchant(merchant.clone());
-        match env.storage().persistent().get::<DataKey, MerchantRecord>(&key) {
-            None => MerchantStatusInfo {
-                registered: false,
-                status: None,
-                is_active: false,
-                is_suspended: false,
-                is_terminated: false,
-                is_kyc_verified: false,
-                is_approved: false,
-            },
-            Some(record) => {
-                let is_active = record.status == MerchantStatus::Active;
-                let is_suspended = record.status == MerchantStatus::Suspended;
-                let is_terminated = record.status == MerchantStatus::Terminated;
-                MerchantStatusInfo {
-                    registered: true,
-                    status: Some(record.status.clone()),
-                    is_active,
-                    is_suspended,
-                    is_terminated,
-                    is_kyc_verified: record.kyc_verified,
-                    is_approved: is_active && record.kyc_verified,
-                }
-            }
-        }
-    }
-
-    /// Returns `true` only when the merchant is registered, active, and KYC
-    /// verified.  Returns `false` for unregistered, suspended, terminated,
-    /// or not-KYC-verified merchants; use `get_merchant_status` to tell those
-    /// cases apart.
-    pub fn is_approved(env: Env, merchant: Address) -> bool {
-        let key = DataKey::Merchant(merchant.clone());
-        match env.storage().persistent().get::<DataKey, MerchantRecord>(&key) {
-            None => false,
-            Some(record) => {
-                record.status == MerchantStatus::Active && record.kyc_verified
-            }
-        }
-    }
-
-    /// Returns `true` only when the merchant is registered and active.
-    pub fn is_merchant_active(env: Env, merchant: Address) -> bool {
-        let key = DataKey::Merchant(merchant.clone());
-        match env.storage().persistent().get::<DataKey, MerchantRecord>(&key) {
-            None => false,
-            Some(record) => record.status == MerchantStatus::Active,
-        }
-    }
-
-    /// Returns `true` only when the merchant is registered and KYC verified.
-    pub fn is_kyc_verified(env: Env, merchant: Address) -> bool {
-        let key = DataKey::Merchant(merchant.clone());
-        match env.storage().persistent().get::<DataKey, MerchantRecord>(&key) {
-            None => false,
-            Some(record) => record.kyc_verified,
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------
-
-    fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if &admin != caller {
-            panic!("Caller is not admin");
-        }
-    }
-}
+/* … truncated 5375 chars — edit only what you need near the top … */
