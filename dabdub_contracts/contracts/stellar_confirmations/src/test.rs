@@ -109,6 +109,41 @@ fn test_update_confirmation_count() {
 }
 
 #[test]
+fn test_lowering_confirmation_count_mid_flight_weakens_guarantee() {
+    // Documents current (buggy) behavior: lowering ConfirmationCount after a
+    // payment has already accrued some confirmations under the higher
+    // threshold causes it to settle immediately at the new, lower threshold —
+    // the payment does not need to re-accrue confirmations from scratch.
+    let (env, admin, client) = setup(5);
+    let payment_id = pid(&env, 9);
+    let merchant = Address::generate(&env);
+
+    // Record some confirmations under the higher threshold — not enough to settle.
+    confirm_n(&client, &admin, &payment_id, &merchant, 2);
+    assert!(!client.is_settling(&payment_id));
+
+    // Admin lowers the required confirmation count mid-flight.
+    client.set_confirmation_count(&admin, &2);
+    assert_eq!(client.get_confirmation_count(), 2);
+
+    // A single further confirmation now settles the payment immediately at
+    // the lower, now-current threshold.
+    client.confirm_payment(&admin, &payment_id, &2001, &100_000, &merchant);
+
+    assert_eq!(client.get_payment_confirmations(&payment_id), 3);
+    assert!(client.is_settling(&payment_id));
+}
+
+#[test]
+#[should_panic(expected = "not admin")]
+fn test_set_confirmation_count_unauthorized_caller_panics() {
+    let (env, _admin, client) = setup(5);
+    let not_admin = Address::generate(&env);
+
+    client.set_confirmation_count(&not_admin, &2);
+}
+
+#[test]
 fn test_large_threshold() {
     let (env, admin, client) = setup(12);
     let payment_id = pid(&env, 8);

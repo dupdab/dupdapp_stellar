@@ -1,12 +1,35 @@
+//! # admin_timelock
+//!
+//! A delay-gated change-scheduling contract. A single `Admin` address may
+//! schedule, apply, and cancel parameter changes, subject to a minimum
+//! timelock delay.
+//!
+//! ## Composing with multisig_admin
+//!
+//! Deploying this contract with its `admin` set to an EOA (externally-owned
+//! account / single key) rather than to a `multisig_admin` contract address
+//! means that one compromised private key is sufficient to schedule **and**
+//! subsequently apply any change once the delay elapses — defeating the
+//! purpose of multi-party review.
+//!
+//! **Recommended deployment**: set the `admin` constructor argument to the
+//! deployed address of a `multisig_admin` instance (2-of-3). Every call to
+//! `schedule_change`, `apply_change`, and `cancel_change` then requires a
+//! `multisig_admin` proposal to reach the 2-of-3 approval threshold before
+//! `admin_timelock` will accept it, providing the independent second check
+//! the timelock is designed to enforce.
+//!
+//! See `test.rs` for an integration test that demonstrates this composition.
+
 #![no_std]
 
 mod test;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String,
+    contract, contractimpl, contracttype, vec, Address, Bytes, BytesN, Env, String, Vec,
 };
 
-const MIN_DELAY_LEDGERS: u32 = 1;
+const MIN_DELAY_LEDGERS: u32 = 17_280;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +57,7 @@ pub enum DataKey {
     Admin,
     Counter,
     Change(BytesN<32>),
+    PendingList,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +85,12 @@ struct ChangeCancelledEvent {
     param: String,
 }
 
+#[contracttype]
+struct AdminRotatedEvent {
+    old_admin: Address,
+    new_admin: Address,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -73,10 +103,13 @@ impl AdminTimelockContract {
     pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Counter, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingList, &Vec::<BytesN<32>>::new(&env));
     }
 
     /// Queue a parameter change. Returns the change_id.
-    /// delay_ledgers must be at least 17_280 (~24 hours at 5 s/ledger).
+    /// delay_ledgers must be at least MIN_DELAY_LEDGERS (~24 hours at 5 s/ledger).
     pub fn schedule_change(
         env: Env,
         caller: Address,
@@ -117,6 +150,16 @@ impl AdminTimelockContract {
             .persistent()
             .set(&DataKey::Change(change_id.clone()), &change);
 
+        let mut pending: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingList)
+            .unwrap_or_else(|| Vec::new(&env));
+        pending.push_back(change_id.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingList, &pending);
+
         env.events().publish(
             ("TIMELOCK", "change_scheduled"),
             ChangeScheduledEvent {
@@ -131,6 +174,16 @@ impl AdminTimelockContract {
     }
 
     /// Execute a queued change after the delay has elapsed.
+    ///
+    /// # Important — attestation only
+    ///
+    /// This contract is a **pure attestation / signaling contract**. Calling
+    /// `apply_change` does **not** make any on-chain state change to another
+    /// contract. It flips the change status to `Applied` and emits a
+    /// `change_applied` event. Applying the actual change to a target contract
+    /// (e.g. updating `fee_calculator`'s fee tiers) is the sole responsibility
+    /// of an **external relayer** that listens for `change_applied` events and
+    /// then invokes the target contract directly.
     pub fn apply_change(env: Env, caller: Address, change_id: BytesN<32>) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
@@ -148,6 +201,8 @@ impl AdminTimelockContract {
         env.storage()
             .persistent()
             .set(&DataKey::Change(change_id.clone()), &change);
+
+        Self::remove_from_pending(&env, &change_id);
 
         env.events().publish(
             ("TIMELOCK", "change_applied"),
@@ -175,12 +230,45 @@ impl AdminTimelockContract {
             .persistent()
             .set(&DataKey::Change(change_id.clone()), &change);
 
+        Self::remove_from_pending(&env, &change_id);
+
         env.events().publish(
             ("TIMELOCK", "change_cancelled"),
             ChangeCancelledEvent {
                 change_id,
                 param: change.param,
             },
+        );
+    }
+
+    /// Remove a completed (Applied or Cancelled) change from persistent storage.
+    /// Admin-only to prevent griefing. Only non-Pending changes may be pruned.
+    pub fn prune_change(env: Env, caller: Address, change_id: BytesN<32>) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let change = Self::get_change(env.clone(), change_id.clone());
+
+        if change.status == ChangeStatus::Pending {
+            panic!("Cannot prune a pending change");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Change(change_id));
+    }
+
+    /// Transfer admin authority to a new address. Irreversible without the new admin's key.
+    pub fn rotate_admin(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let old_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.events().publish(
+            ("TIMELOCK", "admin_rotated"),
+            AdminRotatedEvent { old_admin, new_admin },
         );
     }
 
@@ -199,6 +287,14 @@ impl AdminTimelockContract {
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
+    /// Return the IDs of all currently pending changes.
+    pub fn list_pending(env: Env) -> Vec<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
@@ -208,5 +304,23 @@ impl AdminTimelockContract {
         if caller != &admin {
             panic!("Not admin");
         }
+    }
+
+    fn remove_from_pending(env: &Env, change_id: &BytesN<32>) {
+        let pending: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingList)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut updated = Vec::new(env);
+        for id in pending.iter() {
+            if &id != change_id {
+                updated.push_back(id);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingList, &updated);
     }
 }

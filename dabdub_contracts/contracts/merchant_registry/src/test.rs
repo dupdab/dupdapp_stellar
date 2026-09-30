@@ -226,7 +226,62 @@ fn test_suspend_after_termination_fails() {
 }
 
 // ---------------------------------------------------------------------------
+// merchants() paginated listing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_merchants_listing_still_includes_terminated_merchants() {
+    let (env, client, admin) = setup();
+
+    let merchant_a = Address::generate(&env);
+    let merchant_b = Address::generate(&env);
+    let merchant_c = Address::generate(&env);
+
+    client.register_merchant(&admin, &merchant_a, &sample_name(&env));
+    client.register_merchant(&admin, &merchant_b, &sample_name(&env));
+    client.register_merchant(&admin, &merchant_c, &sample_name(&env));
+
+    // Terminate the middle merchant; it must remain in the index for now.
+    client.terminate_merchant(&admin, &merchant_b);
+    assert_eq!(
+        client.get_merchant(&merchant_b).status,
+        MerchantStatus::Terminated
+    );
+
+    // Document current behavior: terminated merchants are NOT pruned from the
+    // `Merchants` index and keep appearing in the paginated listing.
+    let page = client.merchants(&0, &10);
+    assert_eq!(page.len(), 3);
+    assert!(page.contains(&merchant_a));
+    assert!(page.contains(&merchant_b));
+    assert!(page.contains(&merchant_c));
+
+    // Pagination still walks the full index, including the terminated entry.
+    let first_page = client.merchants(&0, &2);
+    assert_eq!(first_page.len(), 2);
+    let second_page = client.merchants(&2, &2);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page.get(0).unwrap(), merchant_c);
+}
+
+// ---------------------------------------------------------------------------
 // transfer_admin (two-step: propose_admin + accept_admin)
+
+#[test]
+fn test_propose_admin_does_not_take_effect_until_accepted() {
+    let (env, client, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+
+    // Current admin remains in control until the pending admin accepts.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_accept_admin_completes_transfer() {
+    let (env, client, admin) = setup();
+    l
 // ---------------------------------------------------------------------------
 
 #[test]
