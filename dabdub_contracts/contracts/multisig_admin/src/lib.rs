@@ -18,6 +18,7 @@ pub struct Proposal {
     pub created_at: u64,
     pub expires_at: u64,
     pub executed: bool,
+    pub rejected: bool,
 }
 
 #[contracttype]
@@ -43,6 +44,13 @@ pub struct ProposalApprovedEvent {
     pub proposal_id: u64,
     pub approver: Address,
     pub approvals: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalRejectedEvent {
+    pub proposal_id: u64,
+    pub rejecter: Address,
 }
 
 #[contracttype]
@@ -92,6 +100,7 @@ impl MultisigAdminContract {
             created_at: now,
             expires_at: now.saturating_add(EXPIRY_SECONDS),
             executed: false,
+            rejected: false,
         };
 
         env.events().publish(
@@ -128,6 +137,9 @@ impl MultisigAdminContract {
         if proposal.executed {
             panic!("proposal already executed");
         }
+        if proposal.rejected {
+            panic!("proposal already rejected");
+        }
         if caller == proposal.proposer {
             panic!("proposer cannot approve twice");
         }
@@ -146,6 +158,36 @@ impl MultisigAdminContract {
         );
 
         Self::maybe_execute(&env, &mut proposal);
+        env.storage().persistent().set(&key, &proposal);
+    }
+
+    pub fn reject(env: Env, caller: Address, proposal_id: u64) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let key = DataKey::Proposal(proposal_id);
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("proposal not found");
+
+        if proposal.executed {
+            panic!("proposal already executed");
+        }
+        if proposal.rejected {
+            panic!("proposal already rejected");
+        }
+
+        proposal.rejected = true;
+        env.events().publish(
+            ("MULTISIG", "proposal_rejected"),
+            ProposalRejectedEvent {
+                proposal_id,
+                rejecter: caller,
+            },
+        );
+
         env.storage().persistent().set(&key, &proposal);
     }
 
@@ -179,6 +221,9 @@ impl MultisigAdminContract {
 
     fn maybe_execute(env: &Env, proposal: &mut Proposal) {
         if proposal.executed {
+            return;
+        }
+        if proposal.rejected {
             return;
         }
         if env.ledger().timestamp() > proposal.expires_at {
