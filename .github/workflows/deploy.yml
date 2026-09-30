@@ -133,6 +133,8 @@ jobs:
           EMERGENCY_COOLDOWN_LEDGERS: ${{ vars.TESTNET_EMERGENCY_COOLDOWN_LEDGERS }}
           CONFIRMATION_COUNT: ${{ vars.TESTNET_CONFIRMATION_COUNT }}
           REGISTRY_ADDRESS: ${{ vars.TESTNET_REGISTRY_ADDRESS }}
+          BATCH_PAYMENTS_MIN_AMOUNT: ${{ vars.TESTNET_BATCH_PAYMENTS_MIN_AMOUNT }}
+          BATCH_PAYMENTS_MAX_AMOUNT: ${{ vars.TESTNET_BATCH_PAYMENTS_MAX_AMOUNT }}
         run: |
           set -euo pipefail
 
@@ -166,6 +168,8 @@ jobs:
           require EMERGENCY_TREASURY
           require EMERGENCY_COOLDOWN_LEDGERS
           require CONFIRMATION_COUNT
+          require BATCH_PAYMENTS_MIN_AMOUNT
+          require BATCH_PAYMENTS_MAX_AMOUNT
           [ "$missing" -eq 0 ] || exit 1
 
           # ------------------------------------------------------------------
@@ -196,9 +200,34 @@ jobs:
           }
 
           # --- no constructor ------------------------------------------------
-          deploy_contract batch_payments        wasm/batch_payments.wasm
           deploy_contract liquidity_router      wasm/liquidity_router.wasm
           deploy_contract payment_request       wasm/payment_request.wasm
+
+          # liquidity_router doesn't use Soroban's `__constructor` convention,
+          # so its one-time admin setup has to be invoked as a separate call
+          # right after deploy — otherwise the instance sits with no
+          # DataKey::Admin set until someone calls `initialize` out-of-band.
+          stellar contract invoke \
+            --id "$liquidity_router_id" \
+            --source deployer \
+            --network testnet \
+            -- initialize \
+            --admin "$DEPLOY_ADMIN"
+
+          # --- no constructor, but has a required one-time init() -----------
+          # batch_payments has no __constructor; its storage (admin, min/max
+          # amount limits) is only set up by calling init() after deploy. Skip
+          # this and every create_batch/set_limits/get_limits call panics with
+          # "contract not initialized".
+          deploy_contract batch_payments        wasm/batch_payments.wasm
+          stellar contract invoke \
+            --id "$batch_payments_id" \
+            --source deployer \
+            --network testnet \
+            -- init \
+            --admin "$DEPLOY_ADMIN" \
+            --min_amount "$BATCH_PAYMENTS_MIN_AMOUNT" \
+            --max_amount "$BATCH_PAYMENTS_MAX_AMOUNT"
 
           # --- admin only ----------------------------------------------------
           deploy_contract admin_timelock        wasm/admin_timelock.wasm \
@@ -325,6 +354,8 @@ jobs:
           EMERGENCY_COOLDOWN_LEDGERS: ${{ vars.MAINNET_EMERGENCY_COOLDOWN_LEDGERS }}
           CONFIRMATION_COUNT: ${{ vars.MAINNET_CONFIRMATION_COUNT }}
           REGISTRY_ADDRESS: ${{ vars.MAINNET_REGISTRY_ADDRESS }}
+          BATCH_PAYMENTS_MIN_AMOUNT: ${{ vars.MAINNET_BATCH_PAYMENTS_MIN_AMOUNT }}
+          BATCH_PAYMENTS_MAX_AMOUNT: ${{ vars.MAINNET_BATCH_PAYMENTS_MAX_AMOUNT }}
         run: |
           set -euo pipefail
 
@@ -358,6 +389,8 @@ jobs:
           require EMERGENCY_TREASURY
           require EMERGENCY_COOLDOWN_LEDGERS
           require CONFIRMATION_COUNT
+          require BATCH_PAYMENTS_MIN_AMOUNT
+          require BATCH_PAYMENTS_MAX_AMOUNT
           [ "$missing" -eq 0 ] || exit 1
 
           # ------------------------------------------------------------------
@@ -388,9 +421,34 @@ jobs:
           }
 
           # --- no constructor ------------------------------------------------
-          deploy_contract batch_payments        wasm/batch_payments.wasm
           deploy_contract liquidity_router      wasm/liquidity_router.wasm
           deploy_contract payment_request       wasm/payment_request.wasm
+
+          # liquidity_router doesn't use Soroban's `__constructor` convention,
+          # so its one-time admin setup has to be invoked as a separate call
+          # right after deploy — otherwise the instance sits with no
+          # DataKey::Admin set until someone calls `initialize` out-of-band.
+          stellar contract invoke \
+            --id "$liquidity_router_id" \
+            --source deployer \
+            --network mainnet \
+            -- initialize \
+            --admin "$DEPLOY_ADMIN"
+
+          # --- no constructor, but has a required one-time init() -----------
+          # batch_payments has no __constructor; its storage (admin, min/max
+          # amount limits) is only set up by calling init() after deploy. Skip
+          # this and every create_batch/set_limits/get_limits call panics with
+          # "contract not initialized".
+          deploy_contract batch_payments        wasm/batch_payments.wasm
+          stellar contract invoke \
+            --id "$batch_payments_id" \
+            --source deployer \
+            --network mainnet \
+            -- init \
+            --admin "$DEPLOY_ADMIN" \
+            --min_amount "$BATCH_PAYMENTS_MIN_AMOUNT" \
+            --max_amount "$BATCH_PAYMENTS_MAX_AMOUNT"
 
           # --- admin only ----------------------------------------------------
           deploy_contract admin_timelock        wasm/admin_timelock.wasm \

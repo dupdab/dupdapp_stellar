@@ -40,6 +40,11 @@ struct AdminRevokedEvent {
     admin: Address,
 }
 
+#[contracttype]
+struct AdminDeactivatedEvent {
+    admin: Address,
+}
+
 #[contract]
 pub struct AdminAuthContract;
 
@@ -93,6 +98,26 @@ impl AdminAuthContract {
         env.events().publish(
             ("ADMIN_AUTH", "admin_revoked"),
             AdminRevokedEvent { admin },
+        );
+    }
+
+    /// Deactivate an admin without removing its credential record. SuperAdmin
+    /// only. `is_admin` returns false for a deactivated admin.
+    pub fn deactivate_admin(env: Env, caller: Address, admin: Address) {
+        caller.require_auth();
+        Self::require_super_admin(&env, &caller);
+
+        let key = DataKey::Admin(admin.clone());
+        let mut user: AdminUser = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic!("admin not found"));
+        user.active = false;
+        Self::save(&env, user);
+        env.events().publish(
+            ("ADMIN_AUTH", "admin_deactivated"),
+            AdminDeactivatedEvent { admin },
         );
     }
 

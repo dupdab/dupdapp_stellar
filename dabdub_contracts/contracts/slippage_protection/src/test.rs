@@ -88,6 +88,13 @@ fn test_admin_can_relax_slippage() {
 }
 
 #[test]
+#[should_panic(expected = "bps must be <= 10000")]
+fn test_admin_cannot_set_slippage_above_bps_denominator() {
+    let (_env, client, admin) = setup_env();
+    client.set_max_slippage(&admin, &10_001);
+}
+
+#[test]
 fn test_tightened_slippage_rejects_previously_valid_swap() {
     let (_env, client, admin) = setup_env();
     // 0.8% deviation passes at default 1%
