@@ -59,6 +59,8 @@ pub enum DataKey {
     EmergencyLastDrainLedger,
     Payment(BytesN<32>),
     Version,
+    MaxDisputeWindowLedgers,
+    MaxTtlLedgers,
 }
 
 #[contracttype]
@@ -82,8 +84,23 @@ struct EmergencyDrainEvent {
     caller: Address,
 }
 
-const MAX_DISPUTE_WINDOW_LEDGERS: u32 = 51_840;
-const MAX_TTL_LEDGERS: u32 = 518_400;
+#[contracttype]
+struct RegistryUpdatedEvent {
+    previous: Option<Address>,
+    new: Option<Address>,
+    caller: Address,
+}
+
+#[contracttype]
+struct LimitUpdatedEvent {
+    previous: u32,
+    new: u32,
+}
+
+/// Defaults used until the admin overrides them via `set_max_dispute_window_ledgers`
+/// / `set_max_ttl_ledgers`.
+const DEFAULT_MAX_DISPUTE_WINDOW_LEDGERS: u32 = 51_840;
+const DEFAULT_MAX_TTL_LEDGERS: u32 = 518_400;
 const EMERGENCY_SIGNER_COUNT: u32 = 3;
 
 #[contract]
@@ -163,16 +180,81 @@ impl PaymentEscrowContract {
     }
 
     /// Update (or remove) the merchant registry address.  Admin-only.
-    pub fn set_registry(env: Env, caller: Address, registry: Option<Address>) {
+    ///
+    /// Removing the registry (`None`) disables merchant approval/KYC gating for
+    /// ALL future deposits, so it additionally requires co-authorization from two
+    /// distinct emergency signers. Every call emits a `REGISTRY` event whose topic
+    /// is `set`, `changed` or `removed`, with the previous and new addresses.
+    pub fn set_registry(
+        env: Env,
+        caller: Address,
+        registry: Option<Address>,
+        removal_signers: Option<(Address, Address)>,
+    ) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        match registry {
-            Some(reg) => env
-                .storage()
-                .instance()
-                .set(&DataKey::RegistryContract, &reg),
-            None => env.storage().instance().remove(&DataKey::RegistryContract),
+
+        let previous: Option<Address> = env.storage().instance().get(&DataKey::RegistryContract);
+        let action = match (&previous, &registry) {
+            (_, None) => {
+                let (s1, s2) = removal_signers.expect("Registry removal requires emergency signers");
+                if s1 == s2 {
+                    panic!("Emergency signers must be distinct");
+                }
+                s1.require_auth();
+                s2.require_auth();
+                Self::require_emergency_signer(&env, &s1);
+                Self::require_emergency_signer(&env, &s2);
+                env.storage().instance().remove(&DataKey::RegistryContract);
+                "removed"
+            }
+            (prev, Some(reg)) => {
+                env.storage().instance().set(&DataKey::RegistryContract, reg);
+                if prev.is_some() { "changed" } else { "set" }
+            }
+        };
+
+        env.events().publish(
+            ("REGISTRY", action),
+            RegistryUpdatedEvent {
+                previous,
+                new: registry,
+                caller,
+            },
+        );
+    }
+
+    /// Update the maximum dispute window (in ledgers). Admin-only; must be > 0.
+    pub fn set_max_dispute_window_ledgers(env: Env, caller: Address, value: u32) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        if value == 0 {
+            panic!("Max dispute window must be > 0");
         }
+        let previous = Self::get_max_dispute_window_ledgers(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxDisputeWindowLedgers, &value);
+        env.events().publish(
+            ("CONFIG", "max_dispute_window"),
+            LimitUpdatedEvent { previous, new: value },
+        );
+    }
+
+    /// Update the maximum payment TTL (in ledgers). Admin-only; must be > 0.
+    /// Only affects future deposits.
+    pub fn set_max_ttl_ledgers(env: Env, caller: Address, value: u32) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        if value == 0 {
+            panic!("Max TTL must be > 0");
+        }
+        let previous = Self::get_max_ttl_ledgers(env.clone());
+        env.storage().instance().set(&DataKey::MaxTtlLedgers, &value);
+        env.events().publish(
+            ("CONFIG", "max_ttl"),
+            LimitUpdatedEvent { previous, new: value },
+        );
     }
 
     /// Return the registry contract address if one is configured.
@@ -197,7 +279,7 @@ impl PaymentEscrowContract {
         if ttl_ledgers == 0 {
             panic!("TTL must be > 0");
         }
-        if ttl_ledgers > MAX_TTL_LEDGERS {
+        if ttl_ledgers > Self::get_max_ttl_ledgers(env.clone()) {
             panic!("TTL exceeds maximum");
         }
 
@@ -231,7 +313,7 @@ impl PaymentEscrowContract {
             let max_window_end = env
                 .ledger()
                 .sequence()
-                .saturating_add(MAX_DISPUTE_WINDOW_LEDGERS);
+                .saturating_add(Self::get_max_dispute_window_ledgers(env.clone()));
             if expiry < max_window_end {
                 expiry
             } else {
@@ -431,6 +513,12 @@ impl PaymentEscrowContract {
         Self::require_admin(&env, &caller);
 
         let mut payment = Self::get_payment(env.clone(), payment_id.clone());
+        // Intentionally NO expiry check (unlike `require_releasable` /
+        // `require_expirable`): a dispute can only be opened before
+        // `dispute_window_end` (which is <= `expiry`), and once open the funds are
+        // frozen until the admin rules on it. Enforcing expiry here would leave a
+        // disputed payment that outlives its expiry with no settlement path, since
+        // `expire`/`refund` reject non-Pending payments.
         if payment.status != PaymentStatus::Disputed {
             panic!("Dispute is not open");
         }
@@ -503,12 +591,18 @@ impl PaymentEscrowContract {
             .unwrap()
     }
 
-    pub fn get_max_dispute_window_ledgers(_env: Env) -> u32 {
-        MAX_DISPUTE_WINDOW_LEDGERS
+    pub fn get_max_dispute_window_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxDisputeWindowLedgers)
+            .unwrap_or(DEFAULT_MAX_DISPUTE_WINDOW_LEDGERS)
     }
 
-    pub fn get_max_ttl_ledgers(_env: Env) -> u32 {
-        MAX_TTL_LEDGERS
+    pub fn get_max_ttl_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxTtlLedgers)
+            .unwrap_or(DEFAULT_MAX_TTL_LEDGERS)
     }
 
     pub fn emergency_drain(env: Env, caller: Address, signer_one: Address, signer_two: Address) -> i128 {
@@ -611,6 +705,12 @@ impl PaymentEscrowContract {
         }
     }
 
+    /// Single outbound transfer path used by `release`, `release_partial`, `expire`,
+    /// `refund` and `resolve_dispute`. There is deliberately no per-payment fallback:
+    /// if the configured token contract becomes non-functional (paused by its issuer,
+    /// SAC reverting, etc.) every settlement call for payments in that asset fails
+    /// atomically and the payment record is left unchanged. See the "Stuck payment
+    /// recovery" section of `EMERGENCY_RUNBOOK.md` for the operator procedure.
     fn transfer_from_contract(env: &Env, recipient: &Address, amount: i128, asset_type: &AssetType) {
         let token_addr = Self::token_address(env, asset_type);
         token::Client::new(env, &token_addr)

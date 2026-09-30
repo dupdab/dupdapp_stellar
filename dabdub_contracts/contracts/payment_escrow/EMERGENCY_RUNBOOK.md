@@ -100,3 +100,29 @@ does not carry over, so this is a migration and needs planning as one.
 The same guidance is printed by the `Rollback procedure reminder` step at the end
 of the mainnet job in [`.github/workflows/deploy.yml`](../../../.github/workflows/deploy.yml);
 keep the two in step if either changes.
+
+## Stuck payment recovery (non-functional token contract)
+
+`release`, `release_partial`, `expire`, `refund` and `resolve_dispute` all pay out through
+the single internal `transfer_from_contract` helper, which calls the configured token's
+`transfer`. If that token contract stops working (paused/frozen by its issuer, SAC reverting,
+contract account deauthorized, etc.) every settlement call for payments in that asset fails
+atomically — the payment record is **not** modified, so nothing is lost, it is just stuck.
+
+Operator procedure:
+
+1. **Confirm the cause.** Simulate the failing settlement call and check the token contract
+   directly (e.g. `balance` / a small `transfer` simulation). Rule out payment-state errors
+   (`Payment not releasable`, expiry, etc.) first.
+2. **Wait if the outage is temporary.** Payments stay in their current status indefinitely.
+   Once the token is functional again, retry the original settlement call. Note that
+   `release` cannot succeed after `expiry`; the customer-side `expire`/`refund` path remains
+   available, and `resolve_dispute` has no expiry check for already-disputed payments.
+3. **Pause new deposits in the affected asset** off-chain (backend/UI) so no new funds get stuck.
+4. **If the token is permanently broken**, the only on-chain path is `emergency_drain`
+   (2-of-3 emergency signers, see above) to move remaining funds to the emergency treasury
+   once the token allows it, followed by off-chain reconciliation per payment
+   (`get_payment` / `get_balance`) and manual reimbursement to customers/merchants.
+   If the token never allows outbound transfers again, the funds are unrecoverable by any
+   contract — document the affected payment IDs and escalate.
+5. **Record** the affected payment IDs, token address, and resolution in the incident log.

@@ -583,7 +583,7 @@ fn test_set_registry_unauthorized() {
     let random = Address::generate(&env);
     let registry = Address::generate(&env);
 
-    client.set_registry(&random, &Some(registry));
+    client.set_registry(&random, &Some(registry), &None);
 }
 
 // ---------------------------------------------------------------------------
