@@ -61,6 +61,33 @@ cargo build --target wasm32v1-none --release
 cargo test
 ```
 
+## Contract versioning
+
+Dependent contracts verify each other's version before calling across contract
+boundaries. `payment_escrow` reads `merchant_registry`'s `version()` and panics
+with a clear error if the registry is older than the escrow's
+`MIN_COMPATIBLE_VERSION` constant. This prevents a major registry upgrade that
+changes the `is_approved` ABI from silently breaking escrow settlement.
+
+### Bumping a contract version
+
+When you change a contract's public ABI (function signatures, argument types,
+return types, or storage layout that other contracts read):
+
+1. **Bump the contract's `version()`** — increment the value returned by the
+   contract's `version()` entry point (e.g. `merchant_registry`).
+2. **Update dependents' `MIN_COMPATIBLE_VERSION`** — for every contract that
+   calls into the changed contract, raise its `MIN_COMPATIBLE_VERSION` constant
+   to the new version if the change is breaking. Leave it unchanged for
+   backward-compatible additions.
+3. **Update the version check tests** — adjust the dependent contract's tests so
+   they cover both the compatible and incompatible paths.
+4. **Deploy in dependency order** — deploy the upgraded dependency first, then
+   the dependents, so the version check passes at runtime.
+5. **Document the change** — note the version bump and any ABI changes in the
+   PR description and, for breaking changes, in
+   [`docs/escrow_upgrade_procedure.md`](docs/escrow_upgrade_procedure.md).
+
 ## CI/CD
 
 - **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) — runs `cargo test`, coverage (tarpaulin), and a WASM build on every push/PR.
