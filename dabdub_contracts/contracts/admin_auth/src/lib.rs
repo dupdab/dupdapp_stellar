@@ -5,6 +5,15 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
+/// Standardised error message codes (PascalCase) used across contracts.
+/// See issue #1274 — panic strings are standardised here until
+/// `#[contracterror]` enums are adopted (P0 issue).
+mod errors {
+    pub const NOT_ADMIN: &str = "NotAdmin";
+    pub const ADMIN_NOT_FOUND: &str = "AdminNotFound";
+    pub const CANNOT_REVOKE_SUPER_ADMIN: &str = "CannotRevokeSuperAdmin";
+}
+
 /// Admin roles. Admin accounts are stored separately from merchant accounts
 /// as a deployment convention — the contract itself does not cross-check
 /// against a merchant registry, so the separation is upheld by the caller
@@ -148,12 +157,12 @@ impl AdminAuthContract {
         // Prevent the SuperAdmin from revoking themselves (#1041)
         let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
         if admin == super_admin {
-            panic!("cannot revoke super admin");
+            panic!("{}", errors::CANNOT_REVOKE_SUPER_ADMIN);
         }
 
         let key = DataKey::Admin(admin.clone());
         if !env.storage().persistent().has(&key) {
-            panic!("admin not found");
+            panic!("{}", errors::ADMIN_NOT_FOUND);
         }
         env.storage().persistent().remove(&key);
 
@@ -224,7 +233,7 @@ impl AdminAuthContract {
             .storage()
             .instance()
             .get(&key)
-            .unwrap_or_else(|| panic!("admin not found"));
+            .unwrap_or_else(|| panic!("{}", errors::ADMIN_NOT_FOUND));
         user.active = false;
         Self::save(&env, user);
         env.events().publish(
@@ -248,7 +257,7 @@ impl AdminAuthContract {
     fn require_super_admin(env: &Env, caller: &Address) {
         let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
         if caller != &super_admin {
-            panic!("caller is not super admin");
+            panic!("{}", errors::NOT_ADMIN);
         }
     }
 

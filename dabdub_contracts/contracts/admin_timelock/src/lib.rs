@@ -32,6 +32,19 @@ use soroban_sdk::{
 
 const MIN_DELAY_LEDGERS: u32 = 17_280;
 
+// ---------------------------------------------------------------------------
+// Standardised error messages (PascalCase codes)
+//
+// Panic strings are standardised to PascalCase codes so the backend can match
+// on them reliably. These will be replaced by `#[contracterror]` enums once
+// the P0 issue lands.
+// ---------------------------------------------------------------------------
+
+const ERR_DELAY_TOO_SHORT: &str = "DelayTooShort";
+const ERR_CHANGE_NOT_PENDING: &str = "ChangeNotPending";
+const ERR_DELAY_NOT_ELAPSED: &str = "DelayNotElapsed";
+const ERR_CANNOT_PRUNE_PENDING: &str = "CannotPrunePending";
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChangeStatus {
@@ -122,7 +135,7 @@ impl AdminTimelockContract {
         Self::require_admin(&env, &caller);
 
         if delay_ledgers < MIN_DELAY_LEDGERS {
-            panic!("delay_ledgers must be >= 17280 (24 h)");
+            panic!("{}", ERR_DELAY_TOO_SHORT);
         }
 
         let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap();
@@ -192,10 +205,10 @@ impl AdminTimelockContract {
         let mut change = Self::get_change(env.clone(), change_id.clone());
 
         if change.status != ChangeStatus::Pending {
-            panic!("Change is not pending");
+            panic!("{}", ERR_CHANGE_NOT_PENDING);
         }
         if env.ledger().sequence() < change.execute_after {
-            panic!("Delay period has not elapsed");
+            panic!("{}", ERR_DELAY_NOT_ELAPSED);
         }
 
         change.status = ChangeStatus::Applied;
@@ -223,7 +236,7 @@ impl AdminTimelockContract {
         let mut change = Self::get_change(env.clone(), change_id.clone());
 
         if change.status != ChangeStatus::Pending {
-            panic!("Change is not pending");
+            panic!("{}", ERR_CHANGE_NOT_PENDING);
         }
 
         change.status = ChangeStatus::Cancelled;
@@ -251,7 +264,7 @@ impl AdminTimelockContract {
         let change = Self::get_change(env.clone(), change_id.clone());
 
         if change.status == ChangeStatus::Pending {
-            panic!("Cannot prune a pending change");
+            panic!("{}", ERR_CANNOT_PRUNE_PENDING);
         }
 
         env.storage()
@@ -259,65 +272,4 @@ impl AdminTimelockContract {
             .remove(&DataKey::Change(change_id));
     }
 
-    /// Transfer admin authority to a new address. Irreversible without the new admin's key.
-    pub fn rotate_admin(env: Env, caller: Address, new_admin: Address) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let old_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-
-        env.events().publish(
-            ("TIMELOCK", "admin_rotated"),
-            AdminRotatedEvent {
-                old_admin,
-                new_admin,
-            },
-        );
-    }
-
-    /// Read a scheduled change by id.
-    pub fn get_change(env: Env, change_id: BytesN<32>) -> ScheduledChange {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Change(change_id))
-            .expect("Change not found")
-    }
-
-    /// List all currently pending change ids.
-    pub fn get_pending(env: Env) -> Vec<BytesN<32>> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PendingList)
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Return the current admin address.
-    pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
-    }
-
-    fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if &admin != caller {
-            panic!("Caller is not admin");
-        }
-    }
-
-    fn remove_from_pending(env: &Env, change_id: &BytesN<32>) {
-        let pending: Vec<BytesN<32>> = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingList)
-            .unwrap_or_else(|| Vec::new(env));
-        let mut updated = Vec::new(env);
-        for id in pending.iter() {
-            if &id != change_id {
-                updated.push_back(id);
-            }
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingList, &updated);
-    }
-}
+    /// Transfer admin authority to a new address. Irreversible without the n
