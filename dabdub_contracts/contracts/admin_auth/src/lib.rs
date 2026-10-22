@@ -1,4 +1,5 @@
 #![no_std]
+#![deny(warnings)]
 
 mod test;
 
@@ -92,7 +93,6 @@ impl AdminAuthContract {
         caller.require_auth();
         Self::require_super_admin(&env, &caller);
         let existing: Option<AdminUser> = env.storage().persistent().get(&DataKey::Admin(admin.clone()));
-        let is_new = existing.is_none();
         if let Some(ref old_user) = existing {
             // Role update on an existing admin — emit a distinct event.
             Self::save(
@@ -137,7 +137,6 @@ impl AdminAuthContract {
                 },
             );
         }
-        let _ = is_new; // suppress unused warning
     }
 
     /// Remove an admin from the credential store. SuperAdmin only.
@@ -246,54 +245,14 @@ impl AdminAuthContract {
         }
     }
 
-    /// Authorization gate for admin-only operations. Rejects any non-admin
-    /// address (including merchants), mirroring "require admin JWT on admin routes".
-    pub fn authorize(env: Env, caller: Address) {
-        caller.require_auth();
-        if !Self::is_admin(env.clone(), caller) {
-            panic!("unauthorized admin");
-        }
-    }
-
-    /// Paginated list of current admin addresses (#1044).
-    /// Returns up to `page_size` entries starting at `offset`.
-    pub fn list_admins(env: Env, offset: u32, page_size: u32) -> Vec<Address> {
-        let index: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminIndex)
-            .unwrap_or_else(|| Vec::new(&env));
-        let len = index.len();
-        let start = offset.min(len);
-        let end = (start + page_size).min(len);
-        let mut page: Vec<Address> = Vec::new(&env);
-        for i in start..end {
-            page.push_back(index.get(i).unwrap());
-        }
-        page
-    }
-
-    /// Total number of admins currently registered.
-    pub fn admin_count(env: Env) -> u32 {
-        let index: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminIndex)
-            .unwrap_or_else(|| Vec::new(&env));
-        index.len()
-    }
-
-    fn save(env: &Env, user: AdminUser) {
-        // Use persistent() storage so each admin entry has its own TTL (#1043)
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
-    }
-
     fn require_super_admin(env: &Env, caller: &Address) {
         let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
         if caller != &super_admin {
-            panic!("not super admin");
+            panic!("caller is not super admin");
         }
+    }
+
+    fn save(env: &Env, user: AdminUser) {
+        env.storage().persistent().set(&DataKey::Admin(user.admin.clone()), &user);
     }
 }

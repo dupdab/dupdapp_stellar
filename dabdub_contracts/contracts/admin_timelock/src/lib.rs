@@ -22,6 +22,7 @@
 //! See `test.rs` for an integration test that demonstrates this composition.
 
 #![no_std]
+#![deny(warnings)]
 
 mod test;
 
@@ -268,14 +269,14 @@ impl AdminTimelockContract {
 
         env.events().publish(
             ("TIMELOCK", "admin_rotated"),
-            AdminRotatedEvent { old_admin, new_admin },
+            AdminRotatedEvent {
+                old_admin,
+                new_admin,
+            },
         );
     }
 
-    // ------------------------------------------------------------------
-    // Queries
-    // ------------------------------------------------------------------
-
+    /// Read a scheduled change by id.
     pub fn get_change(env: Env, change_id: BytesN<32>) -> ScheduledChange {
         env.storage()
             .persistent()
@@ -283,26 +284,23 @@ impl AdminTimelockContract {
             .expect("Change not found")
     }
 
-    pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
-    }
-
-    /// Return the IDs of all currently pending changes.
-    pub fn list_pending(env: Env) -> Vec<BytesN<32>> {
+    /// List all currently pending change ids.
+    pub fn get_pending(env: Env) -> Vec<BytesN<32>> {
         env.storage()
             .instance()
             .get(&DataKey::PendingList)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
+    /// Return the current admin address.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
 
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != &admin {
-            panic!("Not admin");
+        if &admin != caller {
+            panic!("Caller is not admin");
         }
     }
 
@@ -312,7 +310,6 @@ impl AdminTimelockContract {
             .instance()
             .get(&DataKey::PendingList)
             .unwrap_or_else(|| Vec::new(env));
-
         let mut updated = Vec::new(env);
         for id in pending.iter() {
             if &id != change_id {
