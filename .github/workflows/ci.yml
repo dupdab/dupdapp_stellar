@@ -35,6 +35,13 @@ jobs:
         working-directory: dabdub_contracts
         run: cargo test
 
+      # Property-based tests (proptest) live behind the `proptest` feature so
+      # the default test run stays fast. This job exercises them explicitly so
+      # regressions in fee/slippage/escrow invariants are caught in CI.
+      - name: cargo test (property-based)
+        working-directory: dabdub_contracts
+        run: cargo test --features proptest -- --nocapture
+
       - name: Generate coverage report
         working-directory: dabdub_contracts
         run: |
