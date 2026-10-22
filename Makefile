@@ -1,4 +1,4 @@
-CONTRACTS_DIR := dabdub_contracts
+CONTRACTS_DIR := dupdub_contracts
 WASM_DIR      := $(CONTRACTS_DIR)/target/wasm32v1-none/release
 WASM_SIZE_LIMIT := 65536  # 64 KB
 

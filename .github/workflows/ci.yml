@@ -8,7 +8,7 @@ on:
 env:
   RUSTFLAGS: -D warnings
   CARGO_INCREMENTAL: 0
-  LLVM_PROFILE_FILE: target/coverage/dabdub-%p-%m.profraw
+  LLVM_PROFILE_FILE: target/coverage/dupdub-%p-%m.profraw
 
 jobs:
   ci:
@@ -29,14 +29,14 @@ jobs:
       - name: Install Rust wasm target
         run: rustup target add wasm32v1-none
 
-      # The cargo workspace lives in dabdub_contracts/; there is no manifest at
+      # The cargo workspace lives in dupdub_contracts/; there is no manifest at
       # the repository root, so every cargo invocation has to run from there.
       - name: cargo test
-        working-directory: dabdub_contracts
+        working-directory: dupdub_contracts
         run: cargo test
 
       - name: Generate coverage report
-        working-directory: dabdub_contracts
+        working-directory: dupdub_contracts
         run: |
           mkdir -p target/coverage
           cargo tarpaulin \
@@ -51,9 +51,9 @@ jobs:
         uses: codecov/codecov-action@v4
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
-          files: dabdub_contracts/target/coverage/cobertura.xml
+          files: dupdub_contracts/target/coverage/cobertura.xml
           flags: rust
-          name: dabdub-contracts
+          name: dupdub-contracts
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -77,5 +77,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wasm-contracts
-          path: dabdub_contracts/target/wasm32v1-none/release/*.wasm
+          path: dupdub_contracts/target/wasm32v1-none/release/*.wasm
           retention-days: 30
