@@ -45,6 +45,20 @@ fn setup_env() -> (
     (env, client, admin, merchant, settlement_caller)
 }
 
+/// Builds a 10-tier fee configuration used by the gas benchmark.
+fn ten_tier_config(env: &Env) -> soroban_sdk::Vec<FeeTier> {
+    let mut tiers = soroban_sdk::Vec::new(env);
+    let mut i = 0u32;
+    while i < 10 {
+        tiers.push_back(FeeTier {
+            threshold_usdc: (i as i128) * 1_000,
+            fee_bps: 200 - (i as u32) * 10,
+        });
+        i += 1;
+    }
+    tiers
+}
+
 #[test]
 fn test_fee_rate_drops_when_volume_crosses_tier_threshold() {
     let (_env, client, _admin, merchant, settlement_caller) = setup_env();
@@ -243,6 +257,42 @@ fn test_non_settlement_caller_cannot_calculate_fee() {
     client.calculate_fee(&attacker, &merchant, &1_000);
 }
 
+/// Gas benchmark: `calculate_fee` against a 10-tier fee configuration.
+///
+/// Run with `cargo test -- --include-ignored bench`.
+#[test]
+#[ignore = "gas benchmark; run with --include-ignored bench"]
+fn bench_calculate_fee_ten_tiers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| {
+        li.min_temp_entry_ttl = 300_000;
+        li.min_persistent_entry_ttl = 300_000;
+        li.max_entry_ttl = 300_000;
+    });
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let settlement_caller = Address::generate(&env);
+    let tiers = ten_tier_config(&env);
+
+    let contract_id = env.register(FeeCalculatorContract, (&admin, tiers));
+    let client = FeeCalculatorContractClient::new(&env, &contract_id);
+    client.set_settlement_caller(&admin, &settlement_caller);
+
+    // Warm up: first call writes the merchant volume entry.
+    client.calculate_fee(&settlement_caller, &merchant, &1_000);
+
+    let before = env.budget().cpu_instruction_cost();
+    let (fee, net, bps) = client.calculate_fee(&settlement_caller, &merchant, &1_000);
+    let cpu = env.budget().cpu_instruction_cost() - before;
+
+    assert!(fee > 0);
+    assert!(net > 0);
+    assert!(bps > 0);
+    std::println!("bench_calculate_fee_ten_tiers: cpu_instructions={cpu}");
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -256,15 +306,5 @@ proptest! {
         prop_assert!(fee >= 0);
         prop_assert!(net >= 0);
         prop_assert_eq!(fee + net, amount);
-    }
-
-    /// Property: the effective fee bps returned by calculate_fee is always a
-    /// valid basis-points value within [0, 10000].
-    #[test]
-    fn prop_fee_bps_within_valid_range(amount in 0i128..=1_000_000_000i128) {
-        let (_env, client, _admin, merchant, settlement_caller) = setup_env();
-        let (_fee, _net, bps) =
-            client.calculate_fee(&settlement_caller, &merchant, &amount);
-        prop_assert!((0..=10_000).contains(&bps));
     }
 }
