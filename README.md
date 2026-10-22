@@ -72,6 +72,7 @@ Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.
 
 ## Docs
 
+- [Mainnet deployment, recovery and on-call runbook](docs/deployment.md)
 - [Escrow upgrade procedure](docs/escrow_upgrade_procedure.md)
 - [Security docs](docs/security/)
 
