@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/dabdub_contracts"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      soroban-sdk:
+        patterns:
+          - "soroban-sdk"

@@ -66,6 +66,40 @@ cargo test
 - **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) — runs `cargo test`, coverage (tarpaulin), and a WASM build on every push/PR.
 - **Deploy** ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) — builds and optimises WASMs, then deploys to Stellar testnet on merges to `main` and to mainnet on version tags (manual approval required).
 
+## Contract interaction diagrams
+
+### Contract call graph
+
+```mermaid
+graph TD
+    Backend[NestJS Backend] -->|record_settlement / record_reversal| SL[settlement_ledger]
+    Backend -->|deposit / release / resolve_dispute_split| PE[payment_escrow]
+    PE -->|is_approved| MR[merchant_registry]
+    PE -->|transfer| USDC[USDC token contract]
+    PE -->|transfer| XLM[XLM native asset]
+    SL -->|read| PE
+    MR -->|is_approved| PE
+```
+
+### Data flow: payment_escrow deposit → settlement_ledger record
+
+```mermaid
+sequenceDiagram
+    participant Customer
+    participant PE as payment_escrow
+    participant SL as settlement_ledger
+    participant Backend as NestJS Backend
+    Customer->>PE: deposit(customer, payment_id, merchant, amount, ttl, asset)
+    PE->>PE: verify merchant (registry) + transfer funds into escrow
+    PE-->>Customer: payment_id
+    Backend->>SL: record_settlement(admin, payment_id, merchant, amount, fee, net, timestamp, fiat_ref)
+    SL->>SL: persist settlement record + append to merchant index
+    SL-->>Backend: settlement_recorded event
+    Backend->>SL: record_reversal(admin, original_payment_id, reason)  (optional, admin-only)
+    SL->>SL: reject if already reversed; persist reversal + update merchant index
+    SL-->>Backend: settlement_reversed event
+```
+
 ## Monitoring
 
 Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.yml`](docker-compose.yml) are provided for local observability tooling; see [`monitoring/`](monitoring/) for uptime/status-page setup.

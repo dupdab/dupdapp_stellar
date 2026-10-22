@@ -31,6 +31,17 @@ pub struct SettlementVoid {
     pub voided_at: u64,
 }
 
+/// Reversal of a previously recorded settlement. References the original
+/// `payment_id` being reversed; a settlement can only be reversed once.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SettlementReversal {
+    pub original_payment_id: BytesN<32>,
+    pub merchant: Address,
+    pub reason: String,
+    pub reversed_at: u64,
+}
+
 #[contracttype]
 enum DataKey {
     Admin,
@@ -47,6 +58,13 @@ enum DataKey {
     AllIndex,
     /// A void marker keyed by the original payment ID; never overwrites it.
     Void(BytesN<32>),
+    /// Reversal record keyed by the original (reversed) payment ID. Presence
+    /// of this key means the settlement has been reversed.
+    Reversal(BytesN<32>),
+    /// Number of reversals recorded for a merchant.
+    ReversalCount(Address),
+    /// Vec<BytesN<32>> — one bounded page of reversed payment IDs for a merchant.
+    ReversalPage(Address, u32),
 }
 
 // ── events ───────────────────────────────────────────────────────────────────
@@ -59,6 +77,14 @@ struct SettlementRecordedEvent {
     fee: i128,
     net: i128,
     fiat_ref: String,
+}
+
+#[contracttype]
+struct SettlementReversedEvent {
+    original_payment_id: BytesN<32>,
+    merchant: Address,
+    reason: String,
+    reversed_at: u64,
 }
 
 // ── contract ─────────────────────────────────────────────────────────────────
@@ -184,6 +210,75 @@ impl SettlementLedgerContract {
     /// Returns the void marker for a settlement, if it was corrected.
     pub fn get_settlement_void(env: Env, payment_id: BytesN<32>) -> Option<SettlementVoid> {
         env.storage().persistent().get(&DataKey::Void(payment_id))
+    }
+
+    /// Records a reversal of a previously settled payment. Admin-only.
+    /// Rejects if the original settlement does not exist or has already been
+    /// reversed. Emits a `settlement_reversed` event and appends the reversal
+    /// to the merchant's reversal index.
+    pub fn record_reversal(
+        env: Env,
+        caller: Address,
+        original_payment_id: BytesN<32>,
+        reason: String,
+    ) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let record: SettlementRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Settlement(original_payment_id.clone()))
+            .expect("original settlement not found");
+
+        let reversal_key = DataKey::Reversal(original_payment_id.clone());
+        assert!(
+            !env.storage().persistent().has(&reversal_key),
+            "settlement already reversed"
+        );
+
+        let reversal = SettlementReversal {
+            original_payment_id: original_payment_id.clone(),
+            merchant: record.merchant.clone(),
+            reason: reason.clone(),
+            reversed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&reversal_key, &reversal);
+
+        // Append to the merchant's bounded reversal index so the reversal is
+        // discoverable alongside the merchant's settlement history.
+        let merchant = record.merchant.clone();
+        let count_key = DataKey::ReversalCount(merchant.clone());
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0);
+        let page = count / PAGE_SIZE;
+        let page_key = DataKey::ReversalPage(merchant.clone(), page);
+        let mut index: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&page_key)
+            .unwrap_or_else(|| vec![&env]);
+        index.push_back(original_payment_id.clone());
+        env.storage().persistent().set(&page_key, &index);
+        env.storage().persistent().set(&count_key, &(count + 1));
+
+        env.events().publish(
+            ("SETTLEMENT_LEDGER", "settlement_reversed"),
+            SettlementReversedEvent {
+                original_payment_id,
+                merchant,
+                reason,
+                reversed_at: reversal.reversed_at,
+            },
+        );
+    }
+
+    /// Returns the reversal record for a settlement, if it was reversed.
+    pub fn get_settlement_reversal(env: Env, payment_id: BytesN<32>) -> Option<SettlementReversal> {
+        env.storage().persistent().get(&DataKey::Reversal(payment_id))
     }
 
     /// Paginated list of settlement records for a merchant.

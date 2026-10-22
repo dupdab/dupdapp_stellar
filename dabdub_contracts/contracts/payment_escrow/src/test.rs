@@ -819,3 +819,117 @@ fn test_dispute_after_partial_release_resolves_to_merchant() {
     assert_eq!(token_client.balance(&merchant), 250_000_000);
     assert_eq!(token_client.balance(&contract_id), 0);
 }
+
+#[test]
+fn test_resolve_dispute_split_to_merchant() {
+    let (env, client, contract_id, admin, customer, merchant, usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 1);
+
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, 250_000_000i128);
+    client.dispute(&customer, &payment_id, &String::from_str(&env, "dispute"));
+    client.resolve_dispute_split(&admin, &payment_id, &250_000_000i128, &0i128);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Released);
+    assert_eq!(payment.released_amount, 250_000_000);
+    assert_eq!(client.get_balance(&payment_id), 0);
+
+    let token_client = token::Client::new(&env, &usdc);
+    assert_eq!(token_client.balance(&merchant), 250_000_000);
+    assert_eq!(token_client.balance(&customer), 750_000_000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_resolve_dispute_split_to_customer() {
+    let (env, client, contract_id, admin, customer, merchant, usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 2);
+
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, 250_000_000i128);
+    client.dispute(&merchant, &payment_id, &String::from_str(&env, "dispute"));
+    client.resolve_dispute_split(&admin, &payment_id, &0i128, &250_000_000i128);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Released);
+    assert_eq!(payment.released_amount, 250_000_000);
+    assert_eq!(client.get_balance(&payment_id), 0);
+
+    let token_client = token::Client::new(&env, &usdc);
+    assert_eq!(token_client.balance(&customer), 1_000_000_000);
+    assert_eq!(token_client.balance(&merchant), 0);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_resolve_dispute_split_partial() {
+    let (env, client, contract_id, admin, customer, merchant, usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 3);
+
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, 250_000_000i128);
+    client.dispute(&customer, &payment_id, &String::from_str(&env, "dispute"));
+    client.resolve_dispute_split(&admin, &payment_id, &150_000_000i128, &100_000_000i128);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Released);
+    assert_eq!(payment.released_amount, 250_000_000);
+    assert_eq!(client.get_balance(&payment_id), 0);
+
+    let token_client = token::Client::new(&env, &usdc);
+    assert_eq!(token_client.balance(&merchant), 150_000_000);
+    assert_eq!(token_client.balance(&customer), 850_000_000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_resolve_dispute_split_after_partial_release() {
+    let (env, client, contract_id, admin, customer, merchant, usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 4);
+
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, 250_000_000i128);
+    client.release_partial(&admin, &payment_id, &100_000_000i128);
+    client.dispute(&customer, &payment_id, &String::from_str(&env, "dispute"));
+    client.resolve_dispute_split(&admin, &payment_id, &50_000_000i128, &100_000_000i128);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Released);
+    assert_eq!(payment.released_amount, 250_000_000);
+    assert_eq!(client.get_balance(&payment_id), 0);
+
+    let token_client = token::Client::new(&env, &usdc);
+    assert_eq!(token_client.balance(&merchant), 150_000_000);
+    assert_eq!(token_client.balance(&customer), 850_000_000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+#[should_panic(expected = "Split amounts must equal remaining balance")]
+fn test_resolve_dispute_split_invalid_sum() {
+    let (env, client, _contract_id, admin, customer, merchant, _usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 5);
+
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, 250_000_000i128);
+    client.dispute(&customer, &payment_id, &String::from_str(&env, "dispute"));
+    client.resolve_dispute_split(&admin, &payment_id, &100_000_000i128, &100_000_000i128);
+}
+
+#[test]
+#[should_panic(expected = "Dispute is not open")]
+fn test_resolve_dispute_split_not_disputed() {
+    let (env, client, _contract_id, admin, customer, merchant, _usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 6);
+
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, 250_000_000i128);
+    client.resolve_dispute_split(&admin, &payment_id, &250_000_000i128, &0i128);
+}
+
+#[test]
+#[should_panic(expected = "Not admin")]
+fn test_resolve_dispute_split_unauthorized() {
+    let (env, client, _contract_id, _admin, customer, merchant, _usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 7);
+    let random = Address::generate(&env);
+
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, 250_000_000i128);
+    client.dispute(&customer, &payment_id, &String::from_str(&env, "dispute"));
+    client.resolve_dispute_split(&random, &payment_id, &250_000_000i128, &0i128);
+}

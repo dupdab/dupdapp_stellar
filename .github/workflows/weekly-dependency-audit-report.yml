@@ -19,6 +19,16 @@ jobs:
         with:
           version: 10.30.2
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Generate Rust contracts audit report
+        working-directory: dabdub_contracts
+        run: cargo audit --format json > rust-audit-report.txt 2>&1 || true
+
       - name: Generate backend audit report
         run: node scripts/dependency-audit-report.js backend --output backend-audit-report.txt
 
@@ -34,6 +44,9 @@ jobs:
           echo "" >> audit-report.txt
           echo "## Frontend" >> audit-report.txt
           cat frontend-audit-report.txt >> audit-report.txt
+          echo "" >> audit-report.txt
+          echo "## Rust contracts (cargo audit)" >> audit-report.txt
+          cat rust-audit-report.txt >> audit-report.txt
 
       - name: Send audit report to admin
         uses: dawidd6/action-send-mail@v3
