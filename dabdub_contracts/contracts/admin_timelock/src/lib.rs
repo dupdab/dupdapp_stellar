@@ -29,7 +29,19 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, Bytes, BytesN, Env, String, Vec,
 };
 
+// Delay bounds, expressed in ledgers (Stellar closes a ledger ~every 5 s).
+//
+// Rationale for the chosen bounds:
+// - MIN_DELAY (24 h = 17_280 ledgers) guarantees reviewers and the multisig
+//   signers have a meaningful window to detect and cancel a malicious or
+//   mistaken change before it can be applied. Anything shorter defeats the
+//   purpose of a timelock.
+// - MAX_DELAY (30 days = 518_400 ledgers) caps how long a change can be
+//   parked. Without an upper bound an admin could schedule a change with an
+//   absurd delay, effectively locking the parameter indefinitely and making
+//   the timelock unusable for legitimate governance.
 const MIN_DELAY_LEDGERS: u32 = 17_280;
+const MAX_DELAY_LEDGERS: u32 = 518_400;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -109,7 +121,8 @@ impl AdminTimelockContract {
     }
 
     /// Queue a parameter change. Returns the change_id.
-    /// delay_ledgers must be at least MIN_DELAY_LEDGERS (~24 hours at 5 s/ledger).
+    /// delay_ledgers must be within [MIN_DELAY_LEDGERS, MAX_DELAY_LEDGERS]
+    /// (~24 hours to 30 days at 5 s/ledger).
     pub fn schedule_change(
         env: Env,
         caller: Address,
@@ -120,9 +133,7 @@ impl AdminTimelockContract {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
-        if delay_ledgers < MIN_DELAY_LEDGERS {
-            panic!("delay_ledgers must be >= 17280 (24 h)");
-        }
+        Self::validate_delay(delay_ledgers);
 
         let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap();
         let new_counter = counter + 1;
@@ -268,42 +279,52 @@ impl AdminTimelockContract {
 
         env.events().publish(
             ("TIMELOCK", "admin_rotated"),
-            AdminRotatedEvent { old_admin, new_admin },
+            AdminRotatedEvent {
+                old_admin,
+                new_admin,
+            },
         );
     }
 
-    // ------------------------------------------------------------------
-    // Queries
-    // ------------------------------------------------------------------
+    /// Update the minimum timelock delay. Admin-only.
+    /// The new delay must be within [MIN_DELAY_LEDGERS, MAX_DELAY_LEDGERS].
+    pub fn set_delay(env: Env, caller: Address, delay_ledgers: u32) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
 
-    pub fn get_change(env: Env, change_id: BytesN<32>) -> ScheduledChange {
+        Self::validate_delay(delay_ledgers);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinDelay, &delay_ledgers);
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Enforce the [MIN_DELAY_LEDGERS, MAX_DELAY_LEDGERS] bounds on a delay.
+    fn validate_delay(delay_ledgers: u32) {
+        if delay_ledgers < MIN_DELAY_LEDGERS {
+            panic!("delay_ledgers must be >= 17280 (24 h)");
+        }
+        if delay_ledgers > MAX_DELAY_LEDGERS {
+            panic!("delay_ledgers must be <= 518400 (30 days)");
+        }
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if &admin != caller {
+            panic!("Caller is not admin");
+        }
+    }
+
+    fn get_change(env: Env, change_id: BytesN<32>) -> ScheduledChange {
         env.storage()
             .persistent()
             .get(&DataKey::Change(change_id))
             .expect("Change not found")
-    }
-
-    pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
-    }
-
-    /// Return the IDs of all currently pending changes.
-    pub fn list_pending(env: Env) -> Vec<BytesN<32>> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PendingList)
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
-
-    fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != &admin {
-            panic!("Not admin");
-        }
     }
 
     fn remove_from_pending(env: &Env, change_id: &BytesN<32>) {
@@ -312,7 +333,6 @@ impl AdminTimelockContract {
             .instance()
             .get(&DataKey::PendingList)
             .unwrap_or_else(|| Vec::new(env));
-
         let mut updated = Vec::new(env);
         for id in pending.iter() {
             if &id != change_id {
