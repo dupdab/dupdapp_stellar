@@ -1,8 +1,10 @@
 CONTRACTS_DIR := dabdub_contracts
 WASM_DIR      := $(CONTRACTS_DIR)/target/wasm32v1-none/release
 WASM_SIZE_LIMIT := 65536  # 64 KB
+BINDINGS_DIR  := $(CONTRACTS_DIR)/bindings
+CONTRACTS     := admin_auth admin_timelock batch_payments fee_calculator fee_distributor liquidity_router
 
-.PHONY: build build-optimised check-wasm-size test
+.PHONY: build build-optimised check-wasm-size test bindings
 
 build:
 	cd $(CONTRACTS_DIR) && cargo build --target wasm32v1-none --release
@@ -31,6 +33,23 @@ check-wasm-size: build-optimised
 		echo "One or more contracts exceed the $(WASM_SIZE_LIMIT)-byte limit."; \
 		exit 1; \
 	fi
+
+bindings: build
+	@echo "Generating TypeScript bindings for all contracts..."
+	@mkdir -p $(BINDINGS_DIR)
+	@for contract in $(CONTRACTS); do \
+		wasm=$(WASM_DIR)/$$contract.wasm; \
+		if [ ! -f $$wasm ]; then \
+			echo "  SKIP  $$contract (missing $$wasm)"; \
+			continue; \
+		fi; \
+		echo "  generating $$contract"; \
+		stellar contract bindings typescript \
+			--wasm $$wasm \
+			--output-dir $(BINDINGS_DIR)/$$contract \
+			--overwrite || exit 1; \
+	done
+	@echo "Bindings written to $(BINDINGS_DIR)."
 
 test:
 	cd $(CONTRACTS_DIR) && cargo test

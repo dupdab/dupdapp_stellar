@@ -79,3 +79,48 @@ jobs:
           name: wasm-contracts
           path: dabdub_contracts/target/wasm32v1-none/release/*.wasm
           retention-days: 30
+
+      # Generates TypeScript bindings for every contract from the freshly built
+      # wasm so the backend can import auto-generated types instead of
+      # hand-written ones. Runs after the build step above.
+      - name: Install Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Generate contract bindings
+        run: |
+          set -euo pipefail
+          mkdir -p bindings
+          for contract in admin_auth admin_timelock batch_payments fee_calculator fee_distributor liquidity_router; do
+            wasm="dabdub_contracts/target/wasm32v1-none/release/${contract}.wasm"
+            if [ ! -f "$wasm" ]; then
+              echo "::error::Missing wasm for $contract at $wasm"
+              exit 1
+            fi
+            stellar contract bindings typescript \
+              --wasm "$wasm" \
+              --output-dir "bindings/$contract" \
+              --overwrite
+          done
+
+      - name: Upload contract bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-bindings
+          path: bindings/
+          retention-days: 30
+
+      # Regenerated on every merge to main and published as a GitHub release
+      # asset so downstream consumers can pull the latest bindings.
+      - name: Publish contract bindings release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="bindings-${GITHUB_SHA::12}"
+          tar -czf contract-bindings.tar.gz -C bindings .
+          gh release create "$tag" contract-bindings.tar.gz \
+            --title "Contract bindings $tag" \
+            --notes "Auto-generated TypeScript bindings for commit $GITHUB_SHA."

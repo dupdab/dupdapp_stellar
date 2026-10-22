@@ -10,7 +10,8 @@
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
     "test": "jest",
-    "test:cov": "jest --coverage"
+    "test:cov": "jest --coverage",
+    "bindings:generate": "node scripts/generate-bindings.js"
   },
   "dependencies": {
     "@nestjs/common": "^10.0.0",
