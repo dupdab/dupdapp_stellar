@@ -10,7 +10,8 @@
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
     "test": "jest",
-    "test:cov": "jest --coverage"
+    "test:cov": "jest --coverage",
+    "bindings:generate": "stellar contract bindings typescript --wasm ../contracts/target/wasm32-unknown-unknown/release/dupdapp_contract.wasm --output-dir src/contract-bindings --overwrite"
   },
   "dependencies": {
     "@nestjs/common": "^10.0.0",

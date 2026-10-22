@@ -79,3 +79,46 @@ jobs:
           name: wasm-contracts
           path: dabdub_contracts/target/wasm32v1-none/release/*.wasm
           retention-days: 30
+
+      # Install the Stellar CLI so we can auto-generate TypeScript bindings
+      # from the freshly built contract WASM instead of hand-maintaining them.
+      - name: Install Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Generate TypeScript bindings for every built contract. Output lands in
+      # bindings/<contract-name>/ so it can be published and consumed by the
+      # NestJS backend.
+      - name: Generate contract TypeScript bindings
+        run: |
+          mkdir -p bindings
+          for wasm in dabdub_contracts/target/wasm32v1-none/release/*.wasm; do
+            name="$(basename "$wasm" .wasm)"
+            echo "Generating bindings for $name"
+            stellar contract bindings typescript \
+              --wasm "$wasm" \
+              --output-dir "bindings/$name" \
+              --overwrite
+          done
+
+      - name: Upload generated bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-bindings
+          path: bindings/
+          retention-days: 30
+
+      # On merge to main, publish the generated bindings as a GitHub release
+      # asset so the backend can consume the auto-generated types.
+      - name: Publish bindings as release asset
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="bindings-${GITHUB_SHA::12}"
+          tar -czf "contract-bindings-${GITHUB_SHA::12}.tar.gz" -C bindings .
+          gh release create "$tag" \
+            "contract-bindings-${GITHUB_SHA::12}.tar.gz" \
+            --title "Contract bindings ${GITHUB_SHA::12}" \
+            --notes "Auto-generated TypeScript bindings from commit ${GITHUB_SHA}."
