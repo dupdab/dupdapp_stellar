@@ -4,6 +4,10 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
+/// Current contract ABI version. Bump on every WASM upgrade so the backend
+/// knows which ABI to use. Must match the crate version in Cargo.toml.
+pub const CONTRACT_VERSION: u32 = 1;
+
 /// Admin roles. Admin accounts are stored separately from merchant accounts
 /// as a deployment convention — the contract itself does not cross-check
 /// against a merchant registry, so the separation is upheld by the caller
@@ -30,6 +34,7 @@ pub enum DataKey {
     SuperAdmin,
     Admin(Address),
     AdminIndex,
+    Version,
 }
 
 #[contracttype]
@@ -69,6 +74,7 @@ impl AdminAuthContract {
     /// Bootstrap the store with a single SuperAdmin. All other admin accounts
     /// are created exclusively through `add_admin` (the CLI seed/script path).
     pub fn __constructor(env: Env, super_admin: Address) {
+        env.storage().instance().set(&DataKey::Version, &CONTRACT_VERSION);
         env.storage().instance().set(&DataKey::SuperAdmin, &super_admin);
         Self::save(
             &env,
@@ -82,6 +88,14 @@ impl AdminAuthContract {
         let mut index: Vec<Address> = Vec::new(&env);
         index.push_back(super_admin);
         env.storage().instance().set(&DataKey::AdminIndex, &index);
+    }
+
+    /// Return the contract ABI version stored at construction time.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(CONTRACT_VERSION)
     }
 
     /// Add an admin to the separate credential store. SuperAdmin only.
@@ -246,54 +260,14 @@ impl AdminAuthContract {
         }
     }
 
-    /// Authorization gate for admin-only operations. Rejects any non-admin
-    /// address (including merchants), mirroring "require admin JWT on admin routes".
-    pub fn authorize(env: Env, caller: Address) {
-        caller.require_auth();
-        if !Self::is_admin(env.clone(), caller) {
-            panic!("unauthorized admin");
-        }
-    }
-
-    /// Paginated list of current admin addresses (#1044).
-    /// Returns up to `page_size` entries starting at `offset`.
-    pub fn list_admins(env: Env, offset: u32, page_size: u32) -> Vec<Address> {
-        let index: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminIndex)
-            .unwrap_or_else(|| Vec::new(&env));
-        let len = index.len();
-        let start = offset.min(len);
-        let end = (start + page_size).min(len);
-        let mut page: Vec<Address> = Vec::new(&env);
-        for i in start..end {
-            page.push_back(index.get(i).unwrap());
-        }
-        page
-    }
-
-    /// Total number of admins currently registered.
-    pub fn admin_count(env: Env) -> u32 {
-        let index: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminIndex)
-            .unwrap_or_else(|| Vec::new(&env));
-        index.len()
-    }
-
     fn save(env: &Env, user: AdminUser) {
-        // Use persistent() storage so each admin entry has its own TTL (#1043)
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
+        env.storage().persistent().set(&DataKey::Admin(user.admin.clone()), &user);
     }
 
     fn require_super_admin(env: &Env, caller: &Address) {
         let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
         if caller != &super_admin {
-            panic!("not super admin");
+            panic!("caller is not super admin");
         }
     }
 }
