@@ -61,6 +61,41 @@ cargo build --target wasm32v1-none --release
 cargo test
 ```
 
+### Running a local Soroban testnet
+
+A Docker-based local Soroban testnet is provided via the [`stellar/quickstart`](https://hub.docker.com/r/stellar/quickstart) container, defined in [`docker-compose.yml`](docker-compose.yml).
+
+**Prerequisites**
+
+- Docker with the Compose plugin (`docker compose`)
+- [`stellar-cli`](https://developers.stellar.org/docs/tools/developer-tools) on your `PATH`
+- Rust with the `wasm32v1-none` target (see above)
+
+**Start / stop**
+
+```bash
+make local-testnet-start   # bring up the quickstart container
+make local-testnet-stop    # tear it down
+```
+
+Once running, the local network exposes:
+
+- **Soroban RPC**: `http://localhost:8000/soroban/rpc`
+- **Horizon**: `http://localhost:8000`
+- **Friendbot**: `http://localhost:8000/friendbot`
+
+The quickstart container uses the standard local network passphrase `Standalone Network ; February 2017` and a pre-funded `admin` account.
+
+**Deploy contracts**
+
+With the testnet running, deploy the contracts against it:
+
+```bash
+./scripts/deploy-local.sh
+```
+
+The script builds the `dabdub_contracts` WASM artifacts and deploys them to the local RPC endpoint using the quickstart default network passphrase and funded account.
+
 ## CI/CD
 
 - **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) — runs `cargo test`, coverage (tarpaulin), and a WASM build on every push/PR.
