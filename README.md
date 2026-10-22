@@ -32,6 +32,52 @@ All contracts live under [`dupdapp_contract/contracts/`](dupdapp_contract/contra
 | `slippage_protection` | Slippage guards for conversions |
 | `stellar_confirmations` | Confirmation tracking for Stellar transactions |
 
+## Payment escrow lifetime and storage
+
+`DEFAULT_MAX_TTL_LEDGERS` is 518,400 ledgers: approximately 30 days at an
+assumed five seconds per ledger. It is a default upper bound on a deposit's
+requested lifetime, balancing a settlement window against locked capital and
+operational exposure. It is not a regulatory retention requirement or an exact
+wall-clock deadline. Choose shorter payment TTLs where the business permits;
+compliance and settlement policies must be defined separately.
+
+A deposit at ledger `L` with TTL `T` records `expiry = L + T`. Release is allowed
+through that ledger; refund/expire becomes available only when the sequence is
+strictly greater than expiry. Time passing alone does not transfer tokens or
+change `Pending` status: someone must invoke settlement. An open dispute blocks
+normal expiry/refund and requires admin resolution, so TTL is not a guarantee
+that all funds leave escrow within 30 days.
+
+**Admin configuration already exists:** `get_max_ttl_ledgers` reads the default
+or override, and admin-authorized `set_max_ttl_ledgers(caller, value)` changes the
+cap for future deposits and emits a `CONFIG/max_ttl` event. Existing payments keep
+their original expiry. Keeping this configurable allows business-specific
+settlement periods, but a compromised admin can lengthen future capital lockup;
+operators should restrict and monitor admin access and review cap changes against
+their policies. This change introduces no additional admin authority.
+
+**Soroban storage TTL is separate from payment expiry.** Deposit extends the
+payment's persistent entry and the escrow instance/code through `expiry + 1`,
+including the first refundable ledger. A shorter subsequent deposit cannot
+shorten those lifetimes. A requested TTL must leave that extra ledger within
+`env.storage().max_ttl()`; deposits exceeding network retention capacity (or
+integer capacity) fail before transferring funds, even if the admin cap is larger.
+Network TTL limits can change, so clients should simulate deposits.
+
+After the retained lifetime, unpaid or disputed records can be archived. Operators
+must extend TTLs or restore archived payment, escrow instance/code, and any token
+entries before settlement; archival does not refund or erase entitlement. Token
+contracts have independent storage maintenance. Existing payments deposited before
+this change need TTL extension/restoration too: updating the WASM does not rewrite
+their stored entries. This retention policy is not an audit-history retention SLA.
+
+Run the lifetime regressions with:
+
+```sh
+cd dabdub_contracts
+cargo test -p payment-escrow test_max_ttl
+```
+
 ## Development
 
 ### Prerequisites

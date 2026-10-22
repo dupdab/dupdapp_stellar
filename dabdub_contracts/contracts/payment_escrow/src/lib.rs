@@ -114,6 +114,12 @@ struct UpgradeCancelledEvent {
 /// Defaults used until the admin overrides them via `set_max_dispute_window_ledgers`
 /// / `set_max_ttl_ledgers`.
 const DEFAULT_MAX_DISPUTE_WINDOW_LEDGERS: u32 = 51_840;
+// 518,400 ledgers is approximately 30 days at 5 seconds per ledger. This
+// default bounds how long a new payment may tie up capital while allowing a
+// settlement window; it is not a wall-clock or regulatory deadline. The admin
+// can change the cap for future deposits via set_max_ttl_ledgers. Business
+// expiry and Soroban archival are separate: deposit extends storage through
+// expiry + 1 so the first refundable ledger remains accessible.
 const DEFAULT_MAX_TTL_LEDGERS: u32 = 518_400;
 const EMERGENCY_SIGNER_COUNT: u32 = 3;
 const DEFAULT_UPGRADE_DELAY_LEDGERS: u32 = 17_280;
@@ -392,6 +398,18 @@ impl PaymentEscrowContract {
             panic!("TTL exceeds maximum");
         }
 
+        // Storage TTL is relative to the current ledger and live-until is
+        // inclusive. Refunds require sequence > expiry, hence one extra ledger.
+        let retention = ttl_ledgers
+            .checked_add(1)
+            .filter(|ttl| *ttl <= env.storage().max_ttl())
+            .expect("TTL exceeds storage retention limit");
+        let expiry = env
+            .ledger()
+            .sequence()
+            .checked_add(ttl_ledgers)
+            .expect("Payment expiry overflow");
+
         let key = DataKey::Payment(payment_id.clone());
         if env.storage().persistent().has(&key) {
             panic!("Payment ID already exists");
@@ -417,7 +435,6 @@ impl PaymentEscrowContract {
             &amount,
         );
 
-        let expiry = env.ledger().sequence().saturating_add(ttl_ledgers);
         let dispute_window_end = {
             let max_window_end = env
                 .ledger()
@@ -444,6 +461,12 @@ impl PaymentEscrowContract {
         };
 
         env.storage().persistent().set(&key, &payment);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, retention, retention);
+        // Keep the escrow code and configuration callable for the same period.
+        // Extending for a shorter new payment never shortens existing TTLs.
+        env.storage().instance().extend_ttl(retention, retention);
 
         env.events().publish(
             ("ESCROW", "deposit"),
@@ -466,7 +489,7 @@ impl PaymentEscrowContract {
         let mut payment = Self::get_payment(env.clone(), payment_id.clone());
         Self::require_releasable(&env, &payment);
 
-        let remaini
+        let remaining = Self::remaining_amount(&payment);
 
         Self::transfer_from_contract(&env, &payment.merchant, remaining, &payment.asset_type);
         payment.released_amount = payment.amount;
