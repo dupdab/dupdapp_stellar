@@ -2,9 +2,20 @@ coverage:
   status:
     project:
       default:
-        target: auto
-        threshold: 2%
+        target: 80%
+        threshold: 0%
     patch:
       default:
-        target: auto
-        threshold: 2%
+        target: 80%
+        threshold: 0%
+
+ignore:
+  - "**/test.rs"
+  - "**/tests/**"
+  - "**/*_test.rs"
+  - "dabdub_contracts/contracts/**/src/test.rs"
+
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
+  require_changes: false

@@ -13,24 +13,24 @@ API work tracked in this repository is implemented in the backend; see [the back
 
 ## Contracts
 
-All contracts live under [`dupdapp_contract/contracts/`](dupdapp_contract/contracts/):
+All contracts live under [`dabdub_contracts/contracts/`](dabdub_contracts/contracts/):
 
-| Contract | Purpose |
+| Contract | Purpose | Coverage |
 |---|---|
-| `admin_timelock` | Timelocked admin actions |
-| `batch_payments` | Batched payment processing |
-| `fee_calculator` | Fee computation logic |
-| `fee_distributor` | Fee distribution to recipients |
-| `liquidity_router` | Liquidity routing for settlements |
-| `merchant_registry` | Merchant registration and metadata |
-| `multisig_admin` | Multi-signature admin control |
-| `payment_escrow` | Escrow for customer payments (approve → deposit → settle) |
-| `payment_request` | Payment request lifecycle |
-| `rbac_access` | Role-based access control |
-| `reconciliation` | Settlement reconciliation |
-| `settlement_ledger` | On-chain settlement record-keeping |
-| `slippage_protection` | Slippage guards for conversions |
-| `stellar_confirmations` | Confirmation tracking for Stellar transactions |
+| `admin_timelock` | Timelocked admin actions | [![admin_timelock](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=admin_timelock)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `batch_payments` | Batched payment processing | [![batch_payments](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=batch_payments)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `fee_calculator` | Fee computation logic | [![fee_calculator](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=fee_calculator)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `fee_distributor` | Fee distribution to recipients | [![fee_distributor](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=fee_distributor)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `liquidity_router` | Liquidity routing for settlements | [![liquidity_router](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=liquidity_router)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `merchant_registry` | Merchant registration and metadata | [![merchant_registry](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=merchant_registry)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `multisig_admin` | Multi-signature admin control | [![multisig_admin](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=multisig_admin)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `payment_escrow` | Escrow for customer payments (approve → deposit → settle) | [![payment_escrow](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=payment_escrow)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `payment_request` | Payment request lifecycle | [![payment_request](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=payment_request)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `rbac_access` | Role-based access control | [![rbac_access](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=rbac_access)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `reconciliation` | Settlement reconciliation | [![reconciliation](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=reconciliation)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `settlement_ledger` | On-chain settlement record-keeping | [![settlement_ledger](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=settlement_ledger)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `slippage_protection` | Slippage guards for conversions | [![slippage_protection](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=slippage_protection)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+| `stellar_confirmations` | Confirmation tracking for Stellar transactions | [![stellar_confirmations](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=stellar_confirmations)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 
 ## Development
 
