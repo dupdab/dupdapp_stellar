@@ -93,3 +93,6 @@ Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.
 
 <!-- handsoff-issue-1113 -->
 - #1113: payment_escrow: the highest-risk functions (upgrade, emergency_drain's XLM path, set_registry(None)) have the thinnest test coverage
+
+<!-- handsoff-issue-1256 -->
+- #1256: [P2] payment_escrow: verify merchant is KYC-verified before allowing deposit
