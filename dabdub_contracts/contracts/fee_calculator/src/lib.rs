@@ -6,6 +6,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
 const LEDGERS_PER_30_DAYS: u32 = 172_800;
 const BPS_DENOMINATOR: i128 = 10_000;
+const DEFAULT_MIN_FEE_BPS: u32 = 10;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +29,7 @@ pub enum DataKey {
     Admin,
     FeeTiers,
     MinFeeStroops,
+    MinFeeBps,
     MerchantVolume(Address),
 }
 
@@ -53,11 +55,17 @@ pub struct FeeCalculatorContract;
 
 #[contractimpl]
 impl FeeCalculatorContract {
-    pub fn __constructor(env: Env, admin: Address, tiers: Vec<FeeTier>) {
+    pub fn __constructor(env: Env, admin: Address, tiers: Vec<FeeTier>, min_fee_bps: u32) {
         Self::validate_tiers(&tiers);
+        if min_fee_bps > 10_000 {
+            panic!("min_fee_bps must be <= 10000");
+        }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::FeeTiers, &tiers);
         env.storage().instance().set(&DataKey::MinFeeStroops, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinFeeBps, &min_fee_bps);
     }
 
     pub fn set_fee_tiers(env: Env, caller: Address, tiers: Vec<FeeTier>) {
@@ -90,21 +98,6 @@ impl FeeCalculatorContract {
     pub fn set_min_fee_stroops(env: Env, caller: Address, min_fee_stroops: i128) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        if 
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        env.storage()
-            .instance()
-            .set(&DataKey::SettlementCaller, &settlement_caller);
-    }
-
-    pub fn get_settlement_caller(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::SettlementCaller)
-    }
-
-    pub fn set_min_fee_stroops(env: Env, caller: Address, min_fee_stroops: i128) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
         if min_fee_stroops < 0 {
             panic!("min_fee_stroops must be >= 0");
         }
@@ -120,10 +113,22 @@ impl FeeCalculatorContract {
             .unwrap_or(0)
     }
 
-    pub fn set_settlement_caller(env: Env, caller: Address, settlement_caller: Address) {
+    pub fn set_min_fee_bps(env: Env, caller: Address, min_fee_bps: u32) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        env.storage().instance().set(&DataKey::SettlementCaller, &settlement_caller);
+        if min_fee_bps > 10_000 {
+            panic!("min_fee_bps must be <= 10000");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinFeeBps, &min_fee_bps);
+    }
+
+    pub fn get_min_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinFeeBps)
+            .unwrap_or(DEFAULT_MIN_FEE_BPS)
     }
 
     pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
@@ -156,6 +161,21 @@ impl FeeCalculatorContract {
             .expect("overflow")
             .checked_div(BPS_DENOMINATOR)
             .expect("division failure");
+
+        // Enforce the minimum fee floor (in bps) so zero-bps tiers still pay.
+        let min_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinFeeBps)
+            .unwrap_or(DEFAULT_MIN_FEE_BPS);
+        let min_fee_from_bps = amount
+            .checked_mul(min_fee_bps as i128)
+            .expect("overflow")
+            .checked_div(BPS_DENOMINATOR)
+            .expect("division failure");
+        if fee < min_fee_from_bps {
+            fee = min_fee_from_bps;
+        }
 
         let min_fee_stroops: i128 = env
             .storage()
@@ -280,24 +300,27 @@ impl FeeCalculatorContract {
             data.volume_usdc = 0;
         }
 
-        data.volume_usdc = data.volume_usdc.checked_add(amount).expect("volume overflow");
+        data.volume_usdc = data.volume_usdc.checked_add(amount).expect("overflow");
         env.storage().persistent().set(&key, &data);
         data.volume_usdc
     }
 
     fn select_fee_bps(env: &Env, volume: i128) -> u32 {
-        let tiers: Vec<FeeTier> = env.storage().instance().get(&DataKey::FeeTiers).unwrap();
-        let mut selected_bps = tiers.get(0).unwrap().fee_bps;
+        let tiers: Vec<FeeTier> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeTiers)
+            .expect("tiers not initialized");
 
+        let mut selected = tiers.get(0).unwrap().fee_bps;
         for i in 0..tiers.len() {
             let tier = tiers.get(i).unwrap();
             if volume >= tier.threshold_usdc {
-                selected_bps = tier.fee_bps;
+                selected = tier.fee_bps;
             } else {
                 break;
             }
         }
-
-        selected_bps
+        selected
     }
 }
