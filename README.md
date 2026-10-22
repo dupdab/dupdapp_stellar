@@ -96,3 +96,6 @@ Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.
 
 <!-- handsoff-issue-1214 -->
 - #1214: [P1] payment_escrow: add `release_to_customer` path for admin-approved refunds
+
+<!-- handsoff-issue-1215 -->
+- #1215: [P1] merchant_registry: add merchant metadata fields (website, contact, country)
