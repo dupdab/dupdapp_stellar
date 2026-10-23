@@ -7,7 +7,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Between, FindOptionsWhere } from 'typeorm';
 import { randomBytes } from 'crypto';
-import { WaitlistEntry } from './entities/waitlist.entity';
+import { WaitlistEntry } from './waitlist.entity';
 import { JoinWaitlistDto } from './dto/join-waitlist.dto';
 
 @Injectable()

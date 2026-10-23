@@ -73,6 +73,8 @@ impl PlatformStatsContract {
         let prev: u32 = env.storage().instance().get(&DataKey::TotalMerchants).unwrap();
         let next = prev.checked_add(1).expect("counter overflow");
         env.storage().instance().set(&DataKey::TotalMerchants, &next);
+        env.events()
+            .publish(("PLATFORM_STATS", "merchant_recorded"), (next,));
     }
 
     /// Admin-only: record a merchant termination, decrementing the active
@@ -83,6 +85,8 @@ impl PlatformStatsContract {
         let prev: u32 = env.storage().instance().get(&DataKey::TotalMerchants).unwrap();
         let next = prev.saturating_sub(1);
         env.storage().instance().set(&DataKey::TotalMerchants, &next);
+        env.events()
+            .publish(("PLATFORM_STATS", "merchant_terminated"), (next,));
     }
 
     /// Admin-only: record a payment. If `settled`, adds to settled USD volume
@@ -128,6 +132,10 @@ impl PlatformStatsContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, ACTIVE_BUCKET_TTL_LEDGERS, ACTIVE_BUCKET_TTL_LEDGERS);
+        env.events().publish(
+            ("PLATFORM_STATS", "payment_recorded"),
+            (amount_usd, settled, next_tp),
+        );
     }
 
     /// Admin-only: reverse a previously settled payment (refund or dispute
@@ -145,6 +153,8 @@ impl PlatformStatsContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalSettledVolumeUsd, &next);
+        env.events()
+            .publish(("PLATFORM_STATS", "settlement_reversed"), (amount_usd, next));
     }
 
     /// Admin-only: reflect partner API health status.
@@ -152,6 +162,8 @@ impl PlatformStatsContract {
         caller.require_auth();
         Self::require_admin(&env, &caller);
         env.storage().instance().set(&DataKey::PartnerOk, &ok);
+        env.events()
+            .publish(("PLATFORM_STATS", "partner_status_updated"), (ok,));
     }
 
     /// Live overview metrics, computed directly from storage.

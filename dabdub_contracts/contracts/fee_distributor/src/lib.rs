@@ -177,7 +177,12 @@ impl FeeDistributorContract {
     pub fn set_allowed_caller(env: Env, caller: Address, allowed_caller: Address) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        let old_allowed_caller: Address = env.storage().instance().get(&DataKey::AllowedCaller).unwrap();
         env.storage().instance().set(&DataKey::AllowedCaller, &allowed_caller);
+        env.events().publish(
+            ("FEE_DISTRIBUTOR", "allowed_caller_updated"),
+            (old_allowed_caller, allowed_caller),
+        );
     }
 
     /// Rotate the admin address. Admin-only.

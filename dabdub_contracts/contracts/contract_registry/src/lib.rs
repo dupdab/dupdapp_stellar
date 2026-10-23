@@ -23,6 +23,8 @@ impl ContractRegistry {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.events()
+            .publish(("CONTRACT_REGISTRY", "initialized"), (admin,));
     }
 
     /// Return the current admin.

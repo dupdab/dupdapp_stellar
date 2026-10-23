@@ -100,6 +100,8 @@ impl LiquidityRouter {
         env.storage().instance().set(&DataKey::ApprovedPools, &pools);
         // Issue #1085: Seed the depth threshold with the previous hardcoded default
         env.storage().instance().set(&DataKey::DepthThresholdBps, &DEFAULT_DEPTH_THRESHOLD_BPS);
+        env.events()
+            .publish(("LIQUIDITY_ROUTER", "initialized"), (admin,));
     }
 
     // Issue #1223: Admin-gated setter for the slippage_protection contract address.
@@ -112,7 +114,12 @@ impl LiquidityRouter {
             panic!("only admin can set slippage protection");
         }
 
+        let previous: Option<Address> = env.storage().instance().get(&DataKey::SlippageProtection);
         env.storage().instance().set(&DataKey::SlippageProtection, &slippage_protection);
+        env.events().publish(
+            ("LIQUIDITY_ROUTER", "slippage_protection_updated"),
+            (previous, slippage_protection),
+        );
     }
 
     // Issue #1025: Add pool to allowlist (admin-gated)
@@ -196,7 +203,12 @@ impl LiquidityRouter {
             panic!("invalid depth threshold");
         }
 
+        let previous: u32 = env.storage().instance().get(&DataKey::DepthThresholdBps).unwrap();
         env.storage().instance().set(&DataKey::DepthThresholdBps, &threshold_bps);
+        env.events().publish(
+            ("LIQUIDITY_ROUTER", "depth_threshold_updated"),
+            (previous, threshold_bps),
+        );
     }
 
     /// Issue #1223: Executes a USDC->fiat swap for a merchant, enforcing the
@@ -285,6 +297,10 @@ impl LiquidityRouter {
         let fiat = TokenClient::new(&env, &fiat_token);
         fiat.transfer(&env.current_contract_address(), &merchant, &actual_out);
 
+        env.events().publish(
+            ("LIQUIDITY_ROUTER", "swap_executed"),
+            (merchant, usdc_token, fiat_token, amount_in, fee, actual_out),
+        );
         actual_out
     }
 

@@ -71,7 +71,10 @@ impl ReconciliationContract {
     pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        let old_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events()
+            .publish(("RECONCILIATION", "admin_transferred"), (old_admin, new_admin));
     }
 
     /// Records a new reconciliation batch and returns the ID it was stored
@@ -215,6 +218,12 @@ impl ReconciliationContract {
                 env.storage().persistent().remove(&key);
                 archived += 1;
             }
+        }
+        if archived > 0 {
+            env.events().publish(
+                ("RECONCILIATION", "batches_archived"),
+                (before_batch_id, archived),
+            );
         }
         archived
     }

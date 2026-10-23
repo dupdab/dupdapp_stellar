@@ -80,6 +80,10 @@ impl BatchPaymentContract {
         env.storage().instance().set(&DataKey::MaxBatchSize, &DEFAULT_MAX_BATCH_SIZE);
         env.storage().instance().set(&DataKey::Counter, &0u64);
         env.storage().instance().set(&DataKey::Version, &CONTRACT_VERSION);
+        env.events().publish(
+            ("BATCH_PAYMENTS", "initialized"),
+            (admin, min_amount, max_amount),
+        );
     }
 
     /// Returns the ABI version of this contract.

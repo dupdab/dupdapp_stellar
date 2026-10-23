@@ -41,6 +41,7 @@ pub struct PaymentEscrow {
     pub status: PaymentStatus,
     pub expiry: u32,
     pub dispute_window_end: u32,
+    pub dispute_resolution_deadline: u32,
     pub dispute_reason: Option<String>,
     pub asset_type: AssetType,
 }
@@ -121,6 +122,7 @@ const DEFAULT_MAX_DISPUTE_WINDOW_LEDGERS: u32 = 51_840;
 // expiry and Soroban archival are separate: deposit extends storage through
 // expiry + 1 so the first refundable ledger remains accessible.
 const DEFAULT_MAX_TTL_LEDGERS: u32 = 518_400;
+const DEFAULT_DISPUTE_RESOLUTION_DELAY_LEDGERS: u32 = 17_280;
 const EMERGENCY_SIGNER_COUNT: u32 = 3;
 const DEFAULT_UPGRADE_DELAY_LEDGERS: u32 = 17_280;
 
@@ -270,7 +272,12 @@ impl PaymentEscrowContract {
         let version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
         env.storage().instance().set(&DataKey::Version, &(version + 1));
 
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events().publish(
+            ("ESCROW", "upgrade_applied"),
+            (new_wasm_hash, version + 1, apply_ledger),
+        );
     }
 
     /// Return the current contract version.
@@ -456,6 +463,7 @@ impl PaymentEscrowContract {
             status: PaymentStatus::Pending,
             expiry,
             dispute_window_end,
+            dispute_resolution_deadline: 0,
             dispute_reason: None,
             asset_type,
         };
@@ -622,7 +630,13 @@ impl PaymentEscrowContract {
             panic!("Dispute window expired");
         }
 
+        let resolution_deadline = env
+            .ledger()
+            .sequence()
+            .checked_add(DEFAULT_DISPUTE_RESOLUTION_DELAY_LEDGERS)
+            .expect("Dispute resolution deadline overflow");
         payment.status = PaymentStatus::Disputed;
+        payment.dispute_resolution_deadline = resolution_deadline;
         payment.dispute_reason = Some(_reason.clone());
         env.storage()
             .persistent()
@@ -637,6 +651,38 @@ impl PaymentEscrowContract {
         );
     }
 
+    /// Refunds the remaining disputed balance to the customer after the admin
+    /// resolution window has elapsed. Anyone may trigger this fallback.
+    pub fn auto_resolve_dispute(env: Env, payment_id: BytesN<32>) {
+        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
+        if payment.status != PaymentStatus::Disputed {
+            panic!("Dispute is not open");
+        }
+        if env.ledger().sequence() <= payment.dispute_resolution_deadline {
+            panic!("Dispute resolution deadline has not passed");
+        }
+
+        let remaining = Self::remaining_amount(&payment);
+        if remaining <= 0 {
+            panic!("Payment fully released");
+        }
+
+        Self::transfer_from_contract(&env, &payment.customer, remaining, &payment.asset_type);
+        payment.status = PaymentStatus::Expired;
+        payment.released_amount = payment.amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
+
+        env.events().publish(
+            ("ESCROW", "dispute_auto_resolved"),
+            EscrowStateEvent {
+                payment_id,
+                amount: remaining,
+            },
+        );
+    }
+
     pub fn resolve_dispute(env: Env, caller: Address, payment_id: BytesN<32>, winner: Address) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
@@ -647,9 +693,14 @@ impl PaymentEscrowContract {
         // `dispute_window_end` (which is <= `expiry`), and once open the funds are
         // frozen until the admin rules on it. Enforcing expiry here would leave a
         // disputed payment that outlives its expiry with no settlement path, since
-        // `expire`/`refund` reject non-Pending payments.
+        // `expire`/`refund` reject non-Pending payments. The dispute resolution
+        // deadline instead bounds this admin path and enables the customer refund
+        // fallback.
         if payment.status != PaymentStatus::Disputed {
             panic!("Dispute is not open");
+        }
+        if env.ledger().sequence() > payment.dispute_resolution_deadline {
+            panic!("Dispute resolution deadline has passed");
         }
         if winner != payment.customer && winner != payment.merchant {
             panic!("Invalid dispute winner");
@@ -703,6 +754,9 @@ impl PaymentEscrowContract {
         let mut payment = Self::get_payment(env.clone(), payment_id.clone());
         if payment.status != PaymentStatus::Disputed {
             panic!("Dispute is not open");
+        }
+        if env.ledger().sequence() > payment.dispute_resolution_deadline {
+            panic!("Dispute resolution deadline has passed");
         }
 
         let remaining = Self::remaining_amount(&payment);

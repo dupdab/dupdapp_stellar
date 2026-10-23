@@ -5,8 +5,12 @@ import { APP_PIPE } from '@nestjs/core';
 import { AuthModule } from './auth/auth.module';
 import { WaitlistModule } from './waitlist/waitlist.module';
 import { AdminModule } from './admin/admin.module';
-import { Merchant } from './merchants/entities/merchant.entity';
-import { WaitlistEntry } from './waitlist/entities/waitlist.entity';
+import { Merchant } from './merchant/merchant.entity';
+import { WaitlistEntry } from './waitlist/waitlist.entity';
+import { SorobanEventsModule } from './soroban-events/soroban-events.module';
+import { SorobanIndexedEvent } from './soroban-events/soroban-indexed-event.entity';
+import { SorobanIndexerState } from './soroban-events/soroban-indexer-state.entity';
+import { CreateSorobanEventIndexerTables1760000000000 } from './soroban-events/soroban-events.migration';
 
 @Module({
   imports: [
@@ -16,7 +20,9 @@ import { WaitlistEntry } from './waitlist/entities/waitlist.entity';
       useFactory: (config: ConfigService) => ({
         type: 'postgres',
         url: config.get<string>('DATABASE_URL'),
-        entities: [Merchant, WaitlistEntry],
+        entities: [Merchant, WaitlistEntry, SorobanIndexedEvent, SorobanIndexerState],
+        migrations: [CreateSorobanEventIndexerTables1760000000000],
+        migrationsRun: true,
         synchronize: config.get<string>('NODE_ENV') !== 'production',
         ssl: config.get<string>('NODE_ENV') === 'production' ? { rejectUnauthorized: false } : false,
       }),
@@ -25,6 +31,7 @@ import { WaitlistEntry } from './waitlist/entities/waitlist.entity';
     AuthModule,
     WaitlistModule,
     AdminModule,
+    SorobanEventsModule,
   ],
   providers: [
     {

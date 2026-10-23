@@ -89,6 +89,10 @@ impl FeeCalculatorContract {
         env.storage()
             .instance()
             .set(&DataKey::SettlementCaller, &settlement_caller);
+        env.events().publish(
+            ("FEE", "settlement_caller_updated"),
+            (settlement_caller,),
+        );
     }
 
     pub fn get_settlement_caller(env: Env) -> Option<Address> {
@@ -104,6 +108,8 @@ impl FeeCalculatorContract {
         env.storage()
             .instance()
             .set(&DataKey::MinFeeStroops, &min_fee_stroops);
+        env.events()
+            .publish(("FEE", "min_fee_stroops_updated"), (min_fee_stroops,));
     }
 
     pub fn get_min_fee_stroops(env: Env) -> i128 {
@@ -122,6 +128,8 @@ impl FeeCalculatorContract {
         env.storage()
             .instance()
             .set(&DataKey::MinFeeBps, &min_fee_bps);
+        env.events()
+            .publish(("FEE", "min_fee_bps_updated"), (min_fee_bps,));
     }
 
     pub fn get_min_fee_bps(env: Env) -> u32 {

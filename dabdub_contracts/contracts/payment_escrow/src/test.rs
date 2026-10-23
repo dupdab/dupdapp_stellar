@@ -86,6 +86,7 @@ fn setup_env() -> Setup {
     let client = PaymentEscrowContractClient::new(&env, &contract_id);
 
     token::StellarAssetClient::new(&env, &usdc).mint(&customer, &1_000_000_000i128);
+    token::StellarAssetClient::new(&env, &xlm).mint(&customer, &1_000_000_000i128);
 
     (
         env,
@@ -330,6 +331,33 @@ fn test_partial_release_multiple_steps() {
     let token_client = token::Client::new(&env, &usdc);
     assert_eq!(token_client.balance(&merchant), 250_000_000);
     assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_partial_release_xlm_payment() {
+    let (env, client, contract_id, admin, customer, merchant, _usdc, xlm, ..) = setup_env();
+    let payment_id = make_id(&env, 57);
+    let amount = 300_000_000i128;
+
+    client.deposit(
+        &customer,
+        &payment_id,
+        &merchant,
+        &amount,
+        &DEFAULT_PAYMENT_TTL,
+        &AssetType::Xlm,
+    );
+    client.release_partial(&admin, &payment_id, &120_000_000i128);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.asset_type, AssetType::Xlm);
+    assert_eq!(payment.status, PaymentStatus::Pending);
+    assert_eq!(payment.released_amount, 120_000_000);
+    assert_eq!(client.get_balance(&payment_id), 180_000_000);
+
+    let token_client = token::Client::new(&env, &xlm);
+    assert_eq!(token_client.balance(&merchant), 120_000_000);
+    assert_eq!(token_client.balance(&contract_id), 180_000_000);
 }
 
 #[test]
@@ -818,6 +846,97 @@ fn test_dispute_after_partial_release_resolves_to_merchant() {
     assert_eq!(token_client.balance(&customer), 750_000_000);
     assert_eq!(token_client.balance(&merchant), 250_000_000);
     assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_dispute_deadline_and_automatic_customer_refund() {
+    let (env, client, contract_id, admin, customer, merchant, usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 58);
+    let amount = 250_000_000i128;
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, amount);
+
+    client.release_partial(&admin, &payment_id, &100_000_000i128);
+    let dispute_ledger = env.ledger().sequence();
+    client.dispute(
+        &customer,
+        &payment_id,
+        &String::from_str(&env, "partial delivery"),
+    );
+
+    let payment = client.get_payment(&payment_id);
+    let deadline = dispute_ledger + crate::DEFAULT_DISPUTE_RESOLUTION_DELAY_LEDGERS;
+    assert_eq!(payment.dispute_resolution_deadline, deadline);
+    assert_eq!(payment.status, PaymentStatus::Disputed);
+
+    env.ledger().set_sequence_number(deadline);
+    assert!(client.try_auto_resolve_dispute(&payment_id).is_err());
+    assert_eq!(client.get_payment(&payment_id).status, PaymentStatus::Disputed);
+
+    env.ledger().set_sequence_number(deadline + 1);
+    client.auto_resolve_dispute(&payment_id);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Expired);
+    assert_eq!(payment.released_amount, amount);
+    assert_eq!(client.get_balance(&payment_id), 0);
+
+    let token_client = token::Client::new(&env, &usdc);
+    assert_eq!(token_client.balance(&merchant), 100_000_000);
+    assert_eq!(token_client.balance(&customer), 1_000_000_000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert!(client.try_auto_resolve_dispute(&payment_id).is_err());
+}
+
+#[test]
+fn test_admin_can_resolve_dispute_before_deadline() {
+    let (env, client, _contract_id, admin, customer, merchant, _usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 59);
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, 100_000_000i128);
+    client.dispute(
+        &customer,
+        &payment_id,
+        &String::from_str(&env, "admin review"),
+    );
+
+    let payment = client.get_payment(&payment_id);
+    assert!(env.ledger().sequence() < payment.dispute_resolution_deadline);
+    client.resolve_dispute(&admin, &payment_id, &customer);
+
+    assert_eq!(client.get_payment(&payment_id).status, PaymentStatus::Expired);
+}
+
+#[test]
+fn test_admin_cannot_resolve_dispute_after_deadline() {
+    let (env, client, contract_id, admin, customer, merchant, usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 61);
+    let amount = 100_000_000i128;
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, amount);
+    client.dispute(
+        &customer,
+        &payment_id,
+        &String::from_str(&env, "resolution timeout"),
+    );
+
+    let deadline = client.get_payment(&payment_id).dispute_resolution_deadline;
+    env.ledger().set_sequence_number(deadline + 1);
+    assert!(client
+        .try_resolve_dispute(&admin, &payment_id, &merchant)
+        .is_err());
+    client.auto_resolve_dispute(&payment_id);
+
+    let token_client = token::Client::new(&env, &usdc);
+    assert_eq!(token_client.balance(&customer), 1_000_000_000);
+    assert_eq!(token_client.balance(&merchant), 0);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+#[should_panic(expected = "Dispute is not open")]
+fn test_auto_resolve_requires_open_dispute() {
+    let (env, client, _contract_id, _admin, customer, merchant, _usdc, ..) = setup_env();
+    let payment_id = make_id(&env, 60);
+    deposit_default_ttl(&client, &customer, &payment_id, &merchant, 100_000_000i128);
+    client.auto_resolve_dispute(&payment_id);
 }
 
 // Business expiry and ledger-entry archival must not be confused. Keep the
