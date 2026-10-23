@@ -27,6 +27,14 @@ struct MaxSlippageUpdatedEvent {
     new_bps: u32,
 }
 
+#[contracttype]
+struct PairMaxSlippageUpdatedEvent {
+    asset_a: Address,
+    asset_b: Address,
+    old_bps: u32,
+    new_bps: u32,
+}
+
 #[contract]
 pub struct SlippageProtectionContract;
 
@@ -64,6 +72,9 @@ impl SlippageProtectionContract {
     pub fn set_max_slippage(env: Env, caller: soroban_sdk::Address, bps: u32) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        if bps > 10_000 {
+            panic!("bps must be <= 10000");
+        }
 
         let old_bps = Self::global_max_slippage(&env);
         env.storage().instance().set(&DataKey::MaxSlippageBps, &bps);
@@ -89,9 +100,24 @@ impl SlippageProtectionContract {
     ) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        if bps > 10_000 {
+            panic!("bps must be <= 10000");
+        }
+
+        let old_bps = Self::pair_max_slippage(&env, &asset_a, &asset_b);
         env.storage()
             .instance()
-            .set(&DataKey::PairMaxSlippageBps(asset_a, asset_b), &bps);
+            .set(&DataKey::PairMaxSlippageBps(asset_a.clone(), asset_b.clone()), &bps);
+
+        env.events().publish(
+            ("SLIPPAGE_PROTECTION", "pair_max_slippage_set"),
+            PairMaxSlippageUpdatedEvent {
+                asset_a,
+                asset_b,
+                old_bps,
+                new_bps: bps,
+            },
+        );
     }
 
     pub fn get_max_slippage(env: Env) -> u32 {
@@ -174,32 +200,4 @@ impl SlippageProtectionContract {
             panic!("SlippageExceeded");
         }
     }
-    /// Admin: update the maximum allowed slippage in basis points.
-    pub fn set_max_slippage(env: Env, caller: soroban_sdk::Address, bps: u32) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        if bps > 10_000 {
-            panic!("bps must be <= 10000");
-        }
-        env.storage().instance().set(&DataKey::MaxSlippageBps, &bps);
-    }
-
-    pub fn get_max_slippage(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::MaxSlippageBps)
-            .unwrap_or(DEFAULT_MAX_SLIPPAGE_BPS)
-    }
-
-    pub fn get_admin(env: Env) -> soroban_sdk::Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
-    }
-
-    fn require_admin(env: &Env, caller: &soroban_sdk::Address) {
-        let admin: soroban_sdk::Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != &admin {
-            panic!("Not admin");
-        }
-    }
-
 }
