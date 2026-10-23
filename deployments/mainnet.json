@@ -1,0 +1,20 @@
+{
+  "network": "mainnet",
+  "updatedAt": null,
+  "contracts": {
+    "admin_timelock": null,
+    "batch_payments": null,
+    "fee_calculator": null,
+    "fee_distributor": null,
+    "liquidity_router": null,
+    "merchant_registry": null,
+    "multisig_admin": null,
+    "payment_escrow": null,
+    "payment_request": null,
+    "rbac_access": null,
+    "reconciliation": null,
+    "settlement_ledger": null,
+    "slippage_protection": null,
+    "stellar_confirmations": null
+  }
+}
