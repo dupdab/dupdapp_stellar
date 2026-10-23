@@ -21,9 +21,8 @@ than letting an opaque CLI error surface halfway through a partial deploy.
 | `…_RBAC_SUPER_ADMIN` | `rbac_access` (`super_admin`) | `GA…` |
 | `…_XLM_TOKEN` | `payment_escrow` | `CA…` |
 | `…_USDC_TOKEN` | `payment_escrow`, `fee_distributor` | `CA…` |
-| `…_TREASURY` | `fee_distributor` | `GA…` |
-| `…_LP_ADDRESS` | `fee_distributor` | `GA…` |
-| `…_LP_SHARE_BPS` | `fee_distributor` | `2000` |
+| `…_FEE_DISTRIBUTOR_RECIPIENTS` | `fee_distributor` | JSON array, see below |
+| `…_FEE_DISTRIBUTOR_ALLOWED_CALLER` | `fee_distributor` | `C…` |
 | `…_FEE_TIERS` | `fee_calculator` | JSON array, see below |
 | `…_MULTISIG_ADMIN_1/2/3` | `multisig_admin` | `GA…` |
 | `…_ESCROW_DEFAULT_TTL_LEDGERS` | `payment_escrow` | `518400` |
@@ -47,6 +46,23 @@ Two constructors take container types, which the Stellar CLI expects as JSON.
 ```json
 ["GA…", "GB…", "GC…"]
 ```
+
+`…_FEE_DISTRIBUTOR_RECIPIENTS` — `Vec<FeeRecipient>`. Shares must total exactly
+10,000 basis points, addresses must be unique, and at most 10 recipients are
+accepted:
+
+```json
+[
+  { "address": "G…", "share_bps": 7000 },
+  { "address": "G…", "share_bps": 2000 },
+  { "address": "G…", "share_bps": 1000 }
+]
+```
+
+`fee_distributor` recipient changes require a 17,280-ledger (~24 hour)
+timelock. The admin schedules a complete replacement list; once the deadline is
+reached, the admin applies it. The fee distributor and its existing deployments
+must be redeployed to adopt this constructor and storage schema.
 
 `…_FEE_TIERS` — `Vec<FeeTier>`. Field names must match the struct in
 `dabdub_contracts/contracts/fee_calculator/src/lib.rs`:

@@ -251,7 +251,7 @@ For contracts with **no self-upgrade** (`admin_auth`, `batch_payments`, `fee_cal
 | `payment_request` | Redeploy old instance; state not auto-migrated (initialized once). | Requests stored persistently; migration required. |
 | `batch_payments` | Redeploy old instance; revert registry/limits config. | Payments stored persistently keyed by payment ID. |
 | `fee_calculator` | Redeploy old instance; restore tiers/settlement caller/min fee. | Tiers stored in instance storage; merchant volumes persistent. |
-| `fee_distributor` | Redeploy old instance; restore admin/treasury/LP/allowed caller. | Constructor sets critical invariants; redeploy with same params or careful migration. |
+| `fee_distributor` | Redeploy old instance; restore admin, validated recipient list, USDC token, and allowed caller. | The recipient-list constructor is incompatible with the legacy treasury/LP schema; plan a migration and redeploy. See [deployment configuration](deployment_configuration.md). |
 | `liquidity_router` | Redeploy old instance; restore admin/allowlist/depth threshold. | Allowlist stored in instance storage. |
 | `platform_stats` | Redeploy old instance; counters not auto-migrated. | Rolling buckets in persistent storage with TTL. |
 | `reconciliation` | Redeploy old instance; batches stored persistently; ensure batch history preserved if needed. | Multiple batches retained (by ID). Use `get_batch`/`get_latest_stored_batch`. |
@@ -443,4 +443,3 @@ Before upgrading mainnet, run the full sequence on testnet:
 - Replace placeholders (`<...>`) with actual values.
 - For testnet, be mindful of ledger timing for timelock tests.
 - Document all contract IDs, WASM hashes, and transaction hashes during testing.
-

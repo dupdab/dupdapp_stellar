@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{testutils::Address as _, testutils::Events, Address, Env, String};
 
@@ -11,8 +13,12 @@ fn make_payment(env: &Env, amount: i128, memo: &str) -> PaymentInput {
     }
 }
 
-fn deploy_and_init(env: &Env, min_amount: i128, max_amount: i128) -> (BatchPaymentContractClient, Address) {
-    let contract_id = env.register_contract(None, BatchPaymentContract);
+fn deploy_and_init(
+    env: &Env,
+    min_amount: i128,
+    max_amount: i128,
+) -> (BatchPaymentContractClient<'_>, Address) {
+    let contract_id = env.register(BatchPaymentContract, ());
     let client = BatchPaymentContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
     client.init(&admin, &min_amount, &max_amount);
@@ -66,14 +72,14 @@ fn test_batch_of_20_payments() {
 
 #[test]
 #[should_panic(expected = "batch exceeds maximum")]
-fn test_batch_over_20_reverts() {
+fn test_batch_over_hard_limit_reverts() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin) = deploy_and_init(&env, 1, 10_000);
 
     let merchant = Address::generate(&env);
     let mut payments = soroban_sdk::vec![&env];
-    for i in 0..21_u32 {
+    for i in 0..101_u32 {
         payments.push_back(make_payment(&env, (i as i128 + 1) * 10, "over-limit"));
     }
 
@@ -145,11 +151,11 @@ fn test_payment_created_events_emitted() {
 }
 
 #[test]
-fn test_max_batch_size_is_20() {
+fn test_max_batch_size_defaults_to_100() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin) = deploy_and_init(&env, 1, 10_000);
-    assert_eq!(client.max_batch_size(), 20);
+    assert_eq!(client.max_batch_size(), 100);
 }
 
 #[test]
@@ -189,8 +195,10 @@ fn test_admin_can_set_max_batch_size() {
     env.mock_all_auths();
     let (client, _admin) = deploy_and_init(&env, 1, 10_000);
 
-    assert_eq!(client.max_batch_size(), 20);
+    assert_eq!(client.max_batch_size(), 100);
     client.set_max_batch_size(&10);
+    assert_eq!(client.max_batch_size(), 10);
+    assert!(client.try_set_max_batch_size(&101).is_err());
     assert_eq!(client.max_batch_size(), 10);
 }
 
@@ -262,4 +270,56 @@ fn test_limits_updated_event_emitted() {
     client.set_limits(&150, &1_500);
     let events = env.events().all();
     assert_eq!(events.len(), before + 1);
+}
+
+#[test]
+fn test_batch_at_new_maximum_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+    let merchant = Address::generate(&env);
+    let mut payments = soroban_sdk::vec![&env];
+    for i in 0..100_u32 {
+        payments.push_back(make_payment(&env, i as i128 + 1, "maximum-batch"));
+    }
+
+    let ids = client.create_batch(&merchant, &payments);
+    assert_eq!(ids.len(), 100);
+    for id in ids.iter() {
+        assert!(client.get_payment(&id).is_some());
+    }
+}
+
+fn measure_batch_cpu_instructions(size: u32) -> u64 {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+    let merchant = Address::generate(&env);
+    let mut payments = soroban_sdk::vec![&env];
+    for i in 0..size {
+        payments.push_back(make_payment(&env, i as i128 + 1, "gas-benchmark"));
+    }
+
+    let before = env.cost_estimate().budget().cpu_instruction_cost();
+    let ids = client.create_batch(&merchant, &payments);
+    let instruction_cost = env.cost_estimate().budget().cpu_instruction_cost() - before;
+    assert_eq!(ids.len(), size);
+    instruction_cost
+}
+
+#[test]
+fn benchmark_batch_instruction_cost_per_item() {
+    let cpu_20 = measure_batch_cpu_instructions(20);
+    let cpu_100 = measure_batch_cpu_instructions(100);
+    let per_item_20 = cpu_20 / 20;
+    let per_item_100 = cpu_100 / 100;
+
+    std::println!(
+        "batch benchmark: 20 items={cpu_20} CPU instructions ({per_item_20}/item); \
+         100 items={cpu_100} CPU instructions ({per_item_100}/item)"
+    );
+    assert!(
+        cpu_100 < 100_000_000,
+        "100-item batch exceeds Soroban CPU budget"
+    );
 }

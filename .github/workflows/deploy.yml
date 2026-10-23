@@ -122,9 +122,8 @@ jobs:
           RBAC_SUPER_ADMIN: ${{ vars.TESTNET_RBAC_SUPER_ADMIN }}
           XLM_TOKEN: ${{ vars.TESTNET_XLM_TOKEN }}
           USDC_TOKEN: ${{ vars.TESTNET_USDC_TOKEN }}
-          TREASURY: ${{ vars.TESTNET_TREASURY }}
-          LP_ADDRESS: ${{ vars.TESTNET_LP_ADDRESS }}
-          LP_SHARE_BPS: ${{ vars.TESTNET_LP_SHARE_BPS }}
+          FEE_DISTRIBUTOR_RECIPIENTS: ${{ vars.TESTNET_FEE_DISTRIBUTOR_RECIPIENTS }}
+          FEE_DISTRIBUTOR_ALLOWED_CALLER: ${{ vars.TESTNET_FEE_DISTRIBUTOR_ALLOWED_CALLER }}
           FEE_TIERS: ${{ vars.TESTNET_FEE_TIERS }}
           MULTISIG_ADMIN_1: ${{ vars.TESTNET_MULTISIG_ADMIN_1 }}
           MULTISIG_ADMIN_2: ${{ vars.TESTNET_MULTISIG_ADMIN_2 }}
@@ -158,9 +157,8 @@ jobs:
           require RBAC_SUPER_ADMIN
           require XLM_TOKEN
           require USDC_TOKEN
-          require TREASURY
-          require LP_ADDRESS
-          require LP_SHARE_BPS
+          require FEE_DISTRIBUTOR_RECIPIENTS
+          require FEE_DISTRIBUTOR_ALLOWED_CALLER
           require FEE_TIERS
           require MULTISIG_ADMIN_1
           require MULTISIG_ADMIN_2
@@ -264,12 +262,12 @@ jobs:
             --admin "$DEPLOY_ADMIN" \
             --tiers "$FEE_TIERS"
 
+          # FEE_DISTRIBUTOR_RECIPIENTS is a JSON array of FeeRecipient structs.
           deploy_contract fee_distributor       wasm/fee_distributor.wasm \
             --admin "$DEPLOY_ADMIN" \
-            --treasury "$TREASURY" \
-            --lp_address "$LP_ADDRESS" \
-            --lp_share_bps "$LP_SHARE_BPS" \
-            --usdc_token "$USDC_TOKEN"
+            --recipients "$FEE_DISTRIBUTOR_RECIPIENTS" \
+            --usdc_token "$USDC_TOKEN" \
+            --allowed_caller "$FEE_DISTRIBUTOR_ALLOWED_CALLER"
 
           # payment_escrow takes an Option<Address> registry. Default it to the
           # merchant_registry just deployed, so the two are wired together in
@@ -349,9 +347,8 @@ jobs:
           RBAC_SUPER_ADMIN: ${{ vars.MAINNET_RBAC_SUPER_ADMIN }}
           XLM_TOKEN: ${{ vars.MAINNET_XLM_TOKEN }}
           USDC_TOKEN: ${{ vars.MAINNET_USDC_TOKEN }}
-          TREASURY: ${{ vars.MAINNET_TREASURY }}
-          LP_ADDRESS: ${{ vars.MAINNET_LP_ADDRESS }}
-          LP_SHARE_BPS: ${{ vars.MAINNET_LP_SHARE_BPS }}
+          FEE_DISTRIBUTOR_RECIPIENTS: ${{ vars.MAINNET_FEE_DISTRIBUTOR_RECIPIENTS }}
+          FEE_DISTRIBUTOR_ALLOWED_CALLER: ${{ vars.MAINNET_FEE_DISTRIBUTOR_ALLOWED_CALLER }}
           FEE_TIERS: ${{ vars.MAINNET_FEE_TIERS }}
           MULTISIG_ADMIN_1: ${{ vars.MAINNET_MULTISIG_ADMIN_1 }}
           MULTISIG_ADMIN_2: ${{ vars.MAINNET_MULTISIG_ADMIN_2 }}
@@ -385,9 +382,8 @@ jobs:
           require RBAC_SUPER_ADMIN
           require XLM_TOKEN
           require USDC_TOKEN
-          require TREASURY
-          require LP_ADDRESS
-          require LP_SHARE_BPS
+          require FEE_DISTRIBUTOR_RECIPIENTS
+          require FEE_DISTRIBUTOR_ALLOWED_CALLER
           require FEE_TIERS
           require MULTISIG_ADMIN_1
           require MULTISIG_ADMIN_2
@@ -491,12 +487,12 @@ jobs:
             --admin "$DEPLOY_ADMIN" \
             --tiers "$FEE_TIERS"
 
+          # FEE_DISTRIBUTOR_RECIPIENTS is a JSON array of FeeRecipient structs.
           deploy_contract fee_distributor       wasm/fee_distributor.wasm \
             --admin "$DEPLOY_ADMIN" \
-            --treasury "$TREASURY" \
-            --lp_address "$LP_ADDRESS" \
-            --lp_share_bps "$LP_SHARE_BPS" \
-            --usdc_token "$USDC_TOKEN"
+            --recipients "$FEE_DISTRIBUTOR_RECIPIENTS" \
+            --usdc_token "$USDC_TOKEN" \
+            --allowed_caller "$FEE_DISTRIBUTOR_ALLOWED_CALLER"
 
           # payment_escrow takes an Option<Address> registry. Default it to the
           # merchant_registry just deployed, so the two are wired together in
