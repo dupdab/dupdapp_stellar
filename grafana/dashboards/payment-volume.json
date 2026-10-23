@@ -2,7 +2,7 @@
   "title": "Payment Volume",
   "uid": "cheesepay-payment-volume",
   "schemaVersion": 38,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
   "time": { "from": "now-24h", "to": "now" },
   "panels": [
@@ -62,6 +62,68 @@
         }
       ],
       "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 4,
+      "title": "Soroban Event Lag (ledgers)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "soroban_event_lag_ledgers",
+          "legendFormat": "event lag",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      },
+      "alert": {
+        "name": "Soroban Event Lag High",
+        "conditions": [
+          {
+            "evaluator": { "type": "gt", "params": [10] },
+            "query": { "params": ["A", "5m", "now"] },
+            "reducer": { "type": "avg" },
+            "type": "query"
+          }
+        ],
+        "executionErrorState": "alerting",
+        "frequency": "1m",
+        "handler": 1,
+        "message": "Soroban contract event lag exceeds 10 ledgers"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Last Indexed Ledger vs Current Ledger",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "soroban_last_indexed_ledger",
+          "legendFormat": "last indexed ledger",
+          "refId": "A"
+        },
+        {
+          "expr": "soroban_current_ledger",
+          "legendFormat": "current ledger",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "palette-classic" } }
+      }
     }
   ]
 }

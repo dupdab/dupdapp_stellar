@@ -4,9 +4,17 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
-/// Current contract ABI version. Bump on every WASM upgrade so the backend
-/// knows which ABI to use. Must match the crate version in Cargo.toml.
-pub const CONTRACT_VERSION: u32 = 1;
+/// Contract ABI version. Bumped on every WASM upgrade; CI checks this
+/// matches the crate version in Cargo.toml.
+pub const VERSION: u32 = 1u32;
+
+/// Shared PascalCase error codes for panic messages (issue #1314).
+/// These will be replaced by `#[contracterror]` enums in a future change.
+pub mod errors {
+    pub const NOT_ADMIN: &str = "NotAdmin";
+    pub const ADMIN_NOT_FOUND: &str = "AdminNotFound";
+    pub const CANNOT_REVOKE_SUPER_ADMIN: &str = "CannotRevokeSuperAdmin";
+}
 
 /// Admin roles. Admin accounts are stored separately from merchant accounts
 /// as a deployment convention — the contract itself does not cross-check
@@ -74,7 +82,7 @@ impl AdminAuthContract {
     /// Bootstrap the store with a single SuperAdmin. All other admin accounts
     /// are created exclusively through `add_admin` (the CLI seed/script path).
     pub fn __constructor(env: Env, super_admin: Address) {
-        env.storage().instance().set(&DataKey::Version, &CONTRACT_VERSION);
+        env.storage().instance().set(&DataKey::Version, &VERSION);
         env.storage().instance().set(&DataKey::SuperAdmin, &super_admin);
         Self::save(
             &env,
@@ -95,7 +103,12 @@ impl AdminAuthContract {
         env.storage()
             .instance()
             .get(&DataKey::Version)
-            .unwrap_or(CONTRACT_VERSION)
+    /// Return the contract ABI version stored at construction time.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(VERSION)
     }
 
     /// Add an admin to the separate credential store. SuperAdmin only.
@@ -163,12 +176,12 @@ impl AdminAuthContract {
         // Prevent the SuperAdmin from revoking themselves (#1041)
         let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
         if admin == super_admin {
-            panic!("cannot revoke super admin");
+            panic!("{}", errors::CANNOT_REVOKE_SUPER_ADMIN);
         }
 
         let key = DataKey::Admin(admin.clone());
         if !env.storage().persistent().has(&key) {
-            panic!("admin not found");
+            panic!("{}", errors::ADMIN_NOT_FOUND);
         }
         env.storage().persistent().remove(&key);
 
@@ -239,7 +252,7 @@ impl AdminAuthContract {
             .storage()
             .instance()
             .get(&key)
-            .unwrap_or_else(|| panic!("admin not found"));
+            .unwrap_or_else(|| panic!("{}", errors::ADMIN_NOT_FOUND));
         user.active = false;
         Self::save(&env, user);
         env.events().publish(
@@ -267,7 +280,11 @@ impl AdminAuthContract {
     fn require_super_admin(env: &Env, caller: &Address) {
         let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
         if caller != &super_admin {
-            panic!("caller is not super admin");
+            panic!("{}", errors::NOT_ADMIN);
         }
+    }
+
+    fn save(env: &Env, user: AdminUser) {
+        env.storage().persistent().set(&DataKey::Admin(user.admin.clone()), &user);
     }
 }

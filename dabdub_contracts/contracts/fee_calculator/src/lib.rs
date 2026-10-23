@@ -90,21 +90,6 @@ impl FeeCalculatorContract {
     pub fn set_min_fee_stroops(env: Env, caller: Address, min_fee_stroops: i128) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        if 
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        env.storage()
-            .instance()
-            .set(&DataKey::SettlementCaller, &settlement_caller);
-    }
-
-    pub fn get_settlement_caller(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::SettlementCaller)
-    }
-
-    pub fn set_min_fee_stroops(env: Env, caller: Address, min_fee_stroops: i128) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
         if min_fee_stroops < 0 {
             panic!("min_fee_stroops must be >= 0");
         }
@@ -118,12 +103,6 @@ impl FeeCalculatorContract {
             .instance()
             .get(&DataKey::MinFeeStroops)
             .unwrap_or(0)
-    }
-
-    pub fn set_settlement_caller(env: Env, caller: Address, settlement_caller: Address) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        env.storage().instance().set(&DataKey::SettlementCaller, &settlement_caller);
     }
 
     pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
@@ -280,24 +259,40 @@ impl FeeCalculatorContract {
             data.volume_usdc = 0;
         }
 
-        data.volume_usdc = data.volume_usdc.checked_add(amount).expect("volume overflow");
+        data.volume_usdc = data.volume_usdc.checked_add(amount).expect("overflow");
         env.storage().persistent().set(&key, &data);
         data.volume_usdc
     }
 
+    /// Selects the applicable fee tier for the given volume.
+    ///
+    /// Tiers are validated as strictly increasing by `validate_tiers`, so the
+    /// `threshold_usdc` array is sorted. We binary-search for the highest tier
+    /// whose threshold is `<= volume`, which is O(log n) instead of the
+    /// previous O(n) linear scan.
     fn select_fee_bps(env: &Env, volume: i128) -> u32 {
-        let tiers: Vec<FeeTier> = env.storage().instance().get(&DataKey::FeeTiers).unwrap();
-        let mut selected_bps = tiers.get(0).unwrap().fee_bps;
+        let tiers: Vec<FeeTier> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeTiers)
+            .expect("tiers not initialized");
 
-        for i in 0..tiers.len() {
-            let tier = tiers.get(i).unwrap();
-            if volume >= tier.threshold_usdc {
-                selected_bps = tier.fee_bps;
+        let len = tiers.len();
+        // Find the first index whose threshold is strictly greater than volume.
+        // The applicable tier is the one just before it (or index 0 if none).
+        let mut lo: u32 = 0;
+        let mut hi: u32 = len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let tier = tiers.get(mid).unwrap();
+            if tier.threshold_usdc <= volume {
+                lo = mid + 1;
             } else {
-                break;
+                hi = mid;
             }
         }
 
-        selected_bps
+        let idx = if lo == 0 { 0 } else { lo - 1 };
+        tiers.get(idx).unwrap().fee_bps
     }
 }
