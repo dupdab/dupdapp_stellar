@@ -8,7 +8,7 @@ on:
 env:
   RUSTFLAGS: -D warnings
   CARGO_INCREMENTAL: 0
-  LLVM_PROFILE_FILE: target/coverage/dabdub-%p-%m.profraw
+  LLVM_PROFILE_FILE: target/coverage/dupdub-%p-%m.profraw
 
 jobs:
   ci:
@@ -21,6 +21,22 @@ jobs:
         with:
           targets: wasm32v1-none
 
+      # Cache the cargo registry (downloaded crate sources) and the workspace
+      # target directory so dependencies are not re-downloaded and recompiled
+      # on every run. The key is derived from the Cargo.lock hash so the cache
+      # is invalidated whenever the dependency graph changes; restore-keys
+      # provide a fallback so partial rebuilds still benefit.
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            dabdub_contracts/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
       - name: Install cargo-tarpaulin
         uses: taiki-e/install-action@v2
         with:
@@ -29,14 +45,14 @@ jobs:
       - name: Install Rust wasm target
         run: rustup target add wasm32v1-none
 
-      # The cargo workspace lives in dabdub_contracts/; there is no manifest at
+      # The cargo workspace lives in dupdub_contracts/; there is no manifest at
       # the repository root, so every cargo invocation has to run from there.
       - name: cargo test
-        working-directory: dabdub_contracts
+        working-directory: dupdub_contracts
         run: cargo test
 
       - name: Generate coverage report
-        working-directory: dabdub_contracts
+        working-directory: dupdub_contracts
         run: |
           mkdir -p target/coverage
           cargo tarpaulin \
@@ -51,9 +67,9 @@ jobs:
         uses: codecov/codecov-action@v4
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
-          files: dabdub_contracts/target/coverage/cobertura.xml
+          files: dupdub_contracts/target/coverage/cobertura.xml
           flags: rust
-          name: dabdub-contracts
+          name: dupdub-contracts
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -77,7 +93,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wasm-contracts
-          path: dabdub_contracts/target/wasm32v1-none/release/*.wasm
+          path: dupdub_contracts/target/wasm32v1-none/release/*.wasm
           retention-days: 30
 
       # Generates TypeScript bindings for every contract from the freshly built
@@ -124,3 +140,118 @@ jobs:
           gh release create "$tag" contract-bindings.tar.gz \
             --title "Contract bindings $tag" \
             --notes "Auto-generated TypeScript bindings for commit $GITHUB_SHA."
+
+  # Reports per-contract WASM sizes on pull requests so size regressions are
+  # visible during review instead of only at deploy time.
+  wasm-size-report:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
+      - name: Build optimised WASM
+        run: make build-optimised
+
+      - name: Measure current WASM sizes
+        run: |
+          mkdir -p /tmp/wasm-current
+          for f in dabdub_contracts/target/wasm32v1-none/release/*.wasm; do
+            [ -e "$f" ] || continue
+            name=$(basename "$f" .wasm)
+            stat -c '%s' "$f" > "/tmp/wasm-current/$name"
+          done
+
+      - name: Checkout base branch for previous sizes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Build base WASM and measure previous sizes
+        run: |
+          mkdir -p /tmp/wasm-previous
+          if [ -d base/dabdub_contracts ]; then
+            (cd base && make build-optimised) || true
+            for f in base/dabdub_contracts/target/wasm32v1-none/release/*.wasm; do
+              [ -e "$f" ] || continue
+              name=$(basename "$f" .wasm)
+              stat -c '%s' "$f" > "/tmp/wasm-previous/$name"
+            done
+          fi
+
+      - name: Compose size report
+        id: report
+        run: |
+          BUDGET=65536
+          WARN=$((BUDGET * 80 / 100))
+          {
+            echo '<!-- soroban-wasm-size-report -->'
+            echo '### Soroban contract WASM size report'
+            echo ''
+            echo '| Contract | Current size | Previous size | Delta |'
+            echo '| --- | --- | --- | --- |'
+            for cur in /tmp/wasm-current/*; do
+              [ -e "$cur" ] || continue
+              name=$(basename "$cur")
+              current=$(cat "$cur")
+              if [ -f "/tmp/wasm-previous/$name" ]; then
+                previous=$(cat "/tmp/wasm-previous/$name")
+                delta=$((current - previous))
+                if [ "$delta" -gt 0 ]; then
+                  delta_str="+${delta} B"
+                else
+                  delta_str="${delta} B"
+                fi
+                prev_str="${previous} B"
+              else
+                delta_str="n/a"
+                prev_str="n/a"
+              fi
+              row="| ${name} | ${current} B | ${prev_str} | ${delta_str} |"
+              if [ "$current" -gt "$BUDGET" ]; then
+                row="| :red_circle: ${name} | ${current} B | ${prev_str} | ${delta_str} |"
+              elif [ "$current" -gt "$WARN" ]; then
+                row="| :warning: ${name} | ${current} B | ${prev_str} | ${delta_str} |"
+              fi
+              echo "$row"
+            done
+            echo ''
+            echo "Budget: ${BUDGET} B (64 KB). :warning: = over 80% of budget, :red_circle: = over budget."
+          } > /tmp/wasm-report.md
+          echo 'report_path=/tmp/wasm-report.md' >> "$GITHUB_OUTPUT"
+
+      - name: Post size report comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- soroban-wasm-size-report -->';
+            const body = fs.readFileSync('/tmp/wasm-report.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+            }
