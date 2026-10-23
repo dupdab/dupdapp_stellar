@@ -662,6 +662,75 @@ impl PaymentEscrowContract {
         );
     }
 
+    /// Resolves an open dispute by splitting the remaining balance between the
+    /// merchant and the customer. Admin-only. `merchant_amount` is released to
+    /// the merchant and `customer_amount` is refunded to the customer; the two
+    /// must sum to the remaining balance. Emits a separate `release` event for
+    /// the merchant portion and a `refund` event for the customer portion.
+    pub fn resolve_dispute_split(
+        env: Env,
+        caller: Address,
+        payment_id: BytesN<32>,
+        merchant_amount: i128,
+        customer_amount: i128,
+    ) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
+        if payment.status != PaymentStatus::Disputed {
+            panic!("Dispute is not open");
+        }
+
+        let remaining = Self::remaining_amount(&payment);
+        if remaining <= 0 {
+            panic!("Payment fully released");
+        }
+        if merchant_amount < 0 || customer_amount < 0 {
+            panic!("Split amounts must be >= 0");
+        }
+        if merchant_amount.saturating_add(customer_amount) != remaining {
+            panic!("Split amounts must equal remaining balance");
+        }
+
+        if merchant_amount > 0 {
+            Self::transfer_from_contract(
+                &env,
+                &payment.merchant,
+                merchant_amount,
+                &payment.asset_type,
+            );
+            env.events().publish(
+                ("ESCROW", "release"),
+                EscrowStateEvent {
+                    payment_id: payment_id.clone(),
+                    amount: merchant_amount,
+                },
+            );
+        }
+        if customer_amount > 0 {
+            Self::transfer_from_contract(
+                &env,
+                &payment.customer,
+                customer_amount,
+                &payment.asset_type,
+            );
+            env.events().publish(
+                ("ESCROW", "refund"),
+                EscrowStateEvent {
+                    payment_id: payment_id.clone(),
+                    amount: customer_amount,
+                },
+            );
+        }
+
+        payment.released_amount = payment.amount;
+        payment.status = PaymentStatus::Released;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
+    }
+
     pub fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrow {
         env.storage()
             .persistent()

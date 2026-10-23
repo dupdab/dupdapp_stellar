@@ -283,6 +283,39 @@ impl FeeCalculatorContract {
         }
     }
 
+    /// Selects the applicable fee tier for the given volume using binary
+    /// search over the strictly increasing `threshold_usdc` values (guaranteed
+    /// by `validate_tiers`). Returns the `fee_bps` of the highest tier whose
+    /// threshold is `<= volume`, or the first tier's `fee_bps` if the volume is
+    /// below every threshold. This is O(log n) instead of the previous O(n)
+    /// linear scan.
+    fn select_fee_bps(env: &Env, volume: i128) -> u32 {
+        let tiers: Vec<FeeTier> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeTiers)
+            .expect("tiers not initialized");
+
+        let len = tiers.len();
+        let mut lo: u32 = 0;
+        let mut hi: u32 = len;
+
+        // Find the first index whose threshold is strictly greater than
+        // `volume`; the applicable tier is the one just before it.
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let tier = tiers.get(mid).unwrap();
+            if tier.threshold_usdc <= volume {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        let idx = if lo == 0 { 0 } else { lo - 1 };
+        tiers.get(idx).unwrap().fee_bps
+    }
+
     fn update_and_get_volume(env: &Env, merchant: &Address, amount: i128) -> i128 {
         let current_ledger = env.ledger().sequence();
         let key = DataKey::MerchantVolume(merchant.clone());
@@ -304,7 +337,12 @@ impl FeeCalculatorContract {
         env.storage().persistent().set(&key, &data);
         data.volume_usdc
     }
-
+    /// Selects the applicable fee tier for the given volume.
+    ///
+    /// Tiers are validated as strictly increasing by `validate_tiers`, so the
+    /// `threshold_usdc` array is sorted. We binary-search for the highest tier
+    /// whose threshold is `<= volume`, which is O(log n) instead of the
+    /// previous O(n) linear scan.
     fn select_fee_bps(env: &Env, volume: i128) -> u32 {
         let tiers: Vec<FeeTier> = env
             .storage()
@@ -312,15 +350,13 @@ impl FeeCalculatorContract {
             .get(&DataKey::FeeTiers)
             .expect("tiers not initialized");
 
-        let mut selected = tiers.get(0).unwrap().fee_bps;
-        for i in 0..tiers.len() {
-            let tier = tiers.get(i).unwrap();
-            if volume >= tier.threshold_usdc {
-                selected = tier.fee_bps;
+        let idx = if lo == 0 { 0 } else { lo - 1 };
+        tiers.get(idx).unwrap().fee_bps
             } else {
-                break;
+                hi = mid;
             }
         }
-        selected
+        let idx = if lo == 0 { 0 } else { lo - 1 };
+        tiers.get(idx).unwrap().fee_bps
     }
 }

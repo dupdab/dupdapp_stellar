@@ -9,6 +9,9 @@ use soroban_sdk::{
 
 const DEFAULT_MAX_BATCH_SIZE: u32 = 20;
 
+/// ABI version of this contract. Bump on every WASM upgrade.
+const CONTRACT_VERSION: u32 = 1;
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -17,6 +20,7 @@ enum DataKey {
     MaxAmount,
     MaxBatchSize,
     Counter,
+    Version,
     Payment(BytesN<32>),
 }
 
@@ -75,6 +79,15 @@ impl BatchPaymentContract {
         env.storage().instance().set(&DataKey::MaxAmount, &max_amount);
         env.storage().instance().set(&DataKey::MaxBatchSize, &DEFAULT_MAX_BATCH_SIZE);
         env.storage().instance().set(&DataKey::Counter, &0u64);
+        env.storage().instance().set(&DataKey::Version, &CONTRACT_VERSION);
+    }
+
+    /// Returns the ABI version of this contract.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(CONTRACT_VERSION)
     }
 
     /// Update payment amount limits. Admin-only.
@@ -240,47 +253,4 @@ impl BatchPaymentContract {
         payment_ids
     }
 
-    /// Returns the on-chain record for a previously created payment, if any.
-    pub
-            env.events().publish(
-                (soroban_sdk::Symbol::new(&env, "PaymentCreated"),),
-                (id_bytes.clone(), merchant.clone(), item.amount, item.memo.clone()),
-            );
-
-            payment_ids.push_back(id_bytes);
-        }
-
-        let final_counter = counter + count as u64;
-        env.storage().instance().set(&DataKey::Counter, &final_counter);
-
-        payment_ids
-    }
-
-    /// Returns the on-chain record for a previously created payment, if any.
-    pub fn get_payment(env: Env, id: BytesN<32>) -> Option<PaymentRecord> {
-        env.storage().persistent().get(&DataKey::Payment(id))
-    }
-
-    /// Returns the maximum allowed batch size.
-    pub fn max_batch_size(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::MaxBatchSize)
-            .unwrap_or(DEFAULT_MAX_BATCH_SIZE)
-    }
-
-    /// Return the currently configured min and max payment amounts.
-    pub fn get_limits(env: Env) -> (i128, i128) {
-        let min_amount: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinAmount)
-            .unwrap_or_else(|| panic!("contract not initialized"));
-        let max_amount: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxAmount)
-            .unwrap_or_else(|| panic!("contract not initialized"));
-        (min_amount, max_amount)
-    }
-}
+    /// Returns the on-chain
