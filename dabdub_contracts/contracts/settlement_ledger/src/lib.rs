@@ -31,6 +31,19 @@ pub struct SettlementVoid {
     pub voided_at: u64,
 }
 
+/// An append-only reversal (chargeback) marker referencing the original
+/// settlement. The original record stays readable; consumers must exclude
+/// reversed settlements from financial totals.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SettlementReversal {
+    pub payment_id: BytesN<32>,
+    pub merchant: Address,
+    pub amount: i128,
+    pub reason: String,
+    pub reversed_at: u64,
+}
+
 #[contracttype]
 enum DataKey {
     Admin,
@@ -47,6 +60,10 @@ enum DataKey {
     AllIndex,
     /// A void marker keyed by the original payment ID; never overwrites it.
     Void(BytesN<32>),
+    /// A reversal marker keyed by the original payment ID; never overwrites it.
+    Reversal(BytesN<32>),
+    /// Vec<BytesN<32>> — ordered reversal IDs for a merchant.
+    MerchantReversalIndex(Address),
 }
 
 // ── events ───────────────────────────────────────────────────────────────────
@@ -59,6 +76,14 @@ struct SettlementRecordedEvent {
     fee: i128,
     net: i128,
     fiat_ref: String,
+}
+
+#[contracttype]
+struct SettlementReversedEvent {
+    payment_id: BytesN<32>,
+    merchant: Address,
+    amount: i128,
+    reason: String,
 }
 
 // ── contract ─────────────────────────────────────────────────────────────────
@@ -186,6 +211,63 @@ impl SettlementLedgerContract {
         env.storage().persistent().get(&DataKey::Void(payment_id))
     }
 
+    /// Records a reversal (chargeback) against an existing settlement without
+    /// mutating or deleting the original immutable record. Admin-only.
+    /// Panics if the settlement does not exist or has already been reversed.
+    pub fn record_reversal(
+        env: Env,
+        caller: Address,
+        original_payment_id: BytesN<32>,
+        reason: String,
+    ) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let record: SettlementRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Settlement(original_payment_id.clone()))
+            .expect("settlement not found");
+
+        let key = DataKey::Reversal(original_payment_id.clone());
+        assert!(!env.storage().persistent().has(&key), "settlement already reversed");
+
+        let reversal = SettlementReversal {
+            payment_id: original_payment_id.clone(),
+            merchant: record.merchant.clone(),
+            amount: record.amount,
+            reason: reason.clone(),
+            reversed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &reversal);
+
+        // Update the merchant's reversal index so reversals are discoverable
+        // per merchant without rewriting the settlement index.
+        let idx_key = DataKey::MerchantReversalIndex(record.merchant.clone());
+        let mut idx: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or_else(|| vec![&env]);
+        idx.push_back(original_payment_id.clone());
+        env.storage().persistent().set(&idx_key, &idx);
+
+        env.events().publish(
+            ("SETTLEMENT_LEDGER", "settlement_reversed"),
+            SettlementReversedEvent {
+                payment_id: original_payment_id,
+                merchant: record.merchant,
+                amount: record.amount,
+                reason,
+            },
+        );
+    }
+
+    /// Returns the reversal marker for a settlement, if it was reversed.
+    pub fn get_settlement_reversal(env: Env, payment_id: BytesN<32>) -> Option<SettlementReversal> {
+        env.storage().persistent().get(&DataKey::Reversal(payment_id))
+    }
+
     /// Paginated list of settlement records for a merchant.
     /// `page` is 0-indexed; returns up to PAGE_SIZE (20) records per page.
     pub fn list_settlements(env: Env, merchant: Address, page: u32) -> Vec<SettlementRecord> {
@@ -222,31 +304,12 @@ impl SettlementLedgerContract {
     pub fn settlement_count(env: Env, merchant: Address) -> u32 {
         env.storage()
             .persistent()
-            .get::<_, u32>(&DataKey::MerchantCount(merchant))
+            .get(&DataKey::MerchantCount(merchant))
             .unwrap_or(0)
-    }
-
-    /// Paginated platform-wide settlement list. This avoids off-chain event
-    /// reconstruction for accounting while retaining the merchant index.
-    pub fn list_all_settlements(env: Env, page: u32) -> Vec<SettlementRecord> {
-        let index: Vec<BytesN<32>> = env.storage().persistent().get(&DataKey::AllIndex).unwrap_or_else(|| vec![&env]);
-        let start = page.saturating_mul(PAGE_SIZE);
-        if start >= index.len() { return vec![&env]; }
-        let end = (start + PAGE_SIZE).min(index.len());
-        let mut results = vec![&env];
-        for i in start..end {
-            let payment_id = index.get(i).unwrap();
-            results.push_back(env.storage().persistent().get(&DataKey::Settlement(payment_id)).unwrap());
-        }
-        results
-    }
-
-    pub fn total_settlement_count(env: Env) -> u32 {
-        env.storage().persistent().get::<_, Vec<BytesN<32>>>(&DataKey::AllIndex).map(|index| index.len()).unwrap_or(0)
     }
 
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(caller == &admin, "not admin");
+        assert!(caller == &admin, "caller is not admin");
     }
 }
