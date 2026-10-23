@@ -223,3 +223,63 @@ fn test_get_unknown_panics() {
     let result = client.try_get_settlement(&pid(&env, 99));
     assert!(result.is_err());
 }
+
+// ── settlement reversal ───────────────────────────────────────────────────────
+
+#[test]
+fn test_record_reversal_references_original() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    record(&client, &admin, &env, 70, &merchant, 10_000, 200);
+
+    client.record_reversal(&admin, &pid(&env, 70), &fiat_ref(&env, "chargeback"));
+
+    let rev = client.get_reversal(&pid(&env, 70)).unwrap();
+    assert_eq!(rev.original_payment_id, pid(&env, 70));
+    assert_eq!(rev.reason, fiat_ref(&env, "chargeback"));
+    assert_eq!(rev.merchant, merchant);
+    assert_eq!(rev.amount, 10_000);
+}
+
+#[test]
+#[should_panic(expected = "not admin")]
+fn test_record_reversal_unauthorized_caller_panics() {
+    let (env, admin, client) = setup();
+    let caller = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    record(&client, &admin, &env, 71, &merchant, 1_000, 20);
+    client.record_reversal(&caller, &pid(&env, 71), &fiat_ref(&env, "chargeback"));
+}
+
+#[test]
+fn test_double_reversal_panics() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    record(&client, &admin, &env, 72, &merchant, 1_000, 20);
+    client.record_reversal(&admin, &pid(&env, 72), &fiat_ref(&env, "chargeback"));
+
+    let result = client.try_record_reversal(&admin, &pid(&env, 72), &fiat_ref(&env, "again"));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_reversal_updates_merchant_index() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    record(&client, &admin, &env, 73, &merchant, 1_000, 20);
+    record(&client, &admin, &env, 74, &merchant, 2_000, 40);
+
+    client.record_reversal(&admin, &pid(&env, 73), &fiat_ref(&env, "chargeback"));
+
+    assert_eq!(client.reversal_count(&merchant), 1);
+    let list = client.list_reversals(&merchant, &0);
+    assert_eq!(list.len(), 1);
+    assert_eq!(list.get(0).unwrap().original_payment_id, pid(&env, 73));
+}
+
+#[test]
+fn test_reversal_unknown_payment_panics() {
+    let (env, admin, client) = setup();
+    let result = client.try_record_reversal(&admin, &pid(&env, 99), &fiat_ref(&env, "chargeback"));
+    assert!(result.is_err());
+}

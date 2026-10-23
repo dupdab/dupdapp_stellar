@@ -535,70 +535,30 @@ jobs:
           echo "| slippage_protection | ${{ steps.deploy.outputs.slippage_protection_id }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| stellar_confirmations | ${{ steps.deploy.outputs.stellar_confirmations_id }} |" >> "$GITHUB_STEP_SUMMARY"
 
-      # `stellar contract deploy` installs the WASM and creates a *new* contract
-      # instance with a *new* ID. It does not touch the live contract, so the
-      # previous wording here described deploying an empty orphan while the
-      # contract holding every open escrow kept running the bad code.
+      # Informational only: this step does not perform recovery transactions.
       - name: Rollback procedure reminder
         run: |
           cat <<'ROLLBACK'
-          ================================ ROLLBACK ================================
+          See docs/deployment.md before any production recovery action.
 
-          Do NOT use `stellar contract deploy` to roll back. It creates a NEW
-          contract with a NEW ID and empty storage; the live contract — holding
-          every open escrow, the admin address and the registry pointer — keeps
-          running the bad code, and every service still points at it.
+          This workflow deploys NEW contract instances. It does not replace
+          live code, transfer existing storage/funds, or update service routing.
+          Never use `stellar contract deploy` as an in-place rollback.
 
-          payment_escrow (in-place, preserves contract ID and storage)
-          ---------------------------------------------------------------------
-          1. Install the previous release WASM to get its hash:
+          Current payment_escrow uses schedule_upgrade, get_pending_upgrade,
+          cancel_upgrade and apply_upgrade (default delay: 17,280 ledgers).
+          There is no current immediate `upgrade` entrypoint. Verify the live
+          ABI, authorized signers, pending hash and apply ledger first.
+          Earlier WASM is usable only if compatible with current storage;
+          code replacement does not undo past transfers or state migrations.
 
-               stellar contract install \
-                 --wasm <prev-release>/payment_escrow.wasm \
-                 --source deployer \
-                 --network mainnet
+          Other contracts have no executable-update path in this workspace.
+          Replacement requires an explicit state/funds migration and cutover.
 
-          2. Invoke the contract's own upgrade entrypoint with that hash:
+          multisig_admin does not pause escrow or dispatch arbitrary calls.
+          Its incident proposal is only a signal for verified off-chain
+          containment. Direct on-chain calls remain possible.
 
-               stellar contract invoke \
-                 --id <LIVE_PAYMENT_ESCROW_ID> \
-                 --source deployer \
-                 --network mainnet \
-                 -- upgrade \
-                 --caller <ADMIN_ADDRESS> \
-                 --new_wasm_hash <PREV_WASM_HASH>
-
-             `upgrade` is admin-only. If the admin is a multisig, the
-             transaction needs the required signatures.
-
-          3. Confirm the swap landed:
-
-               stellar contract invoke --id <LIVE_PAYMENT_ESCROW_ID> \
-                 --network mainnet -- get_version
-
-             `get_version` increments on every upgrade, including a downgrade —
-             it counts upgrades, it does not name the code version. Verify
-             against the WASM hash on-chain, not this number.
-
-          Every other contract — no in-place path
-          ---------------------------------------------------------------------
-          payment_escrow is the only contract in this workspace that implements
-          `upgrade`. The other 13 have no `update_current_contract_wasm`
-          entrypoint, so there is no way to swap their code in place. Rolling
-          one back means deploying the previous WASM as a new contract and then
-          repointing everything that references the old ID:
-
-            - merchant_registry's registry pointer in payment_escrow
-              (`set_registry`)
-            - the NestJS backend's configured contract addresses
-            - any other contract holding the old ID
-
-          Storage does NOT carry over. Treat this as a migration, not a
-          rollback, and plan it as one.
-
-          Previous WASM artifacts are retained for 30 days in GitHub Actions.
-
-          See docs/escrow_upgrade_procedure.md and
-          dabdub_contracts/contracts/payment_escrow/EMERGENCY_RUNBOOK.md.
-          ==========================================================================
+          Previous WASM artifacts expire after 30 days; archive recovery
+          artifacts and complete the private on-call roster before rollout.
           ROLLBACK
