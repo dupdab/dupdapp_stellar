@@ -10,7 +10,12 @@ doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
+merchant-registry = { path = "../merchant_registry" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 merchant-registry = { path = "../merchant_registry", features = ["testutils"] }
+
+[[test]]
+name = "fuzz_boundaries"
+path = "tests/fuzz_boundaries.rs"

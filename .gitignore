@@ -5,6 +5,15 @@ node_modules/
 dist/
 build/
 
+# Rust / Soroban build artifacts
+target/
+**/target/
+Cargo.lock
+
+# Soroban / Stellar local state
+.soroban/
+*.wasm
+
 # Generated Stellar contract bindings (regenerated in CI)
 packages/contract-bindings/
 
@@ -17,6 +26,10 @@ yarn-error.log*
 # Env
 .env
 .env.local
+.env.*
+!.env.example
 
 # OS
 .DS_Store
+.idea/
+.vscode/
