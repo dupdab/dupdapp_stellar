@@ -12,6 +12,12 @@ const DEFAULT_MAX_BATCH_SIZE: u32 = 20;
 /// ABI version of this contract. Bump on every WASM upgrade.
 const CONTRACT_VERSION: u32 = 1;
 
+/// Storage strategy (see docs/storage-strategy.md):
+/// - Instance storage holds configuration and small counters (Admin, MinAmount,
+///   MaxAmount, MaxBatchSize, Counter, Version). It is shared across the contract
+///   instance and its TTL is extended together with the contract, so it must stay small.
+/// - Persistent storage holds per-payment records (Payment(id)), which grow with
+///   usage and must carry their own TTL extension so they are not archived.
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {

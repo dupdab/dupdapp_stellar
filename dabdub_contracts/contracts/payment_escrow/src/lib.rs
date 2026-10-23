@@ -45,6 +45,19 @@ pub struct PaymentEscrow {
     pub asset_type: AssetType,
 }
 
+// Storage strategy (see docs/storage-strategy.md for full rationale):
+//
+// * Instance storage holds contract-wide configuration (admin, token addresses,
+//   registry, emergency signers, upgrade timelock, version, limits). It is
+//   loaded on every invocation and shares the contract's TTL, so it is kept
+//   alive by `extend_ttl` on each deposit.
+// * Persistent storage holds per-payment `PaymentEscrow` records keyed by
+//   `DataKey::Payment(payment_id)`. Each record is independently archivable and
+//   must outlive its business expiry, so `deposit` extends its TTL to
+//   `ttl_ledgers + 1` to keep the record readable at the refund point.
+// * Temporary storage is not used: escrowed funds and their records must never
+//   be silently evicted, so no data here is safe to lose on expiry.
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {

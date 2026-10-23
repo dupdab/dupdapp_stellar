@@ -1,5 +1,55 @@
 #![no_std]
 
+//! # Merchant Registry – Storage Strategy
+//!
+//! ## Storage types
+//!
+//! * **Instance** (`env.storage().instance()`): data that is global to the
+//!   contract and read on almost every call. Used here for `Admin`,
+//!   `PendingAdmin`, and `MerchantCount`. Instance storage shares a single
+//!   ledger entry and TTL with the contract instance, so it is cheap to read
+//!   but grows the instance entry if misused. Values are kept scalar.
+//! * **Persistent** (`env.storage().persistent()`): per-merchant records and
+//!   index slots (`Merchant(Address)`, `MerchantAt(u32)`). Each key has its own
+//!   TTL and is never evicted while live, so a merchant record cannot be lost
+//!   to instance-entry expiry. Each key is independent, so writes for one
+//!   merchant do not rewrite another's entry.
+//! * **Temporary** (`env.storage().temporary()`): not used. Nothing in this
+//!   contract is safe to lose on expiry, so temporary storage would risk
+//!   silent data loss.
+//!
+//! ## Per-contract usage and justification
+//!
+//! | Key                 | Storage    | Justification                              |
+//! |---------------------|------------|--------------------------------------------|
+//! | `Admin`             | Instance   | Single global value read on every admin op |
+//! | `PendingAdmin`      | Instance   | Single global value, removed after accept  |
+//! | `MerchantCount`     | Instance   | Scalar counter, O(1) index append          |
+//! | `Merchant(addr)`    | Persistent | Per-merchant record, must not expire       |
+//! | `MerchantAt(i)`     | Persistent | Per-slot index, avoids O(N) rewrites       |
+//!
+//! ## Cost model (per registration / per read)
+//!
+//! * `register_merchant`: 2 persistent writes (record + index slot) and
+//!   2 instance writes/reads (count). Cost is constant in the number of
+//!   merchants, because no prior entry is read or rewritten.
+//! * `merchants(page, page_size)`: reads only the `page_size` slots requested,
+//!   so cost is bounded by page size, not total merchants.
+//! * Payment-path cost depends on the Escrow contract, which reads this
+//!   registry's `get_merchant`. One persistent read per payment, at the
+//!   current Stellar fee schedule. Exact fee figures should be taken from the
+//!   network's current fee stats at deploy time rather than hard-coded here.
+//!
+//! ## TTL extension strategy
+//!
+//! * Instance TTL is extended on each state-changing admin call so the
+//!   contract instance and its `Admin`/`MerchantCount` entries stay live.
+//! * Persistent merchant and index entries should have their TTL extended
+//!   (via `env.storage().persistent().extend_ttl`) whenever a merchant record
+//!   is read or written, so active merchants do not expire. Dormant merchants
+//!   rely on the minimum TTL set at write time; operators should run a
+//!   periodic bump job for long-idle records.
+
 mod test;
 
 use soroban_sdk::{
