@@ -5,6 +5,7 @@ WASM_DIR      := $(CONTRACTS_DIR)/target/wasm32v1-none/release
 WASM_SIZE_LIMIT := 65536  # 64 KB
 WASM_SIZE_WARN  := 52428  # 80% of 64 KB
 WASM_SIZE_REPORT := $(CONTRACTS_DIR)/wasm-size-report.md
+WASM_SIZE_CHECK := scripts/check-wasm-size.sh
 
 # Contracts that have per-contract test/build targets.
 CONTRACTS := admin_auth admin_timelock batch_payments escrow fee_calculator fee_distributor liquidity_router registry
@@ -20,6 +21,7 @@ help:
 	@echo "  make build              Build all contracts"
 	@echo "  make test               Run all contract tests"
 	@echo "  make clean              Remove all build artifacts"
+	@echo "  make check-wasm-size    Enforce 64KB WASM size budget on all contracts"
 	@echo "  make help               Show this help message"
 	@echo ""
 	@echo "Local Soroban testnet targets:"
@@ -81,6 +83,11 @@ build-optimised: build
 	done
 	@echo "Done."
 
+# Enforce the per-contract WASM size budget (WASM_SIZE_LIMIT). Reports the
+# size of every contract and fails if any exceeds the limit.
+check-wasm-size: build-optimised
+	@WASM_DIR=$(WASM_DIR) WASM_SIZE_LIMIT=$(WASM_SIZE_LIMIT) WASM_SIZE_WARN=$(WASM_SIZE_WARN) bash $(WASM_SIZE_CHECK)
+
 lint-clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 
@@ -141,4 +148,3 @@ integration-test: build
 
 verify-deployment:
 	bash scripts/verify-deployment.sh
-
