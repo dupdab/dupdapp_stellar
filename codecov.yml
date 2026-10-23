@@ -1,10 +1,98 @@
+# Codecov configuration — enforce per-contract coverage thresholds.
+#
+# Each contract under dupdapp_contract/contracts/* is treated as its own
+# component with an 80% coverage target. A PR fails if any contract's
+# coverage drops below that threshold.
+
 coverage:
+  precision: 2
+  round: down
+  range: "70...100"
+
   status:
     project:
       default:
-        target: auto
-        threshold: 2%
+        target: 80%
+        threshold: 0%
+        base: auto
+        informational: false
     patch:
       default:
-        target: auto
-        threshold: 2%
+        target: 80%
+        threshold: 0%
+        base: auto
+        informational: false
+
+# Exclude test files and generated snapshots from coverage calculation.
+ignore:
+  - "**/src/test.rs"
+  - "**/test_snapshots/**"
+  - "**/tests/**"
+  - "**/*_test.rs"
+
+# Per-contract components. Each contract is its own component with an 80%
+# target so a single under-covered contract fails the PR status check.
+component_management:
+  default_rules:
+    statuses:
+      - type: project
+        target: 80%
+        threshold: 0%
+        informational: false
+  individual_components:
+    - component_id: admin_timelock
+      name: admin_timelock
+      paths:
+        - dupdapp_contract/contracts/admin_timelock/**
+    - component_id: batch_payments
+      name: batch_payments
+      paths:
+        - dupdapp_contract/contracts/batch_payments/**
+    - component_id: fee_calculator
+      name: fee_calculator
+      paths:
+        - dupdapp_contract/contracts/fee_calculator/**
+    - component_id: fee_distributor
+      name: fee_distributor
+      paths:
+        - dupdapp_contract/contracts/fee_distributor/**
+    - component_id: liquidity_router
+      name: liquidity_router
+      paths:
+        - dupdapp_contract/contracts/liquidity_router/**
+    - component_id: merchant_registry
+      name: merchant_registry
+      paths:
+        - dupdapp_contract/contracts/merchant_registry/**
+    - component_id: multisig_admin
+      name: multisig_admin
+      paths:
+        - dupdapp_contract/contracts/multisig_admin/**
+    - component_id: payment_escrow
+      name: payment_escrow
+      paths:
+        - dupdapp_contract/contracts/payment_escrow/**
+    - component_id: payment_request
+      name: payment_request
+      paths:
+        - dupdapp_contract/contracts/payment_request/**
+    - component_id: rbac_access
+      name: rbac_access
+      paths:
+        - dupdapp_contract/contracts/rbac_access/**
+    - component_id: reconciliation
+      name: reconciliation
+      paths:
+        - dupdapp_contract/contracts/reconciliation/**
+    - component_id: settlement_ledger
+      name: settlement_ledger
+      paths:
+        - dupdapp_contract/contracts/settlement_ledger/**
+    - component_id: slippage_protection
+      name: slippage_protection
+      paths:
+        - dupdapp_contract/contracts/slippage_protection/**
+    - component_id: stellar_confirmations
+      name: stellar_confirmations
+      paths:
+        - dupdapp_contract/contracts/stellar_confirmations/**

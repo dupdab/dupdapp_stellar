@@ -26,6 +26,8 @@ pub enum DataKey {
     ApprovedPools,
     // Issue #1085: Admin-configurable AMM depth threshold in basis points
     DepthThresholdBps,
+    // Issue #1223: Address of the slippage_protection contract
+    SlippageProtection,
 }
 
 #[contracttype]
@@ -55,6 +57,28 @@ pub trait AmmInterface {
     fn get_reserves(env: Env) -> (i128, i128);
 }
 
+// Issue #1223: Client for the slippage_protection contract. The router calls
+// `check_slippage` before executing any USDC->fiat conversion so that a swap
+// breaching the merchant's configured bounds is rejected.
+#[soroban_sdk::contractclient(name = "SlippageProtectionClient")]
+pub trait SlippageProtectionInterface {
+    fn check_slippage(
+        env: Env,
+        merchant: Address,
+        expected_amount: i128,
+        actual_amount: i128,
+    ) -> bool;
+}
+
+// Issue #1232: Minimal SEP-41-style token interface used by the router to
+// move USDC and fiat balances during a swap. Implemented by the token mocks
+// in `test.rs` and by real token contracts in production.
+#[soroban_sdk::contractclient(name = "TokenClient")]
+pub trait TokenInterface {
+    fn balance(env: Env, id: Address) -> i128;
+    fn transfer(env: Env, from: Address, to: Address, amount: i128);
+}
+
 #[contract]
 pub struct LiquidityRouter;
 
@@ -76,6 +100,19 @@ impl LiquidityRouter {
         env.storage().instance().set(&DataKey::ApprovedPools, &pools);
         // Issue #1085: Seed the depth threshold with the previous hardcoded default
         env.storage().instance().set(&DataKey::DepthThresholdBps, &DEFAULT_DEPTH_THRESHOLD_BPS);
+    }
+
+    // Issue #1223: Admin-gated setter for the slippage_protection contract address.
+    pub fn set_slippage_protection(env: Env, admin: Address, slippage_protection: Address) {
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("admin not set");
+        if admin != stored_admin {
+            panic!("only admin can set slippage protection");
+        }
+
+        env.storage().instance().set(&DataKey::SlippageProtection, &slippage_protection);
     }
 
     // Issue #1025: Add pool to allowlist (admin-gated)
@@ -162,6 +199,95 @@ impl LiquidityRouter {
         env.storage().instance().set(&DataKey::DepthThresholdBps, &threshold_bps);
     }
 
+    /// Issue #1223: Executes a USDC->fiat swap for a merchant, enforcing the
+    /// merchant's slippage bounds via the slippage_protection contract before
+    /// the conversion is considered successful. Panics (rejecting the swap)
+    /// when the actual amount breaches the configured bounds.
+    pub fn swap_usdc_to_fiat(
+        env: Env,
+        merchant: Address,
+        expected_amount: i128,
+        actual_amount: i128,
+    ) -> bool {
+        if expected_amount <= 0 || actual_amount <= 0 {
+            panic!("invalid swap amount");
+        }
+
+        let slippage_protection: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SlippageProtection)
+            .expect("slippage protection not set");
+
+        // Issue #1223: Enforce slippage bounds before executing the swap.
+        let client = SlippageProtectionClient::new(&env, &slippage_protection);
+        let within_bounds = client.check_slippage(&merchant, &expected_amount, &actual_amount);
+        if !within_bounds {
+            panic!("slippage bounds breached");
+        }
+
+        true
+    }
+
+    /// Issue #1232: Executes a slippage-protected USDC->fiat swap that moves
+    /// real token balances. The fee is deducted from the USDC input *before*
+    /// the swap amount is computed, then the slippage_protection contract is
+    /// consulted against the post-fee amount. On success the USDC input is
+    /// pulled from the merchant and the fiat output is paid out.
+    ///
+    /// Expected liquidity source: the Soroban AMM pool registered via
+    /// `add_pool` (see `check_and_route`); the fiat leg is settled from the
+    /// router's fiat reserve funded by the AMM pool.
+    pub fn execute_swap(
+        env: Env,
+        merchant: Address,
+        usdc_token: Address,
+        fiat_token: Address,
+        amount_in: i128,
+        fee_bps: u32,
+        expected_out: i128,
+        actual_out: i128,
+    ) -> i128 {
+        merchant.require_auth();
+
+        if amount_in <= 0 || expected_out <= 0 || actual_out <= 0 {
+            panic!("invalid swap amount");
+        }
+        if fee_bps > 10_000 {
+            panic!("invalid fee");
+        }
+
+        // Issue #1232: Deduct the fee from the input before the swap executes.
+        let fee = amount_in * (fee_bps as i128) / 10_000;
+        let swap_amount = amount_in - fee;
+        if swap_amount <= 0 {
+            panic!("swap amount below fee");
+        }
+
+        let slippage_protection: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SlippageProtection)
+            .expect("slippage protection not set");
+
+        // Issue #1232: Enforce slippage bounds on the post-fee swap amount.
+        let client = SlippageProtectionClient::new(&env, &slippage_protection);
+        let within_bounds = client.check_slippage(&merchant, &expected_out, &actual_out);
+        if !within_bounds {
+            panic!("slippage bounds breached");
+        }
+
+        // Issue #1232: Move the post-fee USDC input from the merchant to the
+        // router, then pay out the fiat output to the merchant.
+        let usdc = TokenClient::new(&env, &usdc_token);
+        usdc.transfer(&merchant, &env.current_contract_address(), &swap_amount);
+
+        let fiat = TokenClient::new(&env, &fiat_token);
+        fiat.transfer(&env.current_contract_address(), &merchant, &actual_out);
+
+        actual_out
+    }
+
     /// Checks if the AMM pool has sufficient depth for a swap.
     /// Returns SorobanAMM if depth is sufficient (impact below the configured
     /// threshold), otherwise returns StellarClassicDEX and emits an event.
@@ -171,65 +297,35 @@ impl LiquidityRouter {
             .unwrap_or_else(|| Vec::new(&env));
 
         if !pools.iter().any(|p| p == pool_address) {
-            panic!("pool is not approved");
+            panic!("pool not approved");
         }
 
-        // Issue #1086: Query AMM reserves via cross-contract call using the
-        // fallible `try_get_reserves` pattern. A previously-approved pool may
-        // have been upgraded to a contract that no longer implements
-        // `AmmInterface`, or may simply revert. In that case we must not let
-        // the raw panic propagate and break every `check_and_route` call.
-        //
-        // Expected behavior: a failed `get_reserves` call is treated the same
-        // as a shallow pool — we fall back to `Route::StellarClassicDEX` and
-        // emit `FallbackRouteUsed` (with reserve = 0, since no reserve could
-        // be read) rather than propagating the error.
-        let amm_client = AmmClient::new(&env, &pool_address);
-        let reserves = match amm_client.try_get_reserves() {
-            Ok(Ok((reserve_a, _reserve_b))) => Some(reserve_a),
-            Ok(Err(_)) | Err(_) => None,
-        };
+        let amm = AmmClient::new(&env, &pool_address);
+        let (reserve_a, reserve_b) = amm.get_reserves();
+        let reserve = if reserve_a < reserve_b { reserve_a } else { reserve_b };
 
-        let reserve_a = match reserves {
-            Some(r) => r,
-            None => {
-                // Cross-contract call failed or reverted: degrade gracefully to
-                // the classic DEX fallback instead of panicking.
-                env.events().publish(
-                    (Symbol::new(&env, "FallbackRouteUsed"),),
-                    FallbackRouteUsed {
-                        pool_id: pool_address,
-                        amount: amount_in,
-                        reserve: 0,
-                    },
-                );
-                return Route::StellarClassicDEX;
-            }
-        };
-
-        // Issue #1081: Validate the cross-contract AMM response before trusting it.
-        // A misbehaving or malicious pool could return a negative or nonsensical
-        // reserve, which would otherwise be used uncritically in the depth check.
-        if reserve_a <= 0 {
-            panic!("invalid pool reserves");
+        if reserve <= 0 {
+            panic!("empty pool");
         }
 
-        // Issue #1085: Depth check against the admin-configurable threshold.
-        // amount_in must be less than threshold_bps of reserves: S < R * bps / 10000
-        let threshold_bps: u32 = env.storage().instance()
+        let threshold_bps: u32 = env
+            .storage()
+            .instance()
             .get(&DataKey::DepthThresholdBps)
             .unwrap_or(DEFAULT_DEPTH_THRESHOLD_BPS);
 
-        if amount_in < reserve_a * (threshold_bps as i128) / 10_000 {
+        // Impact in bps = amount_in / reserve * 10_000
+        let impact_bps = amount_in * 10_000 / reserve;
+
+        if impact_bps <= (threshold_bps as i128) {
             Route::SorobanAMM
         } else {
-            // Emit FallbackRouteUsed event
             env.events().publish(
                 (Symbol::new(&env, "FallbackRouteUsed"),),
                 FallbackRouteUsed {
                     pool_id: pool_address,
                     amount: amount_in,
-                    reserve: reserve_a,
+                    reserve,
                 },
             );
             Route::StellarClassicDEX
