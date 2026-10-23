@@ -32,18 +32,20 @@ use soroban_sdk::{
 
 const MIN_DELAY_LEDGERS: u32 = 17_280;
 
-// ---------------------------------------------------------------------------
-// Standardised error messages (PascalCase codes)
-//
-// Panic strings are standardised to PascalCase codes so the backend can match
-// on them reliably. These will be replaced by `#[contracterror]` enums once
-// the P0 issue lands.
-// ---------------------------------------------------------------------------
+/// Contract ABI version. Bumped on every WASM upgrade.
+const VERSION: u32 = 1;
 
-const ERR_DELAY_TOO_SHORT: &str = "DelayTooShort";
-const ERR_CHANGE_NOT_PENDING: &str = "ChangeNotPending";
-const ERR_DELAY_NOT_ELAPSED: &str = "DelayNotElapsed";
-const ERR_CANNOT_PRUNE_PENDING: &str = "CannotPrunePending";
+// ---------------------------------------------------------------------------
+// Standardised error codes (PascalCase) — see issue #1314.
+// Shared format across all contracts until `#[contracterror]` enums land.
+// ---------------------------------------------------------------------------
+mod errors {
+    pub const NOT_ADMIN: &str = "NotAdmin";
+    pub const INVALID_DELAY: &str = "InvalidDelay";
+    pub const CHANGE_NOT_PENDING: &str = "ChangeNotPending";
+    pub const DELAY_NOT_ELAPSED: &str = "DelayNotElapsed";
+    pub const CANNOT_PRUNE_PENDING: &str = "CannotPrunePending";
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -72,6 +74,7 @@ pub enum DataKey {
     Counter,
     Change(BytesN<32>),
     PendingList,
+    Version,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +123,15 @@ impl AdminTimelockContract {
         env.storage()
             .instance()
             .set(&DataKey::PendingList, &Vec::<BytesN<32>>::new(&env));
+        env.storage().instance().set(&DataKey::Version, &VERSION);
+    }
+
+    /// Return the contract ABI version.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(VERSION)
     }
 
     /// Queue a parameter change. Returns the change_id.
@@ -135,7 +147,7 @@ impl AdminTimelockContract {
         Self::require_admin(&env, &caller);
 
         if delay_ledgers < MIN_DELAY_LEDGERS {
-            panic!("{}", ERR_DELAY_TOO_SHORT);
+            panic!("{}", errors::INVALID_DELAY);
         }
 
         let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap();
@@ -205,10 +217,10 @@ impl AdminTimelockContract {
         let mut change = Self::get_change(env.clone(), change_id.clone());
 
         if change.status != ChangeStatus::Pending {
-            panic!("{}", ERR_CHANGE_NOT_PENDING);
+            panic!("{}", errors::CHANGE_NOT_PENDING);
         }
         if env.ledger().sequence() < change.execute_after {
-            panic!("{}", ERR_DELAY_NOT_ELAPSED);
+            panic!("{}", errors::DELAY_NOT_ELAPSED);
         }
 
         change.status = ChangeStatus::Applied;
@@ -236,7 +248,7 @@ impl AdminTimelockContract {
         let mut change = Self::get_change(env.clone(), change_id.clone());
 
         if change.status != ChangeStatus::Pending {
-            panic!("{}", ERR_CHANGE_NOT_PENDING);
+            panic!("{}", errors::CHANGE_NOT_PENDING);
         }
 
         change.status = ChangeStatus::Cancelled;
@@ -264,7 +276,7 @@ impl AdminTimelockContract {
         let change = Self::get_change(env.clone(), change_id.clone());
 
         if change.status == ChangeStatus::Pending {
-            panic!("{}", ERR_CANNOT_PRUNE_PENDING);
+            panic!("{}", errors::CANNOT_PRUNE_PENDING);
         }
 
         env.storage()
@@ -272,4 +284,4 @@ impl AdminTimelockContract {
             .remove(&DataKey::Change(change_id));
     }
 
-    /// Transfer admin authority to a new address. Irreversible without the n
+            panic!("{}", errors::CANNOT_PRUNE_PENDING);

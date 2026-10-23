@@ -36,6 +36,21 @@ The `/health/ready` endpoint checks **PostgreSQL + Stellar Horizon** and returns
 
 ---
 
+## Soroban Contract Event Lag
+
+The payment volume dashboard (`grafana/dashboards/payment-volume.json`) tracks how far
+the Soroban event indexer has fallen behind the chain head via the
+`soroban_event_lag_ledgers` metric.
+
+- **Metric:** `soroban_event_lag_ledgers` — number of ledgers between the last indexed
+  Soroban contract event and the current ledger.
+- **Panel:** "Soroban Event Lag" shows the last indexed ledger vs. the current ledger
+  (and the derived lag) so operators can see indexing progress at a glance.
+- **Alert:** fires when `soroban_event_lag_ledgers > 10` for the configured window,
+  indicating the indexer is falling behind and payment events may be delayed.
+
+---
+
 ## Setup Guides
 
 - [UptimeRobot Setup](./uptimerobot.md)

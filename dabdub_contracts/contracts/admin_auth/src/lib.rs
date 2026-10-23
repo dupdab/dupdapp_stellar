@@ -5,10 +5,13 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
-/// Standardised error message codes (PascalCase) used across contracts.
-/// See issue #1274 — panic strings are standardised here until
-/// `#[contracterror]` enums are adopted (P0 issue).
-mod errors {
+/// Contract ABI version. Bumped on every WASM upgrade; CI checks this
+/// matches the crate version in Cargo.toml.
+pub const VERSION: u32 = 1u32;
+
+/// Shared PascalCase error codes for panic messages (issue #1314).
+/// These will be replaced by `#[contracterror]` enums in a future change.
+pub mod errors {
     pub const NOT_ADMIN: &str = "NotAdmin";
     pub const ADMIN_NOT_FOUND: &str = "AdminNotFound";
     pub const CANNOT_REVOKE_SUPER_ADMIN: &str = "CannotRevokeSuperAdmin";
@@ -40,6 +43,7 @@ pub enum DataKey {
     SuperAdmin,
     Admin(Address),
     AdminIndex,
+    Version,
 }
 
 #[contracttype]
@@ -79,6 +83,7 @@ impl AdminAuthContract {
     /// Bootstrap the store with a single SuperAdmin. All other admin accounts
     /// are created exclusively through `add_admin` (the CLI seed/script path).
     pub fn __constructor(env: Env, super_admin: Address) {
+        env.storage().instance().set(&DataKey::Version, &VERSION);
         env.storage().instance().set(&DataKey::SuperAdmin, &super_admin);
         Self::save(
             &env,
@@ -92,6 +97,19 @@ impl AdminAuthContract {
         let mut index: Vec<Address> = Vec::new(&env);
         index.push_back(super_admin);
         env.storage().instance().set(&DataKey::AdminIndex, &index);
+    }
+
+    /// Return the contract ABI version stored at construction time.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+    /// Return the contract ABI version stored at construction time.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(VERSION)
     }
 
     /// Add an admin to the separate credential store. SuperAdmin only.
@@ -252,6 +270,10 @@ impl AdminAuthContract {
             Some(user) => user.active,
             None => false,
         }
+    }
+
+    fn save(env: &Env, user: AdminUser) {
+        env.storage().persistent().set(&DataKey::Admin(user.admin.clone()), &user);
     }
 
     fn require_super_admin(env: &Env, caller: &Address) {
