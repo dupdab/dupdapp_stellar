@@ -158,6 +158,70 @@ impl MultisigAdminContract {
         proposal_id
     }
 
+    /// Proposes a generic action. Restricted to the first configured signer
+    /// (signer 1). `action_type` and `target_contract` are opaque metadata
+    /// carried alongside the `calldata`; like `propose`, they are stored and
+    /// echoed in events but never dispatched as a cross-contract call.
+    pub fn propose_action(
+        env: Env,
+        caller: Address,
+        action_type: String,
+        target_contract: Address,
+        calldata: Bytes,
+    ) -> u64 {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        if caller != Self::signer_one(&env) {
+            panic!("only signer 1 may propose actions");
+        }
+        if action_type.len() == 0 {
+            panic!("action_type must not be empty");
+        }
+
+        let mut next_id: u64 = env.storage().instance().get(&DataKey::NextProposalId).unwrap_or(0);
+        let proposal_id = next_id;
+        next_id = next_id.checked_add(1).expect("proposal id overflow");
+        env.storage().instance().set(&DataKey::NextProposalId, &next_id);
+
+        let now = env.ledger().timestamp();
+        let mut approvals = vec![&env];
+        approvals.push_back(caller.clone());
+
+        let mut proposal = Proposal {
+            id: proposal_id,
+            proposer: caller.clone(),
+            operation: action_type.clone(),
+            args: calldata,
+            approvals,
+            created_at: now,
+            expires_at: now.saturating_add(EXPIRY_SECONDS),
+            executed: false,
+            rejected: false,
+        };
+
+        env.events().publish(
+            ("MULTISIG", "proposal_created"),
+            ProposalCreatedEvent {
+                proposal_id,
+                proposer: caller,
+                operation: action_type,
+                expires_at: proposal.expires_at,
+            },
+        );
+
+        // Record the target contract as opaque metadata for relayers.
+        env.events().publish(
+            ("MULTISIG", "action_target"),
+            (proposal_id, target_contract),
+        );
+
+        Self::maybe_execute(&env, &mut proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        proposal_id
+    }
+
     pub fn approve(env: Env, caller: Address, proposal_id: u64) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
@@ -201,6 +265,88 @@ impl MultisigAdminContract {
         env.storage().persistent().set(&key, &proposal);
     }
 
+    /// Approves a proposed action. Restricted to signers 2+ (signer 1 is the
+    /// proposer and cannot approve its own action). Prevents double approval.
+    pub fn approve_action(env: Env, caller: Address, action_id: u64) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        if caller == Self::signer_one(&env) {
+            panic!("signer 1 cannot approve its own action");
+        }
+
+        let key = DataKey::Proposal(action_id);
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("proposal not found");
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            panic!("proposal expired");
+        }
+        if proposal.executed {
+            panic!("proposal already executed");
+        }
+        if proposal.rejected {
+            panic!("proposal already rejected");
+        }
+        if Self::has_approved(&proposal.approvals, &caller) {
+            panic!("already approved");
+        }
+
+        proposal.approvals.push_back(caller.clone());
+        env.events().publish(
+            ("MULTISIG", "proposal_approved"),
+            ProposalApprovedEvent {
+                proposal_id: action_id,
+                approver: caller,
+                approvals: proposal.approvals.len(),
+            },
+        );
+
+        Self::maybe_execute(&env, &mut proposal);
+        env.storage().persistent().set(&key, &proposal);
+    }
+
+    /// Executes a proposed action once quorum (THRESHOLD) is reached.
+    ///
+    /// Panics if the proposal does not exist, has expired, was already
+    /// executed/rejected, or has not yet gathered enough approvals.
+    pub fn execute_action(env: Env, caller: Address, action_id: u64) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let key = DataKey::Proposal(action_id);
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("proposal not found");
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            panic!("proposal expired");
+        }
+        if proposal.executed {
+            panic!("proposal already executed");
+        }
+        if proposal.rejected {
+            panic!("proposal already rejected");
+        }
+        if proposal.approvals.len() < THRESHOLD {
+            panic!("quorum not reached");
+        }
+
+        proposal.executed = true;
+        env.events().publish(
+            ("MULTISIG", "proposal_executed"),
+            ProposalExecutedEvent {
+                proposal_id: action_id,
+                operation: proposal.operation.clone(),
+            },
+        );
+        env.storage().persistent().set(&key, &proposal);
+    }
+
     /// Removes an expired, never-executed proposal from persistent storage.
     ///
     /// Permissionless: expiry is objectively checkable on-chain via
@@ -233,67 +379,65 @@ impl MultisigAdminContract {
     }
 
     pub fn get_admins(env: Env) -> Vec<Address> {
-        env.storage().instance().get(&DataKey::Admins).unwrap()
+        env.storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .expect("admins not set")
     }
 
     pub fn get_threshold(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::Threshold).unwrap_or(2)
+        env.storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(THRESHOLD)
     }
 
-    pub fn get_proposal(env: Env, proposal_id: u64) -> Option<Proposal> {
-        env.storage().persistent().get(&DataKey::Proposal(proposal_id))
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("proposal not found")
+    }
+
+    fn signer_one(env: &Env) -> Address {
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .expect("admins not set");
+        admins.get(0).expect("no signer 1")
     }
 
     fn require_admin(env: &Env, caller: &Address) {
-        if !Self::is_admin(env, caller) {
-            panic!("Not admin");
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .expect("admins not set");
+        if !Self::has_approved(&admins, caller) {
+            panic!("caller is not an admin");
         }
     }
 
-    fn is_admin(env: &Env, caller: &Address) -> bool {
-        let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
-        Self::contains_address(&admins, caller)
-    }
-
-    fn contains_address(list: &Vec<Address>, addr: &Address) -> bool {
-        for i in 0..list.len() {
-            if list.get(i).unwrap() == *addr {
+    fn has_approved(list: &Vec<Address>, who: &Address) -> bool {
+        for a in list.iter() {
+            if &a == who {
                 return true;
             }
         }
         false
     }
 
-    fn has_approved(approvals: &Vec<Address>, addr: &Address) -> bool {
-        Self::contains_address(approvals, addr)
-    }
-
     fn maybe_execute(env: &Env, proposal: &mut Proposal) {
-        if proposal.executed {
+        if proposal.executed || proposal.rejected {
             return;
         }
-        if proposal.rejected {
+        if env.ledger().timestamp() > proposal.expires_at {
             return;
         }
         if proposal.approvals.len() < THRESHOLD {
             return;
         }
-        if env.ledger().timestamp() > proposal.expires_at {
-            panic!("proposal expired");
-        }
-        let threshold = Self::get_threshold(env.clone());
-        if proposal.approvals.len() >= threshold {
-            proposal.executed = true;
-            Self::apply_operation(env, proposal);
-            env.events().publish(
-                ("MULTISIG", "proposal_executed"),
-                ProposalExecutedEvent {
-                    proposal_id: proposal.id,
-                    operation: proposal.operation.clone(),
-                },
-            );
-        }
-
         proposal.executed = true;
         env.events().publish(
             ("MULTISIG", "proposal_executed"),
@@ -302,64 +446,5 @@ impl MultisigAdminContract {
                 operation: proposal.operation.clone(),
             },
         );
-    }
-
-    fn apply_operation(env: &Env, proposal: &Proposal) {
-        let op = proposal.operation.clone();
-        if op == String::from_str(env, "add_admin") {
-            let new_admin = Self::decode_address(env, &proposal.args);
-            let mut admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
-            if Self::contains_address(&admins, &new_admin) {
-                panic!("admin already exists");
-            }
-            admins.push_back(new_admin);
-            env.storage().instance().set(&DataKey::Admins, &admins);
-        } else if op == String::from_str(env, "remove_admin") {
-            let target = Self::decode_address(env, &proposal.args);
-            let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
-            if !Self::contains_address(&admins, &target) {
-                panic!("admin not found");
-            }
-            if admins.len() <= 1 {
-                panic!("cannot remove last admin");
-            }
-            let mut updated = vec![env];
-            for i in 0..admins.len() {
-                let a = admins.get(i).unwrap();
-                if a != target {
-                    updated.push_back(a);
-                }
-            }
-            let threshold = Self::get_threshold(env.clone());
-            if threshold > updated.len() {
-                panic!("threshold exceeds admin count");
-            }
-            env.storage().instance().set(&DataKey::Admins, &updated);
-        } else if op == String::from_str(env, "set_threshold") {
-            let new_threshold = Self::decode_u32(env, &proposal.args);
-            let admins: Vec<Address> = env.storage().instance().get(&DataKey::Admins).unwrap();
-            if new_threshold == 0 || new_threshold > admins.len() {
-                panic!("invalid threshold");
-            }
-            env.storage().instance().set(&DataKey::Threshold, &new_threshold);
-        }
-    }
-
-    fn decode_address(env: &Env, args: &Bytes) -> Address {
-        let mut buf = [0u8; 32];
-        if args.len() != 32 {
-            panic!("invalid address args");
-        }
-        args.copy_into_slice(&mut buf);
-        Address::from_string_bytes(&String::from_bytes(env, &Bytes::from_slice(env, &buf)))
-    }
-
-    fn decode_u32(env: &Env, args: &Bytes) -> u32 {
-        let mut buf = [0u8; 4];
-        if args.len() != 4 {
-            panic!("invalid u32 args");
-        }
-        args.copy_into_slice(&mut buf);
-        u32::from_be_bytes(buf)
     }
 }

@@ -114,6 +114,12 @@ struct UpgradeCancelledEvent {
 /// Defaults used until the admin overrides them via `set_max_dispute_window_ledgers`
 /// / `set_max_ttl_ledgers`.
 const DEFAULT_MAX_DISPUTE_WINDOW_LEDGERS: u32 = 51_840;
+// 518,400 ledgers is approximately 30 days at 5 seconds per ledger. This
+// default bounds how long a new payment may tie up capital while allowing a
+// settlement window; it is not a wall-clock or regulatory deadline. The admin
+// can change the cap for future deposits via set_max_ttl_ledgers. Business
+// expiry and Soroban archival are separate: deposit extends storage through
+// expiry + 1 so the first refundable ledger remains accessible.
 const DEFAULT_MAX_TTL_LEDGERS: u32 = 518_400;
 const EMERGENCY_SIGNER_COUNT: u32 = 3;
 const DEFAULT_UPGRADE_DELAY_LEDGERS: u32 = 17_280;
@@ -392,6 +398,18 @@ impl PaymentEscrowContract {
             panic!("TTL exceeds maximum");
         }
 
+        // Storage TTL is relative to the current ledger and live-until is
+        // inclusive. Refunds require sequence > expiry, hence one extra ledger.
+        let retention = ttl_ledgers
+            .checked_add(1)
+            .filter(|ttl| *ttl <= env.storage().max_ttl())
+            .expect("TTL exceeds storage retention limit");
+        let expiry = env
+            .ledger()
+            .sequence()
+            .checked_add(ttl_ledgers)
+            .expect("Payment expiry overflow");
+
         let key = DataKey::Payment(payment_id.clone());
         if env.storage().persistent().has(&key) {
             panic!("Payment ID already exists");
@@ -417,7 +435,6 @@ impl PaymentEscrowContract {
             &amount,
         );
 
-        let expiry = env.ledger().sequence().saturating_add(ttl_ledgers);
         let dispute_window_end = {
             let max_window_end = env
                 .ledger()
@@ -444,6 +461,12 @@ impl PaymentEscrowContract {
         };
 
         env.storage().persistent().set(&key, &payment);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, retention, retention);
+        // Keep the escrow code and configuration callable for the same period.
+        // Extending for a shorter new payment never shortens existing TTLs.
+        env.storage().instance().extend_ttl(retention, retention);
 
         env.events().publish(
             ("ESCROW", "deposit"),
@@ -466,7 +489,7 @@ impl PaymentEscrowContract {
         let mut payment = Self::get_payment(env.clone(), payment_id.clone());
         Self::require_releasable(&env, &payment);
 
-        let remaini
+        let remaining = Self::remaining_amount(&payment);
 
         Self::transfer_from_contract(&env, &payment.merchant, remaining, &payment.asset_type);
         payment.released_amount = payment.amount;
@@ -660,6 +683,75 @@ impl PaymentEscrowContract {
                 amount: remaining,
             },
         );
+    }
+
+    /// Resolves an open dispute by splitting the remaining balance between the
+    /// merchant and the customer. Admin-only. `merchant_amount` is released to
+    /// the merchant and `customer_amount` is refunded to the customer; the two
+    /// must sum to the remaining balance. Emits a separate `release` event for
+    /// the merchant portion and a `refund` event for the customer portion.
+    pub fn resolve_dispute_split(
+        env: Env,
+        caller: Address,
+        payment_id: BytesN<32>,
+        merchant_amount: i128,
+        customer_amount: i128,
+    ) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
+        if payment.status != PaymentStatus::Disputed {
+            panic!("Dispute is not open");
+        }
+
+        let remaining = Self::remaining_amount(&payment);
+        if remaining <= 0 {
+            panic!("Payment fully released");
+        }
+        if merchant_amount < 0 || customer_amount < 0 {
+            panic!("Split amounts must be >= 0");
+        }
+        if merchant_amount.saturating_add(customer_amount) != remaining {
+            panic!("Split amounts must equal remaining balance");
+        }
+
+        if merchant_amount > 0 {
+            Self::transfer_from_contract(
+                &env,
+                &payment.merchant,
+                merchant_amount,
+                &payment.asset_type,
+            );
+            env.events().publish(
+                ("ESCROW", "release"),
+                EscrowStateEvent {
+                    payment_id: payment_id.clone(),
+                    amount: merchant_amount,
+                },
+            );
+        }
+        if customer_amount > 0 {
+            Self::transfer_from_contract(
+                &env,
+                &payment.customer,
+                customer_amount,
+                &payment.asset_type,
+            );
+            env.events().publish(
+                ("ESCROW", "refund"),
+                EscrowStateEvent {
+                    payment_id: payment_id.clone(),
+                    amount: customer_amount,
+                },
+            );
+        }
+
+        payment.released_amount = payment.amount;
+        payment.status = PaymentStatus::Released;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
     }
 
     pub fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrow {

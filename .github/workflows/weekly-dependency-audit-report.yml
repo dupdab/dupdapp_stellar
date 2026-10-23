@@ -2,48 +2,224 @@ name: Weekly Dependency Audit Report
 
 on:
   schedule:
-    - cron: '0 8 * * 1'
+    # Every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
-  dependency-audit-report:
+  audit:
+    name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '20'
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.30.2
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Generate Rust contracts audit report
+        working-directory: dabdub_contracts
+        run: cargo audit --format json > rust-audit-report.txt 2>&1 || true
 
       - name: Generate backend audit report
         run: node scripts/dependency-audit-report.js backend --output backend-audit-report.txt
 
-      - name: Generate frontend audit report
-        run: node scripts/dependency-audit-report.js frontend --output frontend-audit-report.txt
-
-      - name: Combine audit reports
+      - name: Run npm audit (backend)
+        id: npm_audit
+        continue-on-error: true
         run: |
-          echo "# Weekly Dependency Audit Report" > audit-report.txt
-          echo "" >> audit-report.txt
-          echo "## Backend" >> audit-report.txt
-          cat backend-audit-report.txt >> audit-report.txt
-          echo "" >> audit-report.txt
-          echo "## Frontend" >> audit-report.txt
-          cat frontend-audit-report.txt >> audit-report.txt
+          set +e
+          if [ -f package-lock.json ]; then
+            npm audit --json > npm-audit.json 2>/dev/null
+            echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          else
+            echo '{"vulnerabilities":{},"metadata":{"vulnerabilities":{"total":0}}}' > npm-audit.json
+            echo "exit_code=0" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Send audit report to admin
-        uses: dawidd6/action-send-mail@v3
+      - name: Run cargo audit (contracts)
+        id: cargo_audit
+        continue-on-error: true
+        run: |
+          set +e
+          if [ -f dabdub_contracts/Cargo.toml ]; then
+            (cd dabdub_contracts && cargo audit --json > ../cargo-audit.json 2>/dev/null)
+            echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          else
+            echo '{"vulnerabilities":{"list":[]}}' > cargo-audit.json
+            echo "exit_code=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build audit report
+        id: report
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+
+          const readJson = (p, fallback) => {
+            try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
+          };
+
+          const npm = readJson('npm-audit.json', { vulnerabilities: {}, metadata: { vulnerabilities: { total: 0 } } });
+          const cargo = readJson('cargo-audit.json', { vulnerabilities: { list: [] } });
+
+          const lines = [];
+          let total = 0;
+
+          lines.push('## Dependency Audit Report');
+          lines.push('');
+          lines.push(`Generated: ${new Date().toISOString()}`);
+          lines.push('');
+
+          // npm findings
+          const npmVulns = npm.vulnerabilities || {};
+          const npmEntries = Object.entries(npmVulns);
+          lines.push('### Backend (npm audit)');
+          if (npmEntries.length === 0) {
+            lines.push('No vulnerabilities found.');
+          } else {
+            for (const [name, v] of npmEntries) {
+              total += 1;
+              const via = Array.isArray(v.via) ? v.via : [];
+              const advisories = via
+                .filter((x) => x && typeof x === 'object')
+                .map((x) => {
+                  const url = x.url || (x.cve ? `https://nvd.nist.gov/vuln/detail/${x.cve}` : null);
+                  const id = x.cve || x.source || x.title || 'advisory';
+                  return url ? `[${id}](${url})` : id;
+                });
+              const links = advisories.length ? ` - ${advisories.join(', ')}` : '';
+              lines.push(`- **${name}** (${v.severity || 'unknown'})${links}`);
+            }
+          }
+          lines.push('');
+
+          // cargo findings
+          const cargoList = (cargo.vulnerabilities && cargo.vulnerabilities.list) || [];
+          lines.push('### Contracts (cargo audit)');
+          if (cargoList.length === 0) {
+            lines.push('No vulnerabilities found.');
+          } else {
+            for (const item of cargoList) {
+              total += 1;
+              const adv = item.advisory || {};
+              const pkg = item.package || {};
+              const id = adv.id || 'advisory';
+              const url = adv.url || (adv.aliases || []).find((a) => a.startsWith('CVE-'))
+                ? `https://nvd.nist.gov/vuln/detail/${(adv.aliases || []).find((a) => a.startsWith('CVE-'))}`
+                : adv.url;
+              const link = url ? `[${id}](${url})` : id;
+              lines.push(`- **${pkg.name || 'unknown'} ${pkg.version || ''}** - ${link}${adv.title ? `: ${adv.title}` : ''}`);
+            }
+          }
+          lines.push('');
+          lines.push(`**Total findings: ${total}**`);
+
+          const body = lines.join('\n');
+          fs.writeFileSync('audit-report.md', body);
+          fs.writeFileSync('audit-total.txt', String(total));
+          NODE
+
+      - name: Read report
+        id: read_report
+        run: |
+          echo "total=$(cat audit-total.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Post to Slack
+        if: ${{ secrets.SLACK_SECURITY_WEBHOOK_URL != '' }}
+        env:
+          SLACK_SECURITY_WEBHOOK_URL: ${{ secrets.SLACK_SECURITY_WEBHOOK_URL }}
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const https = require('https');
+          const url = new URL(process.env.SLACK_SECURITY_WEBHOOK_URL);
+          const text = fs.readFileSync('audit-report.md', 'utf8');
+          const payload = JSON.stringify({ text });
+          const req = https.request({
+            hostname: url.hostname,
+            path: url.pathname + url.search,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+          }, (res) => {
+            res.on('data', () => {});
+            res.on('end', () => console.log(`Slack response: ${res.statusCode}`));
+          });
+          req.on('error', (e) => { console.error(e); process.exit(1); });
+          req.write(payload);
+          req.end();
+          NODE
+
+      - name: Open or update security issue
+        if: ${{ steps.read_report.outputs.total != '0' }}
+        uses: actions/github-script@v7
         with:
-          server_address: ${{ secrets.EMAIL_SMTP_HOST }}
-          server_port: ${{ secrets.EMAIL_SMTP_PORT }}
-          username: ${{ secrets.EMAIL_SMTP_USER }}
-          password: ${{ secrets.EMAIL_SMTP_PASS }}
-          subject: 'Weekly Dependency Audit Report'
-          body_file: audit-report.txt
-          to: ${{ secrets.EMAIL_ADMIN }}
-          from: ${{ secrets.EMAIL_FROM || secrets.EMAIL_SMTP_USER }}
-          secure: ${{ secrets.EMAIL_SMTP_SECURE }}
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('audit-report.md', 'utf8');
+            const title = 'Weekly dependency audit: vulnerabilities found';
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security',
+              state: 'open',
+            });
+            const existing = issues.find((i) => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['security'],
+              });
+            }
+
+      - name: Auto-close security issue when clean
+        if: ${{ steps.read_report.outputs.total == '0' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'Weekly dependency audit: vulnerabilities found';
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security',
+              state: 'open',
+            });
+            for (const issue of issues.filter((i) => i.title === title)) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: 'Dependencies have been updated and the audit now passes. Closing automatically.',
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }

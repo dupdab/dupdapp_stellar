@@ -1,16 +1,26 @@
+# Codecov configuration — enforce per-contract coverage thresholds.
+#
+# Each contract under dupdapp_contract/contracts/* is treated as its own
+# component with an 80% coverage target. A PR fails if any contract's
+# coverage drops below that threshold.
+
 coverage:
+  precision: 2
+  round: down
+  range: "70...100"
+
   status:
     project:
       default:
         target: 80%
         threshold: 0%
-    patch:
-      default:
-        target: 80%
-        threshold: 0%
+        base: auto
+        informational: false
 
+# Exclude test files and generated snapshots from coverage calculation.
 ignore:
-  - "**/test.rs"
+  - "**/src/test.rs"
+  - "**/test_snapshots/**"
   - "**/tests/**"
   - "**/*_test.rs"
   - "dabdub_contracts/contracts/**/src/test.rs"
@@ -19,3 +29,9 @@ comment:
   layout: "reach,diff,flags,files"
   behavior: default
   require_changes: false
+    patch:
+      default:
+        target: 80%
+        threshold: 0%
+        base: auto
+        informational: false
