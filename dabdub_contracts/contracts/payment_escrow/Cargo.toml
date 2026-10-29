@@ -11,7 +11,10 @@ doctest = false
 [dependencies]
 soroban-sdk = { workspace = true }
 merchant-registry = { path = "../merchant_registry" }
+multisig-admin = { path = "../multisig_admin" }
+admin-timelock = { path = "../admin_timelock" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 merchant-registry = { path = "../merchant_registry", features = ["testutils"] }
+admin-timelock = { path = "../admin_timelock", features = ["testutils"] }

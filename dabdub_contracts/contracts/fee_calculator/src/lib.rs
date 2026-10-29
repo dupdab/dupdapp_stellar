@@ -4,7 +4,7 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
-const LEDGERS_PER_30_DAYS: u32 = 172_800;
+const WINDOW_SECONDS: u64 = 30 * 24 * 60 * 60;
 const BPS_DENOMINATOR: i128 = 10_000;
 const DEFAULT_MIN_FEE_BPS: u32 = 10;
 
@@ -18,7 +18,7 @@ pub struct FeeTier {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MerchantVolume {
-    pub window_start_ledger: u32,
+    pub window_start_timestamp: u64,
     pub volume_usdc: i128,
 }
 
@@ -101,6 +101,14 @@ impl FeeCalculatorContract {
         env.storage().instance().get(&DataKey::SettlementCaller)
     }
 
+    pub fn set_min_fee(ctx: Env, caller: Address, min_fee_bps: u32) {
+        Self::set_min_fee_bps(ctx, caller, min_fee_bps);
+    }
+
+    pub fn get_min_fee(env: Env) -> u32 {
+        Self::get_min_fee_bps(env)
+    }
+
     pub fn set_min_fee_stroops(env: Env, caller: Address, min_fee_stroops: i128) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
@@ -148,8 +156,6 @@ impl FeeCalculatorContract {
     }
 
     pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
-        // `__constructor` always validates and stores `FeeTiers`, so for any
-        // live contract instance the tiers are guaranteed to be present.
         env.storage()
             .instance()
             .get(&DataKey::FeeTiers)
@@ -170,7 +176,12 @@ impl FeeCalculatorContract {
         }
 
         let volume = Self::update_and_get_volume(&env, &merchant, amount);
-        let fee_bps = Self::select_fee_bps(&env, volume);
+        let min_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinFeeBps)
+            .unwrap_or(DEFAULT_MIN_FEE_BPS);
+        let mut fee_bps = Self::select_fee_bps(&env, volume).max(min_fee_bps);
 
         let mut fee = amount
             .checked_mul(fee_bps as i128)
@@ -178,12 +189,6 @@ impl FeeCalculatorContract {
             .checked_div(BPS_DENOMINATOR)
             .expect("division failure");
 
-        // Enforce the minimum fee floor (in bps) so zero-bps tiers still pay.
-        let min_fee_bps: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinFeeBps)
-            .unwrap_or(DEFAULT_MIN_FEE_BPS);
         let min_fee_from_bps = amount
             .checked_mul(min_fee_bps as i128)
             .expect("overflow")
@@ -221,30 +226,26 @@ impl FeeCalculatorContract {
         (fee, net, fee_bps)
     }
 
-    /// Read-only query: returns the merchant's current 30-day windowed volume.
-    /// If the window has elapsed, the windowed (reset) value is computed in
-    /// memory and returned without writing back to storage. The actual
-    /// reset-and-persist happens in `update_and_get_volume` during
-    /// `calculate_fee`.
-    pub fn get_merchant_volume(env: Env, merchant: Address) -> MerchantVolume {
-        let current_ledger = env.ledger().sequence();
+    /// Returns the merchant's current rolling volume for the last 30 days.
+    pub fn get_merchant_volume(env: Env, merchant: Address) -> i128 {
+        let current_timestamp = env.ledger().timestamp();
         let key = DataKey::MerchantVolume(merchant);
         let data = env
             .storage()
             .persistent()
             .get::<DataKey, MerchantVolume>(&key)
             .unwrap_or(MerchantVolume {
-                window_start_ledger: current_ledger,
+                window_start_timestamp: current_timestamp,
                 volume_usdc: 0,
             });
 
-        if current_ledger.saturating_sub(data.window_start_ledger) >= LEDGERS_PER_30_DAYS {
-            MerchantVolume {
-                window_start_ledger: current_ledger,
-                volume_usdc: 0,
-            }
+        if current_timestamp
+            .saturating_sub(data.window_start_timestamp)
+            >= WINDOW_SECONDS
+        {
+            0
         } else {
-            data
+            data.volume_usdc
         }
     }
 
@@ -299,12 +300,6 @@ impl FeeCalculatorContract {
         }
     }
 
-    /// Selects the applicable fee tier for the given volume using binary
-    /// search over the strictly increasing `threshold_usdc` values (guaranteed
-    /// by `validate_tiers`). Returns the `fee_bps` of the highest tier whose
-    /// threshold is `<= volume`, or the first tier's `fee_bps` if the volume is
-    /// below every threshold. This is O(log n) instead of the previous O(n)
-    /// linear scan.
     fn select_fee_bps(env: &Env, volume: i128) -> u32 {
         let tiers: Vec<FeeTier> = env
             .storage()
@@ -316,8 +311,6 @@ impl FeeCalculatorContract {
         let mut lo: u32 = 0;
         let mut hi: u32 = len;
 
-        // Find the first index whose threshold is strictly greater than
-        // `volume`; the applicable tier is the one just before it.
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let tier = tiers.get(mid).unwrap();
@@ -333,19 +326,22 @@ impl FeeCalculatorContract {
     }
 
     fn update_and_get_volume(env: &Env, merchant: &Address, amount: i128) -> i128 {
-        let current_ledger = env.ledger().sequence();
+        let current_timestamp = env.ledger().timestamp();
         let key = DataKey::MerchantVolume(merchant.clone());
         let mut data = env
             .storage()
             .persistent()
             .get::<DataKey, MerchantVolume>(&key)
             .unwrap_or(MerchantVolume {
-                window_start_ledger: current_ledger,
+                window_start_timestamp: current_timestamp,
                 volume_usdc: 0,
             });
 
-        if current_ledger.saturating_sub(data.window_start_ledger) >= LEDGERS_PER_30_DAYS {
-            data.window_start_ledger = current_ledger;
+        if current_timestamp
+            .saturating_sub(data.window_start_timestamp)
+            >= WINDOW_SECONDS
+        {
+            data.window_start_timestamp = current_timestamp;
             data.volume_usdc = 0;
         }
 

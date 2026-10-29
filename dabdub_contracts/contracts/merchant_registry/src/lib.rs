@@ -96,8 +96,10 @@ pub struct MerchantRecord {
 pub struct MerchantStatusInfo {
     /// `true` if a merchant record exists for the queried address.
     pub registered: bool,
-    /// Lifecycle state; `None` when the merchant is not registered.
-    pub status: Option<MerchantStatus>,
+    /// Lifecycle state. For unregistered merchants this is left as `Active` as a
+    /// placeholder value because Soroban contract serialization does not support
+    /// nested `Option<T>` in a `#[contracttype]` payload.
+    pub status: MerchantStatus,
     /// `true` only when registered and `status == Active`.
     pub is_active: bool,
     /// `true` only when registered and `status == Suspended`.
@@ -239,14 +241,17 @@ impl MerchantRegistryContract {
     ///
     /// Requires the pending admin's own `require_auth`, so the transfer only
     /// takes effect once the proposed address proves control of itself.
-    pub fn accept_admin(env: Env) {
+    pub fn accept_admin(env: Env, caller: Address) {
         let pending: Address = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
-            .expect("No pending admin transfer");
+            .expect("No pending admin");
 
-        pending.require_auth();
+        if caller != pending {
+            panic!("Not pending admin");
+        }
+        caller.require_auth();
 
         let old_admin: Address = env
             .storage()
@@ -264,6 +269,11 @@ impl MerchantRegistryContract {
                 new_admin: pending,
             },
         );
+    }
+
+    /// Read the current admin.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).expect("Admin not set")
     }
 
     /// Read the pending admin, if a transfer has been proposed.
@@ -396,7 +406,7 @@ impl MerchantRegistryContract {
             panic!("Merchant already active");
         }
         if record.status == MerchantStatus::Terminated {
-            panic!("Cannot reactivate a terminated merchant");
+            panic!("Cannot reactivate terminated merchant");
         }
 
         record.status = MerchantStatus::Active;
@@ -518,9 +528,77 @@ impl MerchantRegistryContract {
     // Queries
     // ------------------------------------------------------------------
 
-    /// Fetch a single merchant record.  Returns `None` if not registered.
+    /// Fetch a single merchant record. Returns `None` if not registered.
     pub fn get_merchant(env: Env, merchant: Address) -> Option<MerchantRecord> {
         env.storage().persistent().get(&DataKey::Merchant(merchant))
+    }
+
+    /// Return the current fee tier for a merchant.
+    pub fn get_fee_tier(env: Env, merchant: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Merchant(merchant))
+            .map(|record: MerchantRecord| record.fee_bps)
+            .unwrap_or(DEFAULT_FEE_BPS)
+    }
+
+    /// Detailed merchant status snapshot.
+    pub fn get_merchant_status(env: Env, merchant: Address) -> MerchantStatusInfo {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, MerchantRecord>(&DataKey::Merchant(merchant.clone()))
+        {
+            Some(record) => {
+                let status = record.status.clone();
+                let is_active = status == MerchantStatus::Active;
+                let is_suspended = status == MerchantStatus::Suspended;
+                let is_terminated = status == MerchantStatus::Terminated;
+                MerchantStatusInfo {
+                    registered: true,
+                    status: status.clone(),
+                    is_active,
+                    is_suspended,
+                    is_terminated,
+                    is_kyc_verified: record.kyc_verified,
+                    is_approved: is_active && record.kyc_verified,
+                }
+            }
+            None => MerchantStatusInfo {
+                registered: false,
+                status: MerchantStatus::Active,
+                is_active: false,
+                is_suspended: false,
+                is_terminated: false,
+                is_kyc_verified: false,
+                is_approved: false,
+            },
+        }
+    }
+
+    /// Convenience query for whether a merchant is active and usable.
+    pub fn is_merchant_active(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_active
+    }
+
+    /// Convenience query for whether a merchant is suspended.
+    pub fn is_merchant_suspended(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_suspended
+    }
+
+    /// Convenience query for whether a merchant is terminated.
+    pub fn is_merchant_terminated(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_terminated
+    }
+
+    /// Convenience query for KYC status.
+    pub fn is_kyc_verified(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_kyc_verified
+    }
+
+    /// Convenience query for approval status.
+    pub fn is_approved(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_approved
     }
 
     /// Return the total number of registered merchants.
@@ -550,11 +628,7 @@ impl MerchantRegistryContract {
             .get(&DataKey::MerchantCount)
             .unwrap_or(0);
 
-        let start = page.saturating_mul(page_size);
-        if start >= total {
-            return result;
-        }
-
+        let start = page.min(total);
         let end = start.saturating_add(page_size).min(total);
         let mut i = start;
         while i < end {
@@ -582,7 +656,7 @@ impl MerchantRegistryContract {
             .get(&DataKey::Admin)
             .expect("Admin not set");
         if &admin != caller {
-            panic!("Caller is not admin");
+            panic!("Not admin");
         }
     }
 }

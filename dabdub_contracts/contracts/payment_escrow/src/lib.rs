@@ -2,10 +2,26 @@
 
 mod test;
 
+use admin_timelock::TimelockAction;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token, Address, BytesN,
     Env, String, Vec,
 };
+
+#[contractclient(name = "MultisigAdminClient")]
+#[allow(dead_code)]
+trait MultisigAdmin {
+    fn get_admins(env: Env) -> Vec<Address>;
+    fn get_threshold(env: Env) -> u32;
+}
+
+#[contractclient(name = "AdminTimelockClient")]
+#[allow(dead_code)]
+trait AdminTimelock {
+    fn queue_action(env: Env, caller: Address, action_id: BytesN<32>) -> TimelockAction;
+    fn cancel_timelock(env: Env, caller: Address, action_id: BytesN<32>);
+    fn execute_action(env: Env, caller: Address, action_id: BytesN<32>);
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -102,6 +118,9 @@ pub enum DataKey {
     UpgradeDelayLedgers,
     PendingUpgradeHash,
     PendingUpgradeLedger,
+    TimelockContract,
+    MultisigAdmin,
+    LargeReleaseThreshold,
     Payment(BytesN<32>),
     Version,
     MaxDisputeWindowLedgers,
@@ -166,6 +185,7 @@ const DEFAULT_MAX_TTL_LEDGERS: u32 = 518_400;
 const DEFAULT_DISPUTE_RESOLUTION_DELAY_LEDGERS: u32 = 17_280;
 const EMERGENCY_SIGNER_COUNT: u32 = 3;
 const DEFAULT_UPGRADE_DELAY_LEDGERS: u32 = 17_280;
+const LARGE_RELEASE_THRESHOLD_USDC: i128 = 10_000;
 
 #[contract]
 pub struct PaymentEscrowContract;
@@ -227,10 +247,12 @@ impl PaymentEscrowContract {
             .set(&DataKey::EmergencyLastDrainLedger, &0u32);
 
         // Initialize the upgrade timelock delay to a safe default.
-        env.storage().instance().set(
-            &DataKey::UpgradeDelayLedgers,
-            &DEFAULT_UPGRADE_DELAY_LEDGERS,
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeDelayLedgers, &DEFAULT_UPGRADE_DELAY_LEDGERS);
+        env.storage()
+            .instance()
+            .set(&DataKey::LargeReleaseThreshold, &LARGE_RELEASE_THRESHOLD_USDC);
 
         // Initialize contract version to 1.
         env.storage().instance().set(&DataKey::Version, &1u32);
@@ -244,6 +266,11 @@ impl PaymentEscrowContract {
     pub fn schedule_upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+
+        if let Some(timelock_addr) = env.storage().instance().get(&DataKey::TimelockContract) {
+            let timelock = AdminTimelockClient::new(&env, &timelock_addr);
+            timelock.queue_action(&caller, &new_wasm_hash);
+        }
 
         let delay: u32 = env
             .storage()
@@ -268,10 +295,53 @@ impl PaymentEscrowContract {
         );
     }
 
+    pub fn set_timelock_contract(env: Env, caller: Address, timelock: Option<Address>) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::TimelockContract, &timelock);
+    }
+
+    pub fn get_timelock_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TimelockContract)
+    }
+
+    pub fn set_multisig_admin(env: Env, caller: Address, multisig_admin: Option<Address>) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigAdmin, &multisig_admin);
+    }
+
+    pub fn get_multisig_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::MultisigAdmin)
+    }
+
     /// Cancel a previously scheduled upgrade. Admin-only.
     pub fn cancel_upgrade(env: Env, caller: Address) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+
+        if let Some(timelock_addr) = env.storage().instance().get(&DataKey::TimelockContract) {
+            let pending: BytesN<32> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PendingUpgradeHash)
+                .unwrap_or_else(|| panic!("No pending upgrade"));
+            let timelock = AdminTimelockClient::new(&env, &timelock_addr);
+            timelock.cancel_timelock(&caller, &pending);
+            env.storage().instance().remove(&DataKey::PendingUpgradeHash);
+            env.storage().instance().remove(&DataKey::PendingUpgradeLedger);
+            env.events().publish(
+                ("ESCROW", "upgrade_cancelled"),
+                UpgradeCancelledEvent {
+                    new_wasm_hash: pending,
+                },
+            );
+            return;
+        }
 
         let pending: BytesN<32> = env
             .storage()
@@ -564,8 +634,11 @@ impl PaymentEscrowContract {
         Self::require_releasable(&env, &payment)?;
 
         let remaining = Self::remaining_amount(&payment);
+        Self::require_large_action_authorization(&env, &caller, remaining);
 
-        Self::transfer_from_contract(&env, &payment.merchant, remaining, &payment.asset_type);
+        // CEI: mark the payment settled before invoking the token callback so a
+        // malicious recipient cannot re-enter `release` / `refund` and double-claim
+        // funds while the status is still `Pending`.
         payment.released_amount = payment.amount;
         payment.status = PaymentStatus::Released;
         let release_key = DataKey::Payment(payment_id.clone());
@@ -573,6 +646,8 @@ impl PaymentEscrowContract {
         env.storage()
             .persistent()
             .extend_ttl(&release_key, MAX_TTL_LEDGERS, MAX_TTL_LEDGERS);
+
+        Self::transfer_from_contract(&env, &payment.merchant, remaining, &payment.asset_type);
 
         env.events().publish(
             ("ESCROW", "release"),
@@ -658,7 +733,8 @@ impl PaymentEscrowContract {
             return Err(ContractError::PaymentFullyReleased);
         }
 
-        Self::transfer_from_contract(&env, &payment.customer, remaining, &payment.asset_type);
+        // CEI: the status must be set before the token transfer so the recipient
+        // cannot re-enter `release` / `refund` and settle the same payment twice.
         payment.released_amount = payment.amount;
         payment.status = PaymentStatus::Expired;
         let refund_key = DataKey::Payment(payment_id.clone());
@@ -666,6 +742,8 @@ impl PaymentEscrowContract {
         env.storage()
             .persistent()
             .extend_ttl(&refund_key, MAX_TTL_LEDGERS, MAX_TTL_LEDGERS);
+
+        Self::transfer_from_contract(&env, &payment.customer, remaining, &payment.asset_type);
 
         env.events().publish(
             ("ESCROW", "refund"),
@@ -788,8 +866,8 @@ impl PaymentEscrowContract {
         if remaining <= 0 {
             return Err(ContractError::PaymentFullyReleased);
         }
+        Self::require_large_action_authorization(&env, &caller, remaining);
 
-        Self::transfer_from_contract(&env, &winner, remaining, &payment.asset_type);
         payment.status = if winner == payment.merchant {
             PaymentStatus::Released
         } else {
@@ -801,6 +879,8 @@ impl PaymentEscrowContract {
         env.storage()
             .persistent()
             .extend_ttl(&resolve_key, MAX_TTL_LEDGERS, MAX_TTL_LEDGERS);
+
+        Self::transfer_from_contract(&env, &winner, remaining, &payment.asset_type);
 
         let topic = if winner == payment.merchant {
             "release"
@@ -851,6 +931,14 @@ impl PaymentEscrowContract {
             panic!("Split amounts must equal remaining balance");
         }
 
+        Self::require_large_action_authorization(&env, &caller, remaining);
+
+        payment.released_amount = payment.amount;
+        payment.status = PaymentStatus::Released;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
+
         if merchant_amount > 0 {
             Self::transfer_from_contract(
                 &env,
@@ -881,12 +969,6 @@ impl PaymentEscrowContract {
                 },
             );
         }
-
-        payment.released_amount = payment.amount;
-        payment.status = PaymentStatus::Released;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Payment(payment_id.clone()), &payment);
     }
 
     pub fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrow {
@@ -950,8 +1032,17 @@ impl PaymentEscrowContract {
         if signer_one == signer_two {
             return Err(ContractError::DuplicateEmergencySigners);
         }
-        signer_one.require_auth();
-        signer_two.require_auth();
+
+        if caller != signer_one && caller != signer_two {
+            return Err(ContractError::NotEmergencySigner);
+        }
+        if signer_one != caller {
+            signer_one.require_auth();
+        }
+        if signer_two != caller && signer_two != signer_one {
+            signer_two.require_auth();
+        }
+
         Self::require_emergency_signer(&env, &signer_one)?;
         Self::require_emergency_signer(&env, &signer_two)?;
 
@@ -1014,6 +1105,28 @@ impl PaymentEscrowContract {
             return Err(ContractError::NotAdmin);
         }
         Ok(())
+    }
+
+    fn require_large_action_authorization(env: &Env, caller: &Address, amount: i128) {
+        let threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LargeReleaseThreshold)
+            .unwrap_or(LARGE_RELEASE_THRESHOLD_USDC);
+        if amount <= threshold {
+            return;
+        }
+        let Some(multisig_addr) = env.storage().instance().get(&DataKey::MultisigAdmin) else {
+            return;
+        };
+        let multisig = MultisigAdminClient::new(env, &multisig_addr);
+        let admins = multisig.get_admins();
+        if !admins.iter().any(|admin| admin == *caller) {
+            panic!("Large payout requires multisig signer");
+        }
+        if multisig.get_threshold() < 2 {
+            panic!("Large payout requires 2-of-3 quorum");
+        }
     }
 
     fn require_releasable(env: &Env, payment: &PaymentEscrow) -> Result<(), ContractError> {

@@ -51,6 +51,18 @@
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                         }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "MerchantCount"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 0
+                        }
                       }
                     ]
                   }

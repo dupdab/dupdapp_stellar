@@ -33,7 +33,7 @@ fn test_register_merchant_happy_path() {
 
     client.register_merchant(&admin, &merchant, &sample_name(&env));
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.merchant, merchant);
     assert_eq!(record.status, MerchantStatus::Active);
 }
@@ -70,7 +70,7 @@ fn test_suspend_merchant() {
     client.register_merchant(&admin, &merchant, &sample_name(&env));
     client.suspend_merchant(&admin, &merchant);
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.status, MerchantStatus::Suspended);
 }
 
@@ -83,7 +83,7 @@ fn test_reactivate_merchant() {
     client.suspend_merchant(&admin, &merchant);
     client.reactivate_merchant(&admin, &merchant);
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.status, MerchantStatus::Active);
 }
 
@@ -144,7 +144,7 @@ fn test_terminate_merchant_from_active() {
     client.register_merchant(&admin, &merchant, &sample_name(&env));
     client.terminate_merchant(&admin, &merchant);
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.status, MerchantStatus::Terminated);
 }
 
@@ -157,7 +157,7 @@ fn test_terminate_merchant_from_suspended() {
     client.suspend_merchant(&admin, &merchant);
     client.terminate_merchant(&admin, &merchant);
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.status, MerchantStatus::Terminated);
 }
 
@@ -244,7 +244,7 @@ fn test_merchants_listing_still_includes_terminated_merchants() {
     // Terminate the middle merchant; it must remain in the index for now.
     client.terminate_merchant(&admin, &merchant_b);
     assert_eq!(
-        client.get_merchant(&merchant_b).status,
+        client.get_merchant(&merchant_b).unwrap().status,
         MerchantStatus::Terminated
     );
 
@@ -266,19 +266,6 @@ fn test_merchants_listing_still_includes_terminated_merchants() {
 
 // ---------------------------------------------------------------------------
 // transfer_admin (two-step: propose_admin + accept_admin)
-
-#[test]
-fn test_propose_admin_does_not_take_effect_until_accepted() {
-    let (env, client, admin) = setup();
-    let new_admin = Address::generate(&env);
-
-    client.propose_admin(&admin, &new_admin);
-
-    // Current admin remains in control until the pending admin accepts.
-    assert_eq!(client.get_admin(), admin);
-}
-
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_propose_admin_does_not_take_effect_until_accepted() {
@@ -326,7 +313,7 @@ fn test_transfer_admin_updates_merchant_ops() {
     client.accept_admin(&new_admin);
     client.register_merchant(&new_admin, &merchant, &sample_name(&env));
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.merchant, merchant);
     assert_eq!(record.status, MerchantStatus::Active);
 }
