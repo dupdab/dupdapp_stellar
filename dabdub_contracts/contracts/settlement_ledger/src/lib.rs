@@ -1,227 +1,398 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, BytesN, Env};
+mod test;
 
-// TTL constants, in ledgers (~5 seconds per ledger).
-const DAY_IN_LEDGERS: u32 = 17_280;
-const INSTANCE_BUMP_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS;
-const INSTANCE_BUMP_TARGET: u32 = 30 * DAY_IN_LEDGERS;
-const PERSISTENT_BUMP_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
-const PERSISTENT_BUMP_TARGET: u32 = 365 * DAY_IN_LEDGERS;
+use fee_calculator::FeeCalculatorContractClient;
+use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, String, Vec};
 
-/// Window, in ledgers, during which a nonce is considered live (replay protection).
-const NONCE_WINDOW_LEDGERS: u32 = 2 * DAY_IN_LEDGERS;
+const PAGE_SIZE: u32 = 20;
 
+// ── types ────────────────────────────────────────────────────────────────────
+
+/// Immutable on-chain settlement record.
 #[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    /// Instance: privileged admin address.
-    Admin,
-    /// Instance: fee and configuration parameters.
-    Config,
-    /// Instance: monotonic settlement counter.
-    SettlementCount,
-    /// Persistent: settlement record by id.
-    Settlement(u64),
-    /// Persistent: external payment id -> settlement id.
-    PaymentIndex(BytesN<32>),
-    /// Temporary: replay guard for (payer, nonce).
-    Nonce(Address, u64),
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct Config {
-    pub fee_bps: u32,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct Settlement {
-    pub id: u64,
+#[derive(Clone, Debug)]
+pub struct SettlementRecord {
     pub payment_id: BytesN<32>,
-    pub payer: Address,
-    pub payee: Address,
-    pub amount: i128,
-    pub fee: i128,
-    pub ledger: u32,
+    pub merchant: Address,
+    pub amount: i128,   // gross amount paid
+    pub fee: i128,      // platform fee deducted
+    pub net: i128,      // amount remitted to merchant (amount - fee)
+    pub timestamp: u64, // Unix timestamp supplied by the caller (NestJS)
+    pub fiat_ref: String, // bank / fiat-rail reference ID
+    pub currency: String, // ISO 4217 currency code (e.g. "NGN")
 }
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    NotInitialized = 1,
-    AlreadyInitialized = 2,
-    Unauthorized = 3,
-    InvalidAmount = 4,
-    NonceUsed = 5,
-    PaymentExists = 6,
-    SettlementNotFound = 7,
-    InvalidFee = 8,
+/// An append-only correction marker. The original settlement remains readable
+/// and auditable; consumers must exclude voided records from financial totals.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SettlementVoid {
+    pub payment_id: BytesN<32>,
+    pub reason: String,
+    pub voided_at: u64,
 }
+
+/// An append-only reversal (chargeback) marker referencing the original
+/// settlement. The original record stays readable; consumers must exclude
+/// reversed settlements from financial totals.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SettlementReversal {
+    pub original_payment_id: BytesN<32>,
+    pub merchant: Address,
+    pub amount: i128,
+    pub reason: String,
+    pub reversed_at: u64,
+}
+
+#[contracttype]
+enum DataKey {
+    Admin,
+    FeeCalculatorContract,
+    /// SettlementRecord keyed by payment_id
+    Settlement(BytesN<32>),
+    /// Legacy unbounded merchant index. New records use page-sized index
+    /// entries instead so appending does not rewrite a merchant's history.
+    MerchantIndex(Address),
+    /// Vec<BytesN<32>> — one bounded page of payment IDs for a merchant.
+    MerchantPage(Address, u32),
+    /// Number of settlement IDs stored for a merchant.
+    MerchantCount(Address),
+    AllCount,
+    /// Vec<BytesN<32>> — platform-wide ordered settlement IDs.
+    AllIndex,
+    /// A void marker keyed by the original payment ID; never overwrites it.
+    Void(BytesN<32>),
+    /// A reversal marker keyed by the original payment ID; never overwrites it.
+    Reversal(BytesN<32>),
+    /// Vec<BytesN<32>> — ordered reversal IDs for a merchant.
+    MerchantReversalIndex(Address),
+    MerchantReversalCount(Address),
+}
+
+// ── events ───────────────────────────────────────────────────────────────────
+
+#[contracttype]
+struct SettlementRecordedEvent {
+    payment_id: BytesN<32>,
+    merchant: Address,
+    amount: i128,
+    fee: i128,
+    net: i128,
+    fiat_ref: String,
+}
+
+#[contracttype]
+struct SettlementReversedEvent {
+    payment_id: BytesN<32>,
+    merchant: Address,
+    amount: i128,
+    reason: String,
+}
+
+// ── contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
-pub struct SettlementLedger;
-
-fn extend_instance(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_TARGET);
-}
-
-fn extend_persistent(env: &Env, key: &DataKey) {
-    env.storage()
-        .persistent()
-        .extend_ttl(key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
-}
-
-fn read_admin(env: &Env) -> Result<Address, Error> {
-    env.storage()
-        .instance()
-        .get(&DataKey::Admin)
-        .ok_or(Error::NotInitialized)
-}
-
-fn require_admin(env: &Env) -> Result<(), Error> {
-    let admin = read_admin(env)?;
-    admin.require_auth();
-    Ok(())
-}
+pub struct SettlementLedgerContract;
 
 #[contractimpl]
-impl SettlementLedger {
-    /// Initialise the contract. Can only be called once.
-    pub fn initialize(env: Env, admin: Address, fee_bps: u32) -> Result<(), Error> {
-        if env.storage().instance().has(&DataKey::Admin) {
-            return Err(Error::AlreadyInitialized);
-        }
-        if fee_bps > 10_000 {
-            return Err(Error::InvalidFee);
-        }
+impl SettlementLedgerContract {
+    pub fn __constructor(env: Env, admin: Address, fee_calculator_contract: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
-            .set(&DataKey::Config, &Config { fee_bps });
-        env.storage().instance().set(&DataKey::SettlementCount, &0u64);
-        extend_instance(&env);
-        Ok(())
+            .set(&DataKey::FeeCalculatorContract, &fee_calculator_contract);
     }
 
-    /// Update fee configuration. Admin only.
-    pub fn set_fee(env: Env, fee_bps: u32) -> Result<(), Error> {
-        require_admin(&env)?;
-        if fee_bps > 10_000 {
-            return Err(Error::InvalidFee);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::Config, &Config { fee_bps });
-        extend_instance(&env);
-        Ok(())
+    /// Transfers authority to write future immutable settlement records.
+    /// The current administrator must authorize the rotation.
+    pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
     }
 
-    /// Record a settlement for a payment. Enforces replay protection via a
-    /// temporary nonce and uniqueness of the payment id via a persistent index.
-    pub fn settle(
+    /// Write an immutable settlement record. Admin-only (called by NestJS backend).
+    /// Panics if a record for `payment_id` already exists — records are append-only.
+    ///
+    /// This contract is a trusted-write ledger: it validates that `fee + net`
+    /// equals `amount`, but does not query a fee-calculator contract. The
+    /// authorized backend is responsible for applying the merchant's configured
+    /// fee policy before recording a settlement.
+    pub fn record_settlement(
         env: Env,
+        caller: Address,
         payment_id: BytesN<32>,
-        payer: Address,
-        payee: Address,
+        merchant: Address,
         amount: i128,
-        nonce: u64,
-    ) -> Result<u64, Error> {
-        payer.require_auth();
+        fee: i128,
+        net: i128,
+        timestamp: u64,
+        fiat_ref: String,
+        currency: String,
+    ) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
 
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
+        assert!(amount > 0, "amount must be > 0");
+        assert!(fee >= 0, "fee must be >= 0");
+        assert!(net >= 0, "net must be >= 0");
+        assert!(fee + net == amount, "fee + net must equal amount");
 
-        let nonce_key = DataKey::Nonce(payer.clone(), nonce);
-        if env.storage().temporary().has(&nonce_key) {
-            return Err(Error::NonceUsed);
-        }
-        env.storage().temporary().set(&nonce_key, &true);
-        env.storage()
-            .temporary()
-            .extend_ttl(&nonce_key, NONCE_WINDOW_LEDGERS, NONCE_WINDOW_LEDGERS);
-
-        let index_key = DataKey::PaymentIndex(payment_id.clone());
-        if env.storage().persistent().has(&index_key) {
-            return Err(Error::PaymentExists);
-        }
-
-        let config: Config = env
+        let fee_calculator_contract: Address = env
             .storage()
             .instance()
-            .get(&DataKey::Config)
-            .ok_or(Error::NotInitialized)?;
-        let fee = amount * (config.fee_bps as i128) / 10_000;
+            .get(&DataKey::FeeCalculatorContract)
+            .expect("fee calculator not configured");
+        let fee_calculator = FeeCalculatorContractClient::new(&env, &fee_calculator_contract);
+        let (calculated_fee, calculated_net, _) = fee_calculator.calculate_fee(
+            &env.current_contract_address(),
+            &merchant,
+            &amount,
+        );
+        assert!(fee == calculated_fee, "fee does not match fee calculator");
+        assert!(net == calculated_net, "net does not match fee calculator");
 
-        let mut count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SettlementCount)
-            .unwrap_or(0);
-        count += 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::SettlementCount, &count);
+        let key = DataKey::Settlement(payment_id.clone());
+        assert!(!env.storage().persistent().has(&key), "settlement already recorded");
 
-        let settlement = Settlement {
-            id: count,
+        let record = SettlementRecord {
             payment_id: payment_id.clone(),
-            payer,
-            payee,
+            merchant: merchant.clone(),
             amount,
             fee,
-            ledger: env.ledger().sequence(),
+            net,
+            timestamp,
+            fiat_ref: fiat_ref.clone(),
+            currency,
         };
 
-        let settlement_key = DataKey::Settlement(count);
-        env.storage().persistent().set(&settlement_key, &settlement);
-        extend_persistent(&env, &settlement_key);
+        env.storage().persistent().set(&key, &record);
 
-        env.storage().persistent().set(&index_key, &count);
-        extend_persistent(&env, &index_key);
-
-        extend_instance(&env);
-        Ok(count)
-    }
-
-    /// Fetch a settlement by id. Bumps its TTL so frequently read records stay live.
-    pub fn get_settlement(env: Env, id: u64) -> Result<Settlement, Error> {
-        let key = DataKey::Settlement(id);
-        let settlement: Settlement = env
+        // Append to one bounded page so recording a settlement never rewrites
+        // the merchant's full historical index.
+        let count_key = DataKey::MerchantCount(merchant.clone());
+        let count: u32 = env
             .storage()
             .persistent()
-            .get(&key)
-            .ok_or(Error::SettlementNotFound)?;
-        extend_persistent(&env, &key);
-        Ok(settlement)
+            .get(&count_key)
+            .unwrap_or(0);
+        let page = count / PAGE_SIZE;
+        let page_key = DataKey::MerchantPage(merchant.clone(), page);
+        let mut index: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&page_key)
+            .unwrap_or_else(|| vec![&env]);
+        index.push_back(payment_id.clone());
+        env.storage().persistent().set(&page_key, &index);
+        env.storage().persistent().set(&count_key, &(count + 1));
+
+        let mut all: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllIndex)
+            .unwrap_or_else(|| vec![&env]);
+        all.push_back(payment_id.clone());
+        env.storage().persistent().set(&DataKey::AllIndex, &all);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllCount, &(all.len()));
+
+        env.events().publish(
+            ("SETTLEMENT_LEDGER", "settlement_recorded"),
+            SettlementRecordedEvent {
+                payment_id,
+                merchant,
+                amount,
+                fee,
+                net,
+                fiat_ref,
+            },
+        );
     }
 
-    /// Look up a settlement id by external payment id.
-    pub fn get_settlement_id(env: Env, payment_id: BytesN<32>) -> Option<u64> {
-        let key = DataKey::PaymentIndex(payment_id);
-        let id: Option<u64> = env.storage().persistent().get(&key);
-        if id.is_some() {
-            extend_persistent(&env, &key);
+    /// Fetch a single settlement record by payment_id. Callable by anyone.
+    pub fn get_settlement(env: Env, payment_id: BytesN<32>) -> SettlementRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Settlement(payment_id))
+            .expect("settlement not found")
+    }
+
+    /// Marks a settlement as void without mutating or deleting the original
+    /// immutable record. A corrected settlement must be recorded under a new
+    /// payment ID and can reference this one in its fiat reference.
+    pub fn void_settlement(env: Env, caller: Address, payment_id: BytesN<32>, reason: String) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        assert!(env.storage().persistent().has(&DataKey::Settlement(payment_id.clone())), "settlement not found");
+        let key = DataKey::Void(payment_id.clone());
+        assert!(!env.storage().persistent().has(&key), "settlement already voided");
+        env.storage().persistent().set(&key, &SettlementVoid { payment_id, reason, voided_at: env.ledger().timestamp() });
+    }
+
+    /// Returns the void marker for a settlement, if it was corrected.
+    pub fn get_settlement_void(env: Env, payment_id: BytesN<32>) -> Option<SettlementVoid> {
+        env.storage().persistent().get(&DataKey::Void(payment_id))
+    }
+
+    /// Records a reversal (chargeback) against an existing settlement without
+    /// mutating or deleting the original immutable record. Admin-only.
+    /// Panics if the settlement does not exist or has already been reversed.
+    pub fn record_reversal(
+        env: Env,
+        caller: Address,
+        original_payment_id: BytesN<32>,
+        reason: String,
+    ) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let record: SettlementRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Settlement(original_payment_id.clone()))
+            .expect("settlement not found");
+
+        let key = DataKey::Reversal(original_payment_id.clone());
+        assert!(!env.storage().persistent().has(&key), "settlement already reversed");
+
+        let reversal = SettlementReversal {
+            original_payment_id: original_payment_id.clone(),
+            merchant: record.merchant.clone(),
+            amount: record.amount,
+            reason: reason.clone(),
+            reversed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &reversal);
+
+        // Update the merchant's reversal index so reversals are discoverable
+        // per merchant without rewriting the settlement index.
+        let idx_key = DataKey::MerchantReversalIndex(record.merchant.clone());
+        let mut idx: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&idx_key)
+            .unwrap_or_else(|| vec![&env]);
+        idx.push_back(original_payment_id.clone());
+        env.storage().persistent().set(&idx_key, &idx);
+        let reversal_count_key = DataKey::MerchantReversalCount(record.merchant.clone());
+        let reversal_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&reversal_count_key)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&reversal_count_key, &(reversal_count + 1));
+
+        env.events().publish(
+            ("SETTLEMENT_LEDGER", "settlement_reversed"),
+            SettlementReversedEvent {
+                payment_id: original_payment_id,
+                merchant: record.merchant,
+                amount: record.amount,
+                reason,
+            },
+        );
+    }
+
+    /// Returns the reversal marker for a settlement, if it was reversed.
+    pub fn get_settlement_reversal(env: Env, payment_id: BytesN<32>) -> Option<SettlementReversal> {
+        env.storage().persistent().get(&DataKey::Reversal(payment_id))
+    }
+
+    pub fn get_reversal(env: Env, payment_id: BytesN<32>) -> Option<SettlementReversal> {
+        Self::get_settlement_reversal(env, payment_id)
+    }
+
+    /// Paginated list of settlement records for a merchant.
+    /// `page` is 0-indexed; returns up to PAGE_SIZE (20) records per page.
+    pub fn list_settlements(env: Env, merchant: Address, page: u32) -> Vec<SettlementRecord> {
+        let count_key = DataKey::MerchantCount(merchant.clone());
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0);
+        if page >= count.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE {
+            return vec![&env];
         }
-        id
-    }
 
-    /// Maintenance: extend the TTL of the instance and a set of settlement ids.
-    /// Intended to be called periodically by a keeper so idle records do not lapse.
-    pub fn extend_settlements(env: Env, ids: soroban_sdk::Vec<u64>) {
-        extend_instance(&env);
-        for id in ids.iter() {
-            extend_persistent(&env, &DataKey::Settlement(id));
+        let page_key = DataKey::MerchantPage(merchant, page);
+        let index: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&page_key)
+            .unwrap_or_else(|| vec![&env]);
+        let mut results: Vec<SettlementRecord> = vec![&env];
+        for i in 0..index.len() {
+            let pid = index.get(i).unwrap();
+            let record: SettlementRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Settlement(pid))
+                .unwrap();
+            results.push_back(record);
         }
+        results
     }
-}
 
-/// Helper to build a default NGN currency string — used in migration tests.
-pub fn default_currency(env: &Env) -> String {
-    String::from_str(env, DEFAULT_CURRENCY)
+    /// Total number of settlements recorded for a merchant.
+    pub fn settlement_count(env: Env, merchant: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantCount(merchant))
+            .unwrap_or(0)
+    }
+
+    pub fn reversal_count(env: Env, merchant: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantReversalCount(merchant))
+            .unwrap_or(0)
+    }
+
+    pub fn list_reversals(env: Env, merchant: Address, page: u32) -> Vec<SettlementReversal> {
+        let index: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantReversalIndex(merchant))
+            .unwrap_or_else(|| vec![&env]);
+        let start = page.saturating_mul(PAGE_SIZE);
+        let mut results = vec![&env];
+        for position in start..index.len().min(start.saturating_add(PAGE_SIZE)) {
+            let payment_id = index.get(position).unwrap();
+            if let Some(reversal) = env.storage().persistent().get(&DataKey::Reversal(payment_id)) {
+                results.push_back(reversal);
+            }
+        }
+        results
+    }
+
+    pub fn total_settlement_count(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::AllCount).unwrap_or(0)
+    }
+
+    pub fn list_all_settlements(env: Env, page: u32) -> Vec<SettlementRecord> {
+        let ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllIndex)
+            .unwrap_or_else(|| vec![&env]);
+        let start = page.saturating_mul(PAGE_SIZE);
+        let mut results = vec![&env];
+        for position in start..ids.len().min(start.saturating_add(PAGE_SIZE)) {
+            let payment_id = ids.get(position).unwrap();
+            results.push_back(env.storage().persistent().get(&DataKey::Settlement(payment_id)).unwrap());
+        }
+        results
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(caller == &admin, "caller is not admin");
+    }
 }

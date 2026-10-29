@@ -1,9 +1,9 @@
 #![cfg(test)]
 
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
+use fee_calculator::{FeeCalculatorContract, FeeCalculatorContractClient, FeeTier};
+use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env, String};
 
 use crate::{SettlementLedgerContract, SettlementLedgerContractClient};
-use fee_calculator::{FeeCalculatorContract, FeeCalculatorContractClient, FeeTier};
 
 fn pid(env: &Env, seed: u8) -> BytesN<32> {
     BytesN::from_array(env, &[seed; 32])
@@ -44,7 +44,11 @@ fn setup() -> (Env, Address, SettlementLedgerContractClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let id = env.register(SettlementLedgerContract, (&admin,));
+    let tiers = vec![&env, FeeTier { threshold_usdc: 0, fee_bps: 200 }];
+    let fee_id = env.register(FeeCalculatorContract, (&admin, tiers, &10u32));
+    let id = env.register(SettlementLedgerContract, (&admin, &fee_id));
+    let fee_client = FeeCalculatorContractClient::new(&env, &fee_id);
+    fee_client.set_settlement_caller(&admin, &id);
     let client = SettlementLedgerContractClient::new(&env, &id);
     (env, admin, client)
 }
@@ -177,7 +181,7 @@ fn test_invariant_fee_plus_net_equals_amount() {
 // ── zero fee (fee-free merchant) ──────────────────────────────────────────────
 
 #[test]
-fn test_zero_fee() {
+fn test_configured_fee() {
     let (env, admin, client) = setup();
     let merchant = Address::generate(&env);
 
@@ -186,16 +190,16 @@ fn test_zero_fee() {
         &pid(&env, 4),
         &merchant,
         &8_000,
-        &0,
-        &8_000,
+        &160,
+        &7_840,
         &1_700_000_000u64,
         &fiat_ref(&env, "FREE"),
         &currency(&env, "NGN"),
     );
 
     let r = client.get_settlement(&pid(&env, 4));
-    assert_eq!(r.fee, 0);
-    assert_eq!(r.net, 8_000);
+    assert_eq!(r.fee, 160);
+    assert_eq!(r.net, 7_840);
 }
 
 // ── pagination ────────────────────────────────────────────────────────────────

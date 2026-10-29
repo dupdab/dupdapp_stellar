@@ -7,6 +7,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+fee-calculator = { path = "../fee_calculator" }
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]

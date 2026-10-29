@@ -825,6 +825,90 @@ fn test_emergency_drain_moves_all_funds_to_treasury() {
 }
 
 #[test]
+fn test_emergency_drain_moves_xlm_only_to_treasury() {
+    let (
+        env,
+        client,
+        contract_id,
+        _admin,
+        customer,
+        merchant,
+        _usdc,
+        xlm,
+        emergency_signer_one,
+        emergency_signer_two,
+        _emergency_signer_three,
+        emergency_treasury,
+    ) = setup_env();
+    let payment_id = make_id(&env, 56);
+    client.deposit(
+        &customer,
+        &payment_id,
+        &merchant,
+        &250_000_000i128,
+        &DEFAULT_PAYMENT_TTL,
+        &AssetType::Xlm,
+    );
+
+    let drained = client.emergency_drain(
+        &emergency_signer_one,
+        &emergency_signer_one,
+        &emergency_signer_two,
+    );
+    assert_eq!(drained, 250_000_000);
+
+    let token_client = token::Client::new(&env, &xlm);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(token_client.balance(&emergency_treasury), 250_000_000);
+}
+
+#[test]
+fn test_emergency_drain_moves_usdc_and_xlm_to_treasury() {
+    let (
+        env,
+        client,
+        contract_id,
+        _admin,
+        customer,
+        merchant,
+        usdc,
+        xlm,
+        emergency_signer_one,
+        emergency_signer_two,
+        _emergency_signer_three,
+        emergency_treasury,
+    ) = setup_env();
+    client.deposit(
+        &customer,
+        &make_id(&env, 57),
+        &merchant,
+        &100_000_000i128,
+        &DEFAULT_PAYMENT_TTL,
+        &AssetType::Usdc,
+    );
+    client.deposit(
+        &customer,
+        &make_id(&env, 58),
+        &merchant,
+        &150_000_000i128,
+        &DEFAULT_PAYMENT_TTL,
+        &AssetType::Xlm,
+    );
+
+    let drained = client.emergency_drain(
+        &emergency_signer_one,
+        &emergency_signer_one,
+        &emergency_signer_two,
+    );
+    assert_eq!(drained, 250_000_000);
+
+    assert_eq!(token::Client::new(&env, &usdc).balance(&contract_id), 0);
+    assert_eq!(token::Client::new(&env, &xlm).balance(&contract_id), 0);
+    assert_eq!(token::Client::new(&env, &usdc).balance(&emergency_treasury), 100_000_000);
+    assert_eq!(token::Client::new(&env, &xlm).balance(&emergency_treasury), 150_000_000);
+}
+
+#[test]
 fn test_emergency_drain_rejects_non_multisig_signer() {
     let (
         env,
