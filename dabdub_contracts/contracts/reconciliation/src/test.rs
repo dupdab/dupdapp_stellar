@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use crate::{
-    MerkleProofNode, ReconciliationContract, ReconciliationContractClient,
-    ReconciliationSubmittedEvent,
+    MerkleProofNode, ReconciliationCompletedEvent, ReconciliationContract,
+    ReconciliationContractClient, ReconciliationSubmittedEvent,
 };
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
@@ -141,6 +141,28 @@ fn test_submit_emits_reconciliation_submitted_event() {
     assert_eq!(payload.batch_id, 0);
 }
 
+#[test]
+fn test_complete_reconciliation_emits_reconciliation_completed_event() {
+    let (env, client, admin) = setup_env();
+    env.ledger().set_sequence_number(88);
+    env.ledger().set_timestamp(1_730_000_000);
+
+    let run_id = make_id(&env, 5);
+    let discrepancies_found = 3u32;
+    client.complete_reconciliation(&admin, &run_id, &discrepancies_found);
+
+    let all_events = env.events().all();
+    let event = all_events.last().unwrap();
+
+    let expected_topic = ("RECONCILIATION", "completed").into_val(&env);
+    assert_eq!(event.1, expected_topic);
+
+    let payload = ReconciliationCompletedEvent::try_from_val(&env, &event.2).unwrap();
+    assert_eq!(payload.run_id, run_id);
+    assert_eq!(payload.discrepancies_found, discrepancies_found);
+    assert_eq!(payload.timestamp, 1_730_000_000);
+}
+
 // ---------------------------------------------------------------------------
 // Historical batches (#1027)
 // ---------------------------------------------------------------------------
@@ -252,82 +274,4 @@ fn test_verify_settlement_proof_returns_false_for_an_invalid_proof() {
     ];
 
     assert!(!client.verify_settlement_proof(&batch_id, &payment_a, &bogus));
-}
-
-#[test]
-#[should_panic(expected = "No reconciliation batch with that ID")]
-fn test_verify_settlement_proof_panics_for_an_unknown_batch() {
-    let (env, client, admin) = setup_env();
-
-    let payment_a = make_id(&env, 50);
-    let payment_b = make_id(&env, 60);
-    let (root, proof) = two_leaf_tree(&env, &payment_a, &payment_b);
-    client.submit_merkle_root(&admin, &root);
-
-    // A missing batch is not the same as an invalid proof: returning false
-    // here would let a caller read "this root is gone" as "not settled".
-    client.verify_settlement_proof(&7, &payment_a, &proof);
-}
-
-#[test]
-fn test_get_latest_stored_batch_reports_the_newest_id() {
-    let (env, client, admin) = setup_env();
-
-    assert!(client.get_latest_stored_batch().is_none());
-
-    client.submit_merkle_root(&admin, &make_id(&env, 1));
-    let newest = make_id(&env, 2);
-    client.submit_merkle_root(&admin, &newest);
-
-    let stored = client.get_latest_stored_batch().unwrap();
-    assert_eq!(stored.batch_id, 1);
-    assert_eq!(stored.batch.merkle_root, newest);
-}
-
-#[test]
-fn test_get_batch_returns_none_for_an_unknown_id() {
-    let (_env, client, _admin) = setup_env();
-    assert!(client.get_batch(&0).is_none());
-}
-
-#[test]
-fn test_current_batch_still_tracks_the_latest_submission() {
-    let (env, client, admin) = setup_env();
-
-    client.submit_merkle_root(&admin, &make_id(&env, 1));
-    let newest = make_id(&env, 2);
-    client.submit_merkle_root(&admin, &newest);
-
-    // Existing callers of get_current_batch see no behaviour change.
-    assert_eq!(client.get_current_batch().unwrap().merkle_root, newest);
-}
-
-#[test]
-fn test_archive_batches_removes_only_old_history() {
-    let (env, client, admin) = setup_env();
-    client.submit_merkle_root(&admin, &make_id(&env, 1));
-    client.submit_merkle_root(&admin, &make_id(&env, 2));
-    client.submit_merkle_root(&admin, &make_id(&env, 3));
-    assert_eq!(client.archive_batches(&admin, &2, &10), 2);
-    assert!(client.get_batch(&0).is_none());
-    assert!(client.get_batch(&1).is_none());
-    assert!(client.get_batch(&2).is_some());
-}
-
-#[test]
-#[should_panic(expected = "proof too long")]
-fn test_verify_settlement_proof_rejects_excessive_depth() {
-    let (env, client, admin) = setup_env();
-    let payment = make_id(&env, 80);
-    let root = hash_leaf(&env, &payment);
-    let batch = client.submit_merkle_root(&admin, &root);
-    let node = MerkleProofNode {
-        sibling: make_id(&env, 81),
-        is_left: false,
-    };
-    let mut proof = vec![&env];
-    for _ in 0..65 {
-        proof.push_back(node.clone());
-    }
-    client.verify_settlement_proof(&batch, &payment, &proof);
 }

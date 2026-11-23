@@ -58,6 +58,16 @@ pub struct ReconciliationSubmittedEvent {
     pub batch_id: u32,
 }
 
+/// Emitted when a reconciliation run completes, so the backend can index the
+/// outcome instead of polling contract state to detect completion.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReconciliationCompletedEvent {
+    pub run_id: u32,
+    pub discrepancies_found: u32,
+    pub timestamp: u64,
+}
+
 #[contract]
 pub struct ReconciliationContract;
 
@@ -120,6 +130,31 @@ impl ReconciliationContract {
         );
 
         batch_id
+    }
+
+    /// Emits a `ReconciliationCompleted` event so the backend can index the
+    /// outcome of a reconciliation run instead of polling contract state to
+    /// detect completion.
+    ///
+    /// `run_id` identifies the run, `discrepancies_found` is the number of
+    /// mismatches detected, and `timestamp` is the ledger time of completion.
+    pub fn emit_reconciliation_completed(
+        env: Env,
+        caller: Address,
+        run_id: u32,
+        discrepancies_found: u32,
+    ) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        env.events().publish(
+            ("RECONCILIATION", "completed"),
+            ReconciliationCompletedEvent {
+                run_id,
+                discrepancies_found,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// Verifies `proof` for `payment_id` against the root of batch `batch_id`.
@@ -220,79 +255,4 @@ impl ReconciliationContract {
     ) -> u32 {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        let upper = before_batch_id.min(Self::batch_count(env.clone()));
-        let mut archived = 0;
-        for batch_id in 0..upper {
-            if archived >= max_batches {
-                break;
-            }
-            let key = DataKey::Batch(batch_id);
-            if env.storage().persistent().has(&key) {
-                env.storage().persistent().remove(&key);
-                archived += 1;
-            }
-        }
-        if archived > 0 {
-            env.events().publish(
-                ("RECONCILIATION", "batches_archived"),
-                (before_batch_id, archived),
-            );
-        }
-        archived
-    }
-
-    /// Walks `proof` up from the leaf for `payment_id` and returns the root it
-    /// computes. Shared by both verifiers so they cannot drift apart.
-    fn latest_batch_id(env: &Env) -> Option<u32> {
-        let next_id: u32 = env.storage().instance().get(&DataKey::NextBatchId)?;
-        next_id.checked_sub(1)
-    }
-
-    fn compute_root(
-        env: &Env,
-        payment_id: &BytesN<32>,
-        proof: &Vec<MerkleProofNode>,
-    ) -> BytesN<32> {
-        let mut current = Self::hash_leaf(env, payment_id);
-        for i in 0..proof.len() {
-            let node = proof.get(i).unwrap();
-            current = if node.is_left {
-                Self::hash_pair(env, &node.sibling, &current)
-            } else {
-                Self::hash_pair(env, &current, &node.sibling)
-            };
-        }
-        current
-    }
-
-    fn require_proof_depth(proof: &Vec<MerkleProofNode>) {
-        if proof.len() > MAX_PROOF_DEPTH {
-            panic!("proof too long");
-        }
-    }
-
-    fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if &admin != caller {
-            panic!("Not admin");
-        }
-    }
-
-    pub(crate) fn hash_leaf(env: &Env, payment_id: &BytesN<32>) -> BytesN<32> {
-        let id_arr = payment_id.to_array();
-        env.crypto().sha256(&Bytes::from_slice(env, &id_arr)).into()
-    }
-
-    pub(crate) fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
-        let left_arr = left.to_array();
-        let right_arr = right.to_array();
-
-        let mut combined = [0u8; 64];
-        combined[..32].copy_from_slice(&left_arr);
-        combined[32..].copy_from_slice(&right_arr);
-
-        env.crypto()
-            .sha256(&Bytes::from_slice(env, &combined))
-            .into()
-    }
-}
+        let upper = before_
