@@ -116,15 +116,16 @@ fn test_admin_rotation_allows_new_admin_to_record() {
     assert_eq!(client.settlement_count(&merchant), 1);
 }
 
-// ── immutability: duplicate write must panic ──────────────────────────────────
+// ── idempotency: replaying a payment_id returns the existing entry ───────────
 
 #[test]
-fn test_duplicate_record_panics() {
+fn test_duplicate_record_is_idempotent() {
     let (env, admin, client) = setup();
     let merchant = Address::generate(&env);
     record(&client, &admin, &env, 2, &merchant, 5_000, 100);
 
-    let result = client.try_record_settlement(
+    // Replay with different non-key fields: the original entry is returned.
+    let replayed = client.record_settlement(
         &admin,
         &pid(&env, 2),
         &merchant,
@@ -135,7 +136,10 @@ fn test_duplicate_record_panics() {
         &fiat_ref(&env, "DUP"),
         &currency(&env, "NGN"),
     );
-    assert!(result.is_err());
+    assert_eq!(replayed.timestamp, 1_700_000_000u64);
+    assert_eq!(replayed.fiat_ref, fiat_ref(&env, "REF-001"));
+    assert_eq!(client.settlement_count(&merchant), 1);
+    assert_eq!(client.total_settlement_count(), 1);
 }
 
 #[test]

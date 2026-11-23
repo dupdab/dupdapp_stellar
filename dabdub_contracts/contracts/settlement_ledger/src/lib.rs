@@ -113,8 +113,17 @@ impl SettlementLedgerContract {
         env.storage().instance().set(&DataKey::Admin, &new_admin);
     }
 
+    /// Looks up a settlement record by payment_id.
+    fn load_record(env: &Env, payment_id: &BytesN<32>) -> Option<SettlementRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Settlement(payment_id.clone()))
+    }
+
     /// Write an immutable settlement record. Admin-only (called by NestJS backend).
-    /// Panics if a record for `payment_id` already exists — records are append-only.
+    /// Idempotent: `payment_id` is the idempotency key. If a record for it
+    /// already exists, the existing record is returned unchanged and nothing is
+    /// written or emitted, so backend retries never create duplicates.
     ///
     /// This contract is a trusted-write ledger: it validates that `fee + net`
     /// equals `amount`, but does not query a fee-calculator contract. The
@@ -131,9 +140,14 @@ impl SettlementLedgerContract {
         timestamp: u64,
         fiat_ref: String,
         currency: String,
-    ) {
+    ) -> SettlementRecord {
         caller.require_auth();
         Self::require_admin(&env, &caller);
+
+        // Idempotent replay: return the stored entry for a duplicate payment_id.
+        if let Some(existing) = Self::load_record(&env, &payment_id) {
+            return existing;
+        }
 
         assert!(amount > 0, "amount must be > 0");
         assert!(fee >= 0, "fee must be >= 0");
@@ -211,6 +225,8 @@ impl SettlementLedgerContract {
                 fiat_ref,
             },
         );
+
+        record
     }
 
     /// Fetch a single settlement record by payment_id. Callable by anyone.
