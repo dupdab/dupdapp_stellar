@@ -231,3 +231,6 @@ Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.
 
 <!-- handsoff-issue-1215 -->
 - #1215: [P1] merchant_registry: add merchant metadata fields (website, contact, country)
+
+<!-- handsoff-issue-1525 -->
+- #1525: reconciliation: no mechanism to report discrepancies on-chain — only logs them
