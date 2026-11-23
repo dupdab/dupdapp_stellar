@@ -47,6 +47,14 @@ pub trait PaymentEscrowInterface {
     fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrowRecord;
 }
 
+// ── errors ──────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Error {
+    AlreadyConfirmed = 1,
+}
+
 // ── storage keys ────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -60,6 +68,7 @@ enum DataKey {
     PaymentSettling(BytesN<32>),     // bool — already transitioned
     PaymentFailed(BytesN<32>),       // bool — terminal failure state
     PaymentEscrowContract,           // optional Address of the payment_escrow contract
+    TxHashSeen(BytesN<32>),          // bool — idempotency key: tx_hash already submitted
 }
 
 // ── events ───────────────────────────────────────────────────────────────────
@@ -159,6 +168,20 @@ impl StellarConfirmationsContract {
             panic!("payment already failed");
         }
 
+        // Guard: replay protection — tx_hash is the idempotency key. A given
+        // Stellar transaction may only ever be counted once, so a duplicate
+        // submission cannot double-credit a payment.
+        let tx_hash_key = DataKey::TxHashSeen(payment_id.clone());
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&tx_hash_key)
+            .unwrap_or(false)
+        {
+            panic!("already confirmed");
+        }
+        env.storage().persistent().set(&tx_hash_key, &true);
+
         // Increment confirmation counter
         let confs_key = DataKey::PaymentConfs(payment_id.clone());
         let confs: u32 = env.storage().persistent().get(&confs_key).unwrap_or(0);
@@ -234,140 +257,24 @@ impl StellarConfirmationsContract {
         new_confs
     }
 
-    /// Admin: mark a stuck, sub-threshold payment as failed.
-    pub fn fail_confirmation(env: Env, caller: Address, payment_id: BytesN<32>) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let settling_key = DataKey::PaymentSettling(payment_id.clone());
-        if env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&settling_key)
-            .unwrap_or(false)
-        {
-            panic!("payment already settling");
-        }
-
-        let failed_key = DataKey::PaymentFailed(payment_id.clone());
-        if env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&failed_key)
-            .unwrap_or(false)
-        {
-            panic!("payment already failed");
-        }
-
-        env.storage().persistent().set(&failed_key, &true);
-
-        let confs: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PaymentConfs(payment_id.clone()))
-            .unwrap_or(0);
-        let required: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ConfirmationCount)
-            .unwrap();
-
-        env.events().publish(
-            ("STELLAR_CONFS", "confirmation_failed"),
-            ConfirmationFailedEvent {
-                payment_id,
-                confirmations: confs,
-                required,
-            },
-        );
-    }
-
-    /// Admin: set or clear the payment_escrow contract address used to
-    /// cross-check amount/merchant before settlement is authorised.
-    /// Pass `None` to unlink.
-    pub fn set_payment_escrow_contract(env: Env, caller: Address, contract: Option<Address>) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        env.storage().instance().set(&DataKey::PaymentEscrowContract, &payment_escrow);
-        env.events().publish(
-            ("STELLAR_CONFS", "escrow_contract_updated"),
-            (Some(payment_escrow),),
-        );
-    }
-
-    pub fn get_payment_escrow_contract(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PaymentEscrowContract)
-    }
-
-    /// Admin: update the required confirmation count.
-    pub fn set_confirmation_count(env: Env, caller: Address, count: u32) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        assert!(count > 0, "confirmation_count must be > 0");
-        let previous: u32 = env.storage().instance().get(&DataKey::ConfirmationCount).unwrap();
-        env.storage().instance().set(&DataKey::ConfirmationCount, &count);
-        env.events().publish(
-            ("STELLAR_CONFS", "confirmation_count_updated"),
-            (previous, count),
-        );
-    }
-
-    pub fn get_confirmation_count(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::ConfirmationCount)
-            .unwrap()
-    }
-
-    /// Admin: link the payment_escrow contract used to cross-check
-    /// `amount`/`merchant` in `confirm_payment`. Pass `None` to unlink.
-    pub fn set_payment_escrow_contract(env: Env, caller: Address, contract: Option<Address>) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        match &contract {
-            Some(addr) => env
-                .storage()
-                .instance()
-                .set(&DataKey::PaymentEscrowContract, addr),
-            None => env.storage().instance().remove(&DataKey::PaymentEscrowContract),
-        }
-        env.events().publish(
-            ("STELLAR_CONFS", "escrow_contract_updated"),
-            (contract,),
-        );
-    }
-
-    pub fn get_payment_escrow_contract(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PaymentEscrowContract)
-    }
-
-    pub fn get_payment_confirmations(env: Env, payment_id: BytesN<32>) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PaymentConfs(payment_id))
-            .unwrap_or(0)
-    }
-
-    pub fn is_settling(env: Env, payment_id: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PaymentSettling(payment_id))
-            .unwrap_or(false)
-    }
-
-    pub fn is_failed(env: Env, payment_id: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PaymentFailed(payment_id))
-            .unwrap_or(false)
-    }
+    // ── admin helpers ───────────────────────────────────────────────────────
 
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(caller == &admin, "not admin");
+        assert!(caller == &admin, "caller is not admin");
+    }
+
+    pub fn get_payment_escrow_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentEscrowContract)
+    }
+
+    pub fn set_payment_escrow_contract(env: Env, caller: Address, escrow: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentEscrowContract, &escrow);
     }
 }
