@@ -64,3 +64,32 @@ fn test_execute_before_delay_panics() {
     client.queue_action(&admin, &action_id);
     client.execute_action(&admin, &action_id);
 }
+
+#[test]
+fn test_execute_within_execution_window_succeeds() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 5);
+    client.queue_action(&admin, &action_id);
+
+    // Advance past the timelock delay but stay within the execution window.
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS + 1);
+    client.execute_action(&admin, &action_id);
+    assert!(client.get_pending_action(&action_id).is_none());
+}
+
+#[test]
+fn test_execute_after_execution_window_expires() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 6);
+    client.queue_action(&admin, &action_id);
+
+    // Advance past the timelock delay plus the full execution window.
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_MIN_DELAY_SECONDS + MAX_EXECUTION_WINDOW_SECONDS + 1
+    });
+
+    let result = client.try_execute_action(&admin, &action_id);
+    assert_eq!(result, Err(Ok(Error::OperationExpired)));
+    // Expired operation is auto-cancelled and removed from pending state.
+    assert!(client.get_pending_action(&action_id).is_none());
+}

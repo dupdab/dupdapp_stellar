@@ -2,9 +2,16 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env};
 
 const DEFAULT_MIN_DELAY_SECONDS: u64 = 48 * 60 * 60;
+const MAX_EXECUTION_WINDOW_SECONDS: u64 = 48 * 60 * 60;
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Error {
+    OperationExpired = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -12,6 +19,7 @@ pub struct TimelockAction {
     pub action_id: BytesN<32>,
     pub queued_at: u64,
     pub execute_after: u64,
+    pub execute_by: u64,
 }
 
 #[contracttype]
@@ -45,6 +53,10 @@ impl AdminTimelockContract {
             .unwrap_or(DEFAULT_MIN_DELAY_SECONDS)
     }
 
+    pub fn get_max_execution_window(_env: Env) -> u64 {
+        MAX_EXECUTION_WINDOW_SECONDS
+    }
+
     pub fn set_min_delay(env: Env, caller: Address, min_delay_seconds: u64) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
@@ -61,10 +73,12 @@ impl AdminTimelockContract {
         Self::require_admin(&env, &caller);
         let now = env.ledger().timestamp();
         let delay = Self::get_min_delay(env.clone());
+        let execute_after = now.saturating_add(delay);
         let action = TimelockAction {
             action_id: action_id.clone(),
             queued_at: now,
-            execute_after: now.saturating_add(delay),
+            execute_after,
+            execute_by: execute_after.saturating_add(MAX_EXECUTION_WINDOW_SECONDS),
         };
         env.storage()
             .persistent()
@@ -90,7 +104,7 @@ impl AdminTimelockContract {
         Self::cancel_timelock(env, caller, action_id);
     }
 
-    pub fn execute_action(env: Env, caller: Address, action_id: BytesN<32>) {
+    pub fn execute_action(env: Env, caller: Address, action_id: BytesN<32>) -> Result<(), Error> {
         caller.require_auth();
         Self::require_admin(&env, &caller);
         let key = DataKey::PendingAction(action_id.clone());
@@ -99,14 +113,20 @@ impl AdminTimelockContract {
             .persistent()
             .get(&key)
             .expect("pending action not found");
-        if env.ledger().timestamp() < action.execute_after {
+        let now = env.ledger().timestamp();
+        if now < action.execute_after {
             panic!("timelock has not elapsed");
         }
+        if now > action.execute_by {
+            env.storage().persistent().remove(&key);
+            return Err(Error::OperationExpired);
+        }
         env.storage().persistent().remove(&key);
+        Ok(())
     }
 
-    pub fn apply_change(env: Env, caller: Address, action_id: BytesN<32>) {
-        Self::execute_action(env, caller, action_id);
+    pub fn apply_change(env: Env, caller: Address, action_id: BytesN<32>) -> Result<(), Error> {
+        Self::execute_action(env, caller, action_id)
     }
 
     pub fn get_pending_action(env: Env, action_id: BytesN<32>) -> Option<TimelockAction> {
