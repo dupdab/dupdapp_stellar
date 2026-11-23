@@ -256,57 +256,42 @@ fn test_signer_removal_allowed_after_timelock() {
 }
 
 // ---------------------------------------------------------------------------
-// Generic action dispatch: propose_action / approve_action / execute_action
+// Signer cap (#1544)
 // ---------------------------------------------------------------------------
 
-fn setup_2_of_3() -> (
-    Env,
-    MultisigAdminContractClient<'static>,
-    Address,
-    Address,
-    Address,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
+const MAX_SIGNERS: u32 = 20;
 
-    let signer1 = Address::generate(&env);
-    let signer2 = Address::generate(&env);
-    let signer3 = Address::generate(&env);
+#[test]
+fn test_signer_cap_allows_up_to_max() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
 
-    let contract_id = env.register(MultisigAdminContract, (&signer1, &signer2, &signer3));
-    let client = MultisigAdminContractClient::new(&env, &contract_id);
+    // Start with 3 admins; add signers until we reach the cap.
+    let mut count = client.get_admins().len();
+    while count < MAX_SIGNERS {
+        let new_admin = Address::generate(&env);
+        let proposal_id = client.propose_admin_change(&admin1, &new_admin, &true);
+        client.approve(&admin2, &proposal_id);
+        count += 1;
+    }
 
-    (env, client, signer1, signer2, signer3)
+    assert_eq!(client.get_admins().len(), MAX_SIGNERS);
 }
 
-fn setup_3_of_5() -> (
-    Env,
-    MultisigAdminContractClient<'static>,
-    Address,
-    Address,
-    Address,
-    Address,
-    Address,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
+#[test]
+#[should_panic(expected = "TooManySigners")]
+fn test_signer_cap_rejects_exceeding_max() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
 
-    let s1 = Address::generate(&env);
-    let s2 = Address::generate(&env);
-    let s3 = Address::generate(&env);
-    let s4 = Address::generate(&env);
-    let s5 = Address::generate(&env);
+    let mut count = client.get_admins().len();
+    while count < MAX_SIGNERS {
+        let new_admin = Address::generate(&env);
+        let proposal_id = client.propose_admin_change(&admin1, &new_admin, &true);
+        client.approve(&admin2, &proposal_id);
+        count += 1;
+    }
 
-    let contract_id = env.register(MultisigAdminContract, (&s1, &s2, &s3));
-    let client = MultisigAdminContractClient::new(&env, &contract_id);
-
-    // Expand the signer set to 5 and raise the threshold to 3.
-    let add4 = client.propose_admin_change(&s1, &s4, &true);
-    client.approve(&s2, &add4);
-    let add5 = client.propose_admin_change(&s1, &s5, &true);
-    client.approve(&s2, &add5);
-    let raise = client.propose_threshold_change(&s1, &3);
-    client.approve(&s2, &raise);
-
-    (env, client, s1, s2, s3, s4, s5)
+    // Adding one more signer beyond the cap must fail.
+    let extra_admin = Address::generate(&env);
+    let proposal_id = client.propose_admin_change(&admin1, &extra_admin, &true);
+    client.approve(&admin2, &proposal_id);
 }

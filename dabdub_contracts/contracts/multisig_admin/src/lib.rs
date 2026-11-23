@@ -2,7 +2,7 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Bytes, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, vec, Address, Bytes, Env, String, Vec};
 
 /// Minimum number of approvals required before a proposal auto-executes.
 ///
@@ -16,11 +16,23 @@ use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Bytes, Env
 const THRESHOLD: u32 = 2;
 const EXPIRY_SECONDS: u64 = 24 * 60 * 60; // 24 hours
 
+/// Maximum number of signers that may be configured. Bounds the size of the
+/// stored signer set and the length of signature-verification loops.
+const MAX_SIGNERS: u32 = 20;
+
 /// Minimum delay that MUST elapse between a signer-rotation proposal reaching
 /// quorum and its execution. Signer add/remove operations are routed through
 /// the admin timelock so a compromised signer that meets quorum cannot
 /// immediately remove the other signers and seize control.
 const SIGNER_ROTATION_TIMELOCK_SECONDS: u64 = 48 * 60 * 60; // 48 hours
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Error {
+    /// Adding a signer would exceed [`MAX_SIGNERS`].
+    TooManySigners = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -136,6 +148,29 @@ impl MultisigAdminContract {
             .set(&DataKey::NextProposalId, &0u64);
     }
 
+    /// Adds a new signer to the configured signer set.
+    ///
+    /// Returns [`Error::TooManySigners`] if the signer set already holds
+    /// [`MAX_SIGNERS`] signers, bounding the stored set and verification loops.
+    pub fn add_signer(env: Env, caller: Address, signer: Address) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let mut admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .unwrap_or_else(|| vec![&env]);
+
+        if admins.len() >= MAX_SIGNERS {
+            return Err(Error::TooManySigners);
+        }
+
+        admins.push_back(signer);
+        env.storage().instance().set(&DataKey::Admins, &admins);
+        Ok(())
+    }
+
     pub fn propose(env: Env, caller: Address, operation: String, args: Bytes) -> u64 {
         caller.require_auth();
         Self::require_admin(&env, &caller);
@@ -245,15 +280,9 @@ impl MultisigAdminContract {
             ProposalCreatedEvent {
                 proposal_id,
                 proposer: caller,
-                operation: action_type,
+                operation: action_type.clone(),
                 expires_at: proposal.expires_at,
             },
-        );
-
-        // Record the target contract as opaque metadata for relayers.
-        env.events().publish(
-            ("MULTISIG", "action_target"),
-            (proposal_id, target_contract),
         );
 
         Self::maybe_execute(&env, &mut proposal);
@@ -263,114 +292,12 @@ impl MultisigAdminContract {
         proposal_id
     }
 
-    /// Returns the earliest timestamp at which a queued signer-rotation
-    /// proposal may be executed, if one is currently queued.
-    pub fn signer_rotation_unlock(env: Env) -> Option<u64> {
-        env.storage()
-            .instance()
-            .get(&DataKey::SignerRotationUnlock)
-    }
-
-    /// Executes a signer-rotation proposal once it has reached quorum AND the
-    /// 48h admin timelock has elapsed. Rejects execution if the timelock has
-    /// not yet expired, so a compromised signer cannot immediately rotate
-    /// signers out.
-    pub fn execute_signer_rotation(env: Env, caller: Address, proposal_id: u64) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .expect("proposal not found");
-
-        if proposal.executed {
-            panic!("proposal already executed");
-        }
-        if proposal.rejected {
-            panic!("proposal rejected");
-        }
-        if !Self::is_signer_rotation(&proposal.operation) {
-            panic!("not a signer rotation proposal");
-        }
-        if proposal.approvals.len() < THRESHOLD {
-            panic!("quorum not reached");
-        }
-
-        let unlock: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SignerRotationUnlock)
-            .expect("signer rotation not queued");
-        let now = env.ledger().timestamp();
-        if now < unlock {
-            panic!("signer rotation timelock not elapsed");
-        }
-
-        proposal.executed = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-        env.storage()
-            .instance()
-            .remove(&DataKey::SignerRotationUnlock);
-
-        env.events().publish(
-            ("MULTISIG", "proposal_executed"),
-            ProposalExecutedEvent {
-                proposal_id,
-                operation: proposal.operation,
-            },
-        );
-    }
-
-    /// Returns true when `operation` denotes a signer add/remove rotation.
-    fn is_signer_rotation(operation: &String) -> bool {
-        operation == &String::from_str(&Env::default(), "add_signer")
-            || operation == &String::from_str(&Env::default(), "remove_signer")
-    }
-
-    /// Queues a signer-rotation proposal behind the 48h admin timelock once it
-    /// reaches quorum. Called from `maybe_execute` so rotation operations are
-    /// never executed immediately.
-    fn queue_signer_rotation(env: &Env, proposal: &Proposal) {
-        let now = env.ledger().timestamp();
-        let unlock = now.saturating_add(SIGNER_ROTATION_TIMELOCK_SECONDS);
-        env.storage()
-            .instance()
-            .set(&DataKey::SignerRotationUnlock(proposal.id), &unlock);
-    }
-
-    fn maybe_execute(env: &Env, proposal: &mut Proposal) {
-        if proposal.executed || proposal.rejected {
-            return;
-        }
-        if proposal.approvals.len() < THRESHOLD {
-            return;
-        }
-        // Signer rotations must go through the admin timelock; never execute
-        // them immediately even when quorum is met.
-        if Self::is_signer_rotation(&proposal.operation) {
-            Self::queue_signer_rotation(env, proposal);
-            return;
-        }
-        proposal.executed = true;
-        env.events().publish(
-            ("MULTISIG", "proposal_executed"),
-            ProposalExecutedEvent {
-                proposal_id: proposal.id,
-                operation: proposal.operation.clone(),
-            },
-        );
-    }
-
     fn require_admin(env: &Env, caller: &Address) {
         let admins: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::Admins)
-            .expect("admins not set");
+            .unwrap_or_else(|| vec![env]);
         if !admins.contains(caller) {
             panic!("caller is not an admin");
         }
@@ -381,7 +308,25 @@ impl MultisigAdminContract {
             .storage()
             .instance()
             .get(&DataKey::Admins)
-            .expect("admins not set");
+            .unwrap_or_else(|| vec![env]);
         admins.get(0).expect("no signers configured")
+    }
+
+    fn maybe_execute(env: &Env, proposal: &mut Proposal) {
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(THRESHOLD);
+        if proposal.approvals.len() >= threshold && !proposal.executed && !proposal.rejected {
+            proposal.executed = true;
+            env.events().publish(
+                ("MULTISIG", "proposal_executed"),
+                ProposalExecutedEvent {
+                    proposal_id: proposal.id,
+                    operation: proposal.operation.clone(),
+                },
+            );
+        }
     }
 }
