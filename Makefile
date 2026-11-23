@@ -12,7 +12,8 @@ CONTRACTS := admin_auth admin_timelock batch_payments escrow fee_calculator fee_
 
 .PHONY: all build build-optimised check-wasm-size wasm-size-report test integration-test verify-deployment lint lint-clippy lint-fmt lint-audit \
         $(addprefix build-,$(CONTRACTS)) $(addprefix test-,$(CONTRACTS)) \
-        deploy-testnet local-testnet-start local-testnet-stop local-testnet-deploy
+        deploy-testnet local-testnet-start local-testnet-stop local-testnet-deploy \
+        dev dev-down simnet-start simnet-stop simnet-deploy simnet-fund
 
 all: build
 
@@ -25,10 +26,20 @@ help:
 	@echo "  make help               Show this help message"
 	@echo "  make deploy-testnet     Build and deploy all contracts to Stellar testnet"
 	@echo ""
+	@echo "Local dev environment (single command):"
+	@echo "  make dev                Start local Stellar simnet + deploy contracts"
+	@echo "  make dev-down           Stop the local dev environment"
+	@echo ""
 	@echo "Local Soroban testnet targets:"
 	@echo "  make local-testnet-start   Start local Soroban testnet (Docker)"
 	@echo "  make local-testnet-stop    Stop local Soroban testnet"
 	@echo "  make local-testnet-deploy  Deploy contracts to local testnet"
+	@echo ""
+	@echo "Local Stellar simnet targets (stellar-cli):"
+	@echo "  make simnet-start          Start a local Stellar simnet via stellar-cli"
+	@echo "  make simnet-stop           Stop the local Stellar simnet"
+	@echo "  make simnet-fund           Create and fund a local dev identity"
+	@echo "  make simnet-deploy         Deploy contracts to the local simnet"
 	@echo ""
 	@echo "Per-contract build targets:"
 	@$(foreach c,$(CONTRACTS),echo "  make build-$(c)";)
@@ -54,17 +65,52 @@ $(addprefix build-,$(CONTRACTS)): build-%:
 $(addprefix test-,$(CONTRACTS)): test-%:
 	cargo test -p $*
 
+# Single command to bring up the full local dev environment: start the
+# Stellar simnet container and deploy the contracts to it.
+dev: local-testnet-start local-testnet-deploy
+	@echo "Local dev environment ready. RPC: http://localhost:8000/soroban/rpc"
+
+dev-down: local-testnet-stop
+
 local-testnet-start:
-	docker compose up -d
+	docker compose -f docker-compose.dev.yml up -d
 	@echo "Waiting for local Soroban testnet to become healthy..."
 	@until curl -sf http://localhost:8000/soroban/rpc -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' >/dev/null 2>&1; do sleep 2; done
 	@echo "Local Soroban testnet is up at http://localhost:8000/soroban/rpc"
 
 local-testnet-stop:
-	docker compose down -v
+	docker compose -f docker-compose.dev.yml down -v
 
 local-testnet-deploy:
 	./scripts/deploy-local-testnet.sh
+
+# Local Stellar simnet driven directly by stellar-cli (no Docker required).
+# See README "Local Stellar simnet" for details.
+simnet-start:
+	stellar network start local
+	@echo "Local simnet running. RPC: http://localhost:8000/soroban/rpc"
+
+simnet-stop:
+	stellar network stop local
+
+simnet-fund:
+	stellar keys generate dev --network local --fund
+	@echo "Funded identity 'dev' on local simnet."
+
+simnet-deploy: build
+	@for contract in $(CONTRACTS); do \
+		wasm=$(WASM_DIR)/$$contract.wasm; \
+		if [ ! -f $$wasm ]; then \
+			echo "  SKIP  $$contract (missing $$wasm)"; \
+			continue; \
+		fi; \
+		echo "  deploying $$contract"; \
+		stellar contract deploy \
+			--wasm $$wasm \
+			--source dev \
+			--network local || exit 1; \
+	done
+	@echo "Contracts deployed to local simnet."
 
 deploy-testnet:
 	./scripts/deploy-testnet.sh
