@@ -1,6 +1,6 @@
 # Codecov configuration — enforce per-contract coverage thresholds.
 #
-# Each contract under dupdapp_contract/contracts/* is treated as its own
+# Each contract under dabdub_contracts/contracts/* is treated as its own
 # component with an 80% coverage target. A PR fails if any contract's
 # coverage drops below that threshold.
 
@@ -16,6 +16,12 @@ coverage:
         threshold: 0%
         base: auto
         informational: false
+    patch:
+      default:
+        target: 80%
+        threshold: 0%
+        base: auto
+        informational: false
 
 # Exclude test files and generated snapshots from coverage calculation.
 ignore:
@@ -25,13 +31,29 @@ ignore:
   - "**/*_test.rs"
   - "dabdub_contracts/contracts/**/src/test.rs"
 
+# Per-contract breakdown: each contract is its own component so a well-tested
+# contract cannot mask a poorly tested one. Component statuses fail the check
+# when any individual contract falls below the 80% threshold.
+component_management:
+  individual_components:
+    - component_id: contract_escrow
+      name: contract: escrow
+      paths:
+        - dabdub_contracts/contracts/escrow/**
+    - component_id: contract_multisig
+      name: contract: multisig
+      paths:
+        - dabdub_contracts/contracts/multisig/**
+    - component_id: contract_token
+      name: contract: token
+      paths:
+        - dabdub_contracts/contracts/token/**
+    - component_id: contract_registry
+      name: contract: registry
+      paths:
+        - dabdub_contracts/contracts/registry/**
+
 comment:
   layout: "reach,diff,flags,files"
   behavior: default
   require_changes: false
-    patch:
-      default:
-        target: 80%
-        threshold: 0%
-        base: auto
-        informational: false

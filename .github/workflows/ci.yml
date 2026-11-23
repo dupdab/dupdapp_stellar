@@ -9,6 +9,10 @@ env:
   RUSTFLAGS: -D warnings
   CARGO_INCREMENTAL: 0
   LLVM_PROFILE_FILE: target/coverage/dupdub-%p-%m.profraw
+  # Minimum line coverage each individual contract must reach. Global
+  # workspace coverage is not enough: a well-tested contract can mask a
+  # poorly tested one, so this threshold is enforced per contract.
+  PER_CONTRACT_COVERAGE_THRESHOLD: 80
 
 jobs:
   ci:
@@ -85,23 +89,74 @@ jobs:
         working-directory: dabdub_contracts
         run: cargo audit
 
-      - name: Generate coverage report
+      # Runs tarpaulin once per contract crate (each directory under
+      # contracts/) instead of a single workspace-wide pass. A global number
+      # can hide a contract with little or no coverage behind a well-tested
+      # one, so each contract is measured and gated independently. The
+      # per-contract percentage is written to a summary table and the job
+      # fails when any contract falls below PER_CONTRACT_COVERAGE_THRESHOLD.
+      - name: Generate per-contract coverage report
         working-directory: dabdub_contracts
         run: |
+          set -euo pipefail
           mkdir -p target/coverage
-          cargo tarpaulin \
-            --workspace \
-            --out Xml \
-            --output-dir target/coverage \
-            --exclude-files "*/tests/*" \
-            --verbose \
-            --fail-under 85
+          threshold="${PER_CONTRACT_COVERAGE_THRESHOLD}"
+          summary="target/coverage/per-contract-summary.txt"
+          : > "$summary"
+          printf '| Contract | Coverage | Threshold | Status |\n' >> "$summary"
+          printf '| --- | --- | --- | --- |\n' >> "$summary"
+          failed=0
+          for manifest in contracts/*/Cargo.toml; do
+            contract="$(basename "$(dirname "$manifest")")"
+            outdir="target/coverage/$contract"
+            mkdir -p "$outdir"
+            echo "::group::Coverage for $contract"
+            cargo tarpaulin \
+              --manifest-path "$manifest" \
+              --out Xml \
+              --output-dir "$outdir" \
+              --exclude-files "*/tests/*" \
+              --verbose
+            echo "::endgroup::"
+            # Parse the line-rate attribute from the generated cobertura XML.
+            xml="$outdir/cobertura.xml"
+            if [ ! -f "$xml" ]; then
+              echo "::error::No coverage report produced for $contract"
+              printf '| %s | n/a | %s%% | FAIL |\n' "$contract" "$threshold" >> "$summary"
+              failed=1
+              continue
+            fi
+            rate="$(grep -o 'line-rate="[0-9.]*"' "$xml" | head -n1 | sed -E 's/.*"([0-9.]+)"/\1/')"
+            pct="$(awk -v r="$rate" 'BEGIN { printf "%.2f", r * 100 }')"
+            status="PASS"
+            if awk -v p="$pct" -v t="$threshold" 'BEGIN { exit !(p + 0 < t + 0) }'; then
+              status="FAIL"
+              failed=1
+              echo "::error::$contract coverage ${pct}% is below the ${threshold}% threshold"
+            fi
+            printf '| %s | %s%% | %s%% | %s |\n' "$contract" "$pct" "$threshold" "$status" >> "$summary"
+          done
+          echo "### Per-contract coverage" >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more contracts are below the ${threshold}% coverage threshold"
+            exit 1
+          fi
+
+      - name: Upload per-contract coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-per-contract
+          path: dabdub_contracts/target/coverage/
+          retention-days: 30
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
-          files: dupdub_contracts/target/coverage/cobertura.xml
+          directory: dabdub_contracts/target/coverage
           flags: rust
           name: dupdub-contracts
           fail_ci_if_error: false
@@ -212,9 +267,4 @@ jobs:
           gh release create "$tag" \
             "contract-bindings-${GITHUB_SHA::12}.tar.gz" \
             --title "Contract bindings ${GITHUB_SHA::12}" \
-            --notes "Auto-generated TypeScript bindings from commit ${GITHUB_SHA}."
-
-  # Deploys every contract to Stellar testnet and runs the integration suite
-  # against the live deployment. Only runs on merges to main so PRs stay fast
-  # and don't consume testnet resources. Deployed contract IDs are recorded in
-  # a manifest and torn down in an always() step so testne
+            --notes "Auto-generated contract bindings"
