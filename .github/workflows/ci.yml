@@ -29,3 +29,15 @@ jobs:
           sudo mv clarinet /usr/local/bin/clarinet
       - name: Run integration tests
         run: clarinet test tests/integration
+
+  batch-payments-benchmark:
+    name: batch_payments instruction benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run batch_payments instruction benchmark
+        working-directory: dabdub_contracts
+        run: |
+          cargo test -p batch_payments benchmark_max_batch_instruction_usage -- --nocapture --exact
