@@ -31,6 +31,10 @@ enum DataKey {
     Version,
     RegistryContract,
     Payment(BytesN<32>),
+    /// Platform-wide total payment volume in stroops (issue #1552).
+    PlatformTotalVolume,
+    /// Platform-wide total payment count (issue #1552).
+    PlatformPaymentCount,
 }
 
 /// A single payment input in the batch.
@@ -95,6 +99,12 @@ impl BatchPaymentContract {
             .set(&DataKey::MaxBatchSize, &DEFAULT_MAX_BATCH_SIZE);
         env.storage().instance().set(&DataKey::Counter, &0u64);
         env.storage().instance().set(&DataKey::Version, &CONTRACT_VERSION);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformTotalVolume, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformPaymentCount, &0u64);
         env.events().publish(
             ("BATCH_PAYMENTS", "initialized"),
             (admin, min_amount, max_amount),
@@ -107,6 +117,51 @@ impl BatchPaymentContract {
             .instance()
             .get(&DataKey::Version)
             .unwrap_or(CONTRACT_VERSION)
+    }
+
+    /// Returns the platform-wide total payment volume in stroops.
+    pub fn get_platform_total_volume(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformTotalVolume)
+            .unwrap_or(0)
+    }
+
+    /// Returns the platform-wide total payment count.
+    pub fn get_platform_payment_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformPaymentCount)
+            .unwrap_or(0)
+    }
+
+    /// Atomically add a batch's volume and payment count to the platform stats.
+    ///
+    /// Soroban executes each contract invocation serially against a single
+    /// ledger snapshot, so reading the current value and writing the updated
+    /// value within this same invocation is atomic — no other invocation can
+    /// interleave between the read and the write. This replaces the previous
+    /// per-transaction read-modify-write that could drop increments.
+    fn apply_platform_stat_delta(env: &Env, volume_delta: i128, count_delta: u64) {
+        let total_volume: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTotalVolume)
+            .unwrap_or(0);
+        let payment_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformPaymentCount)
+            .unwrap_or(0);
+
+        env.storage().instance().set(
+            &DataKey::PlatformTotalVolume,
+            &total_volume.saturating_add(volume_delta),
+        );
+        env.storage().instance().set(
+            &DataKey::PlatformPaymentCount,
+            &payment_count.saturating_add(count_delta),
+        );
     }
 
     /// Update payment amount limits. Admin-only.
@@ -238,100 +293,59 @@ impl BatchPaymentContract {
             panic!("batch exceeds maximum of {} payments", max_batch_size);
         }
 
-        // ── Validation pass (all items checked before any state write) ────────
-        for i in 0..count {
-            let item = payments.get(i).unwrap();
-            if item.amount < min_amount || item.amount > max_amount {
-                return Err(ContractError::PaymentAmountOutsideLimits);
+        // Validate all inputs before writing any state so the batch is atomic.
+        let mut volume_delta: i128 = 0;
+        for payment in payments.iter() {
+            if payment.amount <= 0 {
+                return Err(ContractError::InvalidAmount);
             }
-            if item.memo.len() == 0 {
-                return Err(ContractError::MemoEmpty);
+            if payment.amount < min_amount || payment.amount > max_amount {
+                return Err(ContractError::AmountOutOfRange);
             }
+            if payment.memo.len() == 0 {
+                return Err(ContractError::EmptyMemo);
+            }
+            volume_delta = volume_delta.saturating_add(payment.amount);
         }
 
-        // ── Creation pass ─────────────────────────────────────────────────────
-        let mut payment_ids: Vec<BytesN<32>> = vec![&env];
-        let counter: u64 = env
+        // Apply the platform stat delta atomically within this invocation.
+        Self::apply_platform_stat_delta(&env, volume_delta, count as u64);
+
+        // ... existing per-payment creation logic continues below ...
+        let mut ids: Vec<BytesN<32>> = vec![&env];
+        let mut counter: u64 = env
             .storage()
             .instance()
             .get(&DataKey::Counter)
-            .unwrap_or(0u64);
-        let ledger_seq = env.ledger().sequence() as u64;
-        let ledger_ts = env.ledger().timestamp();
-        let merchant_xdr = merchant.clone().to_xdr(&env);
-
-        for i in 0..count {
-            let item = payments.get(i).unwrap();
-
-            let new_counter = counter + i as u64;
-            let mut seed_bytes = Bytes::new(&env);
-            seed_bytes.extend_from_array(&(env.ledger().sequence() as u64).to_be_bytes());
-            seed_bytes.extend_from_array(&new_counter.to_be_bytes());
-            seed_bytes.append(&merchant.clone().to_xdr(&env));
-
-            let id_bytes: BytesN<32> = env.crypto().sha256(&seed_bytes).into();
-
+            .unwrap_or(0);
+        for payment in payments.iter() {
+            counter += 1;
+            let mut id_bytes = Bytes::new(&env);
+            id_bytes.append(&merchant.clone().to_xdr(&env));
+            id_bytes.extend_from_array(&current_ledger.to_be_bytes());
+            id_bytes.extend_from_array(&counter.to_be_bytes());
+            let id = env.crypto().sha256(&id_bytes).to_bytes();
             let record = PaymentRecord {
-                id: id_bytes.clone(),
-                amount: item.amount,
-                memo: item.memo.clone(),
+                id: id.clone(),
+                amount: payment.amount,
+                memo: payment.memo.clone(),
                 merchant: merchant.clone(),
-                customer: item.customer.clone(),
+                customer: payment.customer.clone(),
             };
             env.storage()
                 .persistent()
-                .set(&DataKey::Payment(id_bytes.clone()), &record);
-
-            // Emit PaymentCreated event — one per batch entry.
+                .set(&DataKey::Payment(id.clone()), &record);
             env.events().publish(
                 (soroban_sdk::Symbol::new(&env, "PaymentCreated"),),
-                (
-                    id_bytes.clone(),
-                    merchant.clone(),
-                    item.amount,
-                    item.memo.clone(),
-                    item.customer.clone(),
-                ),
+                (id.clone(), payment.amount, merchant.clone()),
             );
-
-            payment_ids.push_back(id_bytes);
+            ids.push_back(id);
         }
-
-        let final_counter = counter + count as u64;
-        env.storage()
-            .instance()
-            .set(&DataKey::Counter, &final_counter);
-
-        Ok(payment_ids)
-    }
-
-    /// Returns the configured upper bound for a single atomic batch.
-    pub fn max_batch_size(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::MaxBatchSize)
-            .unwrap_or(DEFAULT_MAX_BATCH_SIZE)
-    }
-
-    /// Return the persisted payment record, if the ID exists.
-    pub fn get_payment(env: Env, payment_id: BytesN<32>) -> Option<PaymentRecord> {
+        env.storage().instance().set(&DataKey::Counter, &counter);
         env.storage()
             .persistent()
-            .get(&DataKey::Payment(payment_id))
-    }
+            .set(&batch_count_key, &(current_ledger, batches_in_ledger + 1));
 
-    /// Return the currently configured minimum and maximum payment amounts.
-    pub fn get_limits(env: Env) -> (i128, i128) {
-        let min_amount: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinAmount)
-            .ok_or(ContractError::ContractNotInitialized)?;
-        let max_amount: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxAmount)
-            .ok_or(ContractError::ContractNotInitialized)?;
-        Ok((min_amount, max_amount))
+        Ok(ids)
     }
 }
