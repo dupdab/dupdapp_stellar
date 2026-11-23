@@ -6,6 +6,10 @@ use fee_calculator::FeeCalculatorContractClient;
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, String, Vec};
 
 const PAGE_SIZE: u32 = 20;
+/// Archived records have their TTL bumped to ~30 days once their remaining TTL
+/// drops below ~1 day (ledgers close roughly every 5 seconds).
+const ARCHIVE_TTL_THRESHOLD: u32 = 17_280;
+const ARCHIVE_TTL_EXTEND_TO: u32 = 518_400;
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -69,6 +73,10 @@ enum DataKey {
     /// Vec<BytesN<32>> — ordered reversal IDs for a merchant.
     MerchantReversalIndex(Address),
     MerchantReversalCount(Address),
+    /// Ledger sequence at which a settlement was recorded (used for archival).
+    RecordedLedger(BytesN<32>),
+    /// SettlementRecord moved out of `Settlement` by `archive_settlements`.
+    Archived(BytesN<32>),
 }
 
 // ── events ───────────────────────────────────────────────────────────────────
@@ -89,6 +97,13 @@ struct SettlementReversedEvent {
     merchant: Address,
     amount: i128,
     reason: String,
+}
+
+#[contracttype]
+struct SettlementArchivedEvent {
+    payment_id: BytesN<32>,
+    merchant: Address,
+    archived_at_ledger: u32,
 }
 
 // ── contract ─────────────────────────────────────────────────────────────────
@@ -114,10 +129,91 @@ impl SettlementLedgerContract {
     }
 
     /// Looks up a settlement record by payment_id.
+    /// Falls back to the archive when the record was moved by
+    /// `archive_settlements`.
     fn load_record(env: &Env, payment_id: &BytesN<32>) -> Option<SettlementRecord> {
+        let live: Option<SettlementRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Settlement(payment_id.clone()));
+        if live.is_some() {
+            return live;
+        }
         env.storage()
             .persistent()
-            .get(&DataKey::Settlement(payment_id.clone()))
+            .get(&DataKey::Archived(payment_id.clone()))
+    }
+
+    /// Admin-only. Archives up to `limit` settlements recorded at least
+    /// `older_than_ledgers` ledgers ago by moving each one from its primary key
+    /// to a secondary `Archived` key with an extended TTL, and emits a
+    /// `settlement_archived` event per record. Archived records stay readable
+    /// through `get_settlement`, but can no longer be voided or reversed.
+    /// Settlements recorded before ledger tracking existed are skipped.
+    /// Returns the number of records archived.
+    pub fn archive_settlements(
+        env: Env,
+        caller: Address,
+        older_than_ledgers: u32,
+        limit: u32,
+    ) -> u32 {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let current = env.ledger().sequence();
+        let ids: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllIndex)
+            .unwrap_or_else(|| vec![&env]);
+        let mut archived: u32 = 0;
+        for i in 0..ids.len() {
+            if archived >= limit {
+                break;
+            }
+            let id = ids.get(i).unwrap();
+            let recorded: Option<u32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RecordedLedger(id.clone()));
+            let recorded = match recorded {
+                Some(ledger) => ledger,
+                None => continue,
+            };
+            if current.saturating_sub(recorded) < older_than_ledgers {
+                continue;
+            }
+            let live_key = DataKey::Settlement(id.clone());
+            let record: SettlementRecord = match env.storage().persistent().get(&live_key) {
+                Some(record) => record,
+                None => continue, // already archived
+            };
+
+            let archive_key = DataKey::Archived(id.clone());
+            env.storage().persistent().set(&archive_key, &record);
+            env.storage().persistent().extend_ttl(
+                &archive_key,
+                ARCHIVE_TTL_THRESHOLD,
+                ARCHIVE_TTL_EXTEND_TO,
+            );
+            env.storage().persistent().remove(&live_key);
+            archived += 1;
+
+            env.events().publish(
+                ("SETTLEMENT_LEDGER", "settlement_archived"),
+                SettlementArchivedEvent {
+                    payment_id: id,
+                    merchant: record.merchant,
+                    archived_at_ledger: current,
+                },
+            );
+        }
+        archived
+    }
+
+    /// True if the settlement has been moved to the archive.
+    pub fn is_archived(env: Env, payment_id: BytesN<32>) -> bool {
+        env.storage().persistent().has(&DataKey::Archived(payment_id))
     }
 
     /// Write an immutable settlement record. Admin-only (called by NestJS backend).
@@ -183,6 +279,9 @@ impl SettlementLedgerContract {
         };
 
         env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecordedLedger(payment_id.clone()), &env.ledger().sequence());
 
         // Append to one bounded page so recording a settlement never rewrites
         // the merchant's full historical index.
@@ -231,10 +330,7 @@ impl SettlementLedgerContract {
 
     /// Fetch a single settlement record by payment_id. Callable by anyone.
     pub fn get_settlement(env: Env, payment_id: BytesN<32>) -> SettlementRecord {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Settlement(payment_id))
-            .expect("settlement not found")
+        Self::load_record(&env, &payment_id).expect("settlement not found")
     }
 
     /// Marks a settlement as void without mutating or deleting the original
@@ -346,11 +442,7 @@ impl SettlementLedgerContract {
         let mut results: Vec<SettlementRecord> = vec![&env];
         for i in 0..index.len() {
             let pid = index.get(i).unwrap();
-            let record: SettlementRecord = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Settlement(pid))
-                .unwrap();
+            let record: SettlementRecord = Self::load_record(&env, &pid).unwrap();
             results.push_back(record);
         }
         results
@@ -402,7 +494,7 @@ impl SettlementLedgerContract {
         let mut results = vec![&env];
         for position in start..ids.len().min(start.saturating_add(PAGE_SIZE)) {
             let payment_id = ids.get(position).unwrap();
-            results.push_back(env.storage().persistent().get(&DataKey::Settlement(payment_id)).unwrap());
+            results.push_back(Self::load_record(&env, &payment_id).unwrap());
         }
         results
     }

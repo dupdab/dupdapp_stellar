@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use fee_calculator::{FeeCalculatorContract, FeeCalculatorContractClient, FeeTier};
-use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env, String};
+use soroban_sdk::{testutils::{Address as _, Ledger as _}, vec, Address, BytesN, Env, String};
 
 use crate::{SettlementLedgerContract, SettlementLedgerContractClient};
 
@@ -140,6 +140,49 @@ fn test_duplicate_record_is_idempotent() {
     assert_eq!(replayed.fiat_ref, fiat_ref(&env, "REF-001"));
     assert_eq!(client.settlement_count(&merchant), 1);
     assert_eq!(client.total_settlement_count(), 1);
+}
+
+// ── archival of old settlements ─────────────────────────────────────────────
+
+#[test]
+fn test_archive_settlements_moves_old_records() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    record(&client, &admin, &env, 80, &merchant, 5_000, 100);
+    env.ledger().with_mut(|l| l.sequence_number += 100);
+    record(&client, &admin, &env, 81, &merchant, 5_000, 100);
+
+    // Only the first settlement is at least 50 ledgers old.
+    assert_eq!(client.archive_settlements(&admin, &50, &10), 1);
+    assert!(client.is_archived(&pid(&env, 80)));
+    assert!(!client.is_archived(&pid(&env, 81)));
+
+    // Still readable and still listed after archival.
+    assert_eq!(client.get_settlement(&pid(&env, 80)).amount, 5_000);
+    assert_eq!(client.list_settlements(&merchant, &0).len(), 2);
+
+    // Nothing left to archive on a second pass.
+    assert_eq!(client.archive_settlements(&admin, &50, &10), 0);
+}
+
+#[test]
+fn test_archive_settlements_respects_limit() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    record(&client, &admin, &env, 82, &merchant, 5_000, 100);
+    record(&client, &admin, &env, 83, &merchant, 5_000, 100);
+    env.ledger().with_mut(|l| l.sequence_number += 100);
+
+    assert_eq!(client.archive_settlements(&admin, &50, &1), 1);
+    assert_eq!(client.archive_settlements(&admin, &50, &1), 1);
+    assert_eq!(client.archive_settlements(&admin, &50, &1), 0);
+}
+
+#[test]
+fn test_archive_settlements_unauthorized_caller_fails() {
+    let (env, _admin, client) = setup();
+    let caller = Address::generate(&env);
+    assert!(client.try_archive_settlements(&caller, &0, &10).is_err());
 }
 
 #[test]
