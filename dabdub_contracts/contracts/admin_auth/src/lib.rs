@@ -249,22 +249,19 @@ impl AdminAuthContract {
         let key = DataKey::Admin(admin.clone());
         let mut user: AdminUser = env
             .storage()
-            .instance()
+            .persistent()
             .get(&key)
             .unwrap_or_else(|| panic!("{}", errors::ADMIN_NOT_FOUND));
         user.active = false;
         Self::save(&env, user);
+
         env.events().publish(
             ("ADMIN_AUTH", "admin_deactivated"),
             AdminDeactivatedEvent { admin },
         );
     }
 
-    pub fn get_admin(env: Env, admin: Address) -> Option<AdminUser> {
-        env.storage().persistent().get(&DataKey::Admin(admin))
-    }
-
-    /// True when the address is an active admin in the store.
+    /// Returns true only if the address is a known, active admin.
     pub fn is_admin(env: Env, admin: Address) -> bool {
         match env
             .storage()
@@ -276,10 +273,29 @@ impl AdminAuthContract {
         }
     }
 
-    fn save(env: &Env, user: AdminUser) {
-        env.storage()
+    /// Return the role of an active admin, or None if not an active admin.
+    pub fn get_role(env: Env, admin: Address) -> Option<AdminRole> {
+        match env
+            .storage()
             .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
+            .get::<DataKey, AdminUser>(&DataKey::Admin(admin))
+        {
+            Some(user) if user.active => Some(user.role),
+            _ => None,
+        }
+    }
+
+    /// Return the current SuperAdmin address.
+    pub fn get_super_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::SuperAdmin).unwrap()
+    }
+
+    /// Return all admin addresses (including deactivated ones).
+    pub fn get_admins(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminIndex)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     fn require_super_admin(env: &Env, caller: &Address) {

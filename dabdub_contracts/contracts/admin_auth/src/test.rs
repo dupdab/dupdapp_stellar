@@ -160,3 +160,46 @@ fn test_revoke_then_readd_admin_restores_access() {
     assert_eq!(user.role, AdminRole::SuperAdmin);
     assert!(user.active);
 }
+
+// Issue #1554 — end-to-end admin key rotation: old key works, rotate, new key
+// works, and the old key is rejected afterwards.
+#[test]
+fn test_admin_key_rotation_end_to_end() {
+    let (env, client, super_admin) = setup();
+    let old_key = Address::generate(&env);
+    let new_key = Address::generate(&env);
+
+    // Old key is a valid admin and can perform an admin action.
+    client.add_admin(&super_admin, &old_key, &AdminRole::Admin);
+    assert!(client.is_admin(&old_key));
+    client.authorize(&old_key);
+
+    // Rotate: revoke the old key and grant the new key.
+    client.revoke_admin(&super_admin, &old_key);
+    client.add_admin(&super_admin, &new_key, &AdminRole::Admin);
+
+    // New key can perform an admin action.
+    assert!(client.is_admin(&new_key));
+    client.authorize(&new_key);
+
+    // Old key is rejected after rotation.
+    assert!(!client.is_admin(&old_key));
+    assert!(client.get_admin(&old_key).is_none());
+}
+
+#[test]
+#[should_panic(expected = "unauthorized admin")]
+fn test_old_key_rejected_after_rotation() {
+    let (env, client, super_admin) = setup();
+    let old_key = Address::generate(&env);
+    let new_key = Address::generate(&env);
+
+    client.add_admin(&super_admin, &old_key, &AdminRole::Admin);
+    client.authorize(&old_key);
+
+    client.revoke_admin(&super_admin, &old_key);
+    client.add_admin(&super_admin, &new_key, &AdminRole::Admin);
+
+    // Old key must no longer be authorized after rotation.
+    client.authorize(&old_key);
+}

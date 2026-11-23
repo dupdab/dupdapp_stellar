@@ -26,6 +26,15 @@ Consumers should index these events to keep off-chain views of admin membership 
 - `remove_admin` — owner-only; revokes admin rights from an address.
 - `is_admin` — read-only check used by dependent contracts.
 
+## Key rotation
+
+Admin key rotation is performed by adding the new admin key and then removing the old one. The end-to-end rotation flow is covered by tests:
+
+1. An admin action performed with the old key succeeds.
+2. The admin key is rotated (new key added, old key removed).
+3. An admin action performed with the new key succeeds.
+4. An admin action performed with the old key fails after rotation.
+
 ## Known limitations
 
 - Admin membership is stored on-chain only; there is no built-in expiry or timelock. Pair with `admin_timelock` if delayed execution is required.
