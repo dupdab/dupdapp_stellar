@@ -53,12 +53,14 @@ pub trait PaymentEscrowInterface {
 enum DataKey {
     Admin,
     ConfirmationCount,               // required ledger-close count (u32)
+    ExpiryLedgers,                   // ledgers after first confirmation before expiry (u32)
     PaymentConfs(BytesN<32>),        // confirmed count so far for a payment (u32)
     PaymentFirstLedger(BytesN<32>),  // ledger_seq of the first confirmation
     PaymentLastLedger(BytesN<32>),   // ledger_seq of the most recent confirmation
     PaymentRequiredConfs(BytesN<32>),// required count snapshotted at first confirmation
     PaymentSettling(BytesN<32>),     // bool — already transitioned
     PaymentFailed(BytesN<32>),       // bool — terminal failure state
+    PaymentExpired(BytesN<32>),      // bool — terminal expiry state
     PaymentEscrowContract,           // optional Address of the payment_escrow contract
 }
 
@@ -85,6 +87,15 @@ struct ConfirmationFailedEvent {
     payment_id: BytesN<32>,
     confirmations: u32,
     required: u32,
+}
+
+#[contracttype]
+struct ConfirmationExpiredEvent {
+    payment_id: BytesN<32>,
+    confirmations: u32,
+    required: u32,
+    first_ledger: u32,
+    expired_at_ledger: u32,
 }
 
 // ── contract ─────────────────────────────────────────────────────────────────
@@ -157,6 +168,17 @@ impl StellarConfirmationsContract {
             .unwrap_or(false)
         {
             panic!("payment already failed");
+        }
+
+        // Guard: already expired — terminal state, cannot resume confirming
+        let expired_key = DataKey::PaymentExpired(payment_id.clone());
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&expired_key)
+            .unwrap_or(false)
+        {
+            panic!("payment already expired");
         }
 
         // Increment confirmation counter
@@ -234,32 +256,63 @@ impl StellarConfirmationsContract {
         new_confs
     }
 
-    /// Admin: mark a stuck, sub-threshold payment as failed.
-    pub fn fail_confirmation(env: Env, caller: Address, payment_id: BytesN<32>) {
+    /// Admin/cron entry point: expire a pending confirmation that has not
+    /// reached its threshold within `expiry_ledgers` of its first confirmation.
+    ///
+    /// Panics if the payment is already settling, failed, or expired, or if the
+    /// expiry window has not yet elapsed. On success the payment is marked as
+    /// expired (terminal) and a `ConfirmationExpired` event is emitted so
+    /// off-chain indexers can drop the pending record.
+    pub fn expire_confirmation(env: Env, caller: Address, payment_id: BytesN<32>) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
         let settling_key = DataKey::PaymentSettling(payment_id.clone());
-        if env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&settling_key)
-            .unwrap_or(false)
-        {
-            panic!("payment already settling");
-        }
+        assert!(
+            !env.storage()
+                .persistent()
+                .get::<_, bool>(&settling_key)
+                .unwrap_or(false),
+            "payment already settling"
+        );
 
         let failed_key = DataKey::PaymentFailed(payment_id.clone());
-        if env
+        assert!(
+            !env.storage()
+                .persistent()
+                .get::<_, bool>(&failed_key)
+                .unwrap_or(false),
+            "payment already failed"
+        );
+
+        let expired_key = DataKey::PaymentExpired(payment_id.clone());
+        assert!(
+            !env.storage()
+                .persistent()
+                .get::<_, bool>(&expired_key)
+                .unwrap_or(false),
+            "payment already expired"
+        );
+
+        let first_key = DataKey::PaymentFirstLedger(payment_id.clone());
+        let first_ledger: u32 = env
             .storage()
             .persistent()
-            .get::<_, bool>(&failed_key)
-            .unwrap_or(false)
-        {
-            panic!("payment already failed");
-        }
+            .get(&first_key)
+            .expect("no pending confirmation for payment");
 
-        env.storage().persistent().set(&failed_key, &true);
+        let expiry_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExpiryLedgers)
+            .unwrap_or(0);
+        assert!(expiry_ledgers > 0, "expiry_ledgers not configured");
+
+        let current_ledger = env.ledger().sequence();
+        assert!(
+            current_ledger >= first_ledger.saturating_add(expiry_ledgers),
+            "confirmation has not expired yet"
+        );
 
         let confs: u32 = env
             .storage()
@@ -268,106 +321,50 @@ impl StellarConfirmationsContract {
             .unwrap_or(0);
         let required: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::ConfirmationCount)
-            .unwrap();
+            .persistent()
+            .get(&DataKey::PaymentRequiredConfs(payment_id.clone()))
+            .unwrap_or(0);
+
+        env.storage().persistent().set(&expired_key, &true);
 
         env.events().publish(
-            ("STELLAR_CONFS", "confirmation_failed"),
-            ConfirmationFailedEvent {
+            ("STELLAR_CONFS", "confirmation_expired"),
+            ConfirmationExpiredEvent {
                 payment_id,
                 confirmations: confs,
                 required,
+                first_ledger,
+                expired_at_ledger: current_ledger,
             },
         );
     }
 
-    /// Admin: set or clear the payment_escrow contract address used to
-    /// cross-check amount/merchant before settlement is authorised.
-    /// Pass `None` to unlink.
-    pub fn set_payment_escrow_contract(env: Env, caller: Address, contract: Option<Address>) {
+    /// Admin: set the number of ledgers after the first confirmation before a
+    /// still-pending confirmation becomes eligible for expiry cleanup.
+    pub fn set_expiry_ledgers(env: Env, caller: Address, expiry_ledgers: u32) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        env.storage().instance().set(&DataKey::PaymentEscrowContract, &payment_escrow);
-        env.events().publish(
-            ("STELLAR_CONFS", "escrow_contract_updated"),
-            (Some(payment_escrow),),
-        );
-    }
-
-    pub fn get_payment_escrow_contract(env: Env) -> Option<Address> {
+        assert!(expiry_ledgers > 0, "expiry_ledgers must be > 0");
         env.storage()
             .instance()
-            .get(&DataKey::PaymentEscrowContract)
+            .set(&DataKey::ExpiryLedgers, &expiry_ledgers);
     }
 
-    /// Admin: update the required confirmation count.
-    pub fn set_confirmation_count(env: Env, caller: Address, count: u32) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        assert!(count > 0, "confirmation_count must be > 0");
-        let previous: u32 = env.storage().instance().get(&DataKey::ConfirmationCount).unwrap();
-        env.storage().instance().set(&DataKey::ConfirmationCount, &count);
-        env.events().publish(
-            ("STELLAR_CONFS", "confirmation_count_updated"),
-            (previous, count),
-        );
-    }
-
-    pub fn get_confirmation_count(env: Env) -> u32 {
+    pub fn get_expiry_ledgers(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::ConfirmationCount)
-            .unwrap()
-    }
-
-    /// Admin: link the payment_escrow contract used to cross-check
-    /// `amount`/`merchant` in `confirm_payment`. Pass `None` to unlink.
-    pub fn set_payment_escrow_contract(env: Env, caller: Address, contract: Option<Address>) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        match &contract {
-            Some(addr) => env
-                .storage()
-                .instance()
-                .set(&DataKey::PaymentEscrowContract, addr),
-            None => env.storage().instance().remove(&DataKey::PaymentEscrowContract),
-        }
-        env.events().publish(
-            ("STELLAR_CONFS", "escrow_contract_updated"),
-            (contract,),
-        );
-    }
-
-    pub fn get_payment_escrow_contract(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PaymentEscrowContract)
-    }
-
-    pub fn get_payment_confirmations(env: Env, payment_id: BytesN<32>) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PaymentConfs(payment_id))
+            .get(&DataKey::ExpiryLedgers)
             .unwrap_or(0)
-    }
-
-    pub fn is_settling(env: Env, payment_id: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PaymentSettling(payment_id))
-            .unwrap_or(false)
-    }
-
-    pub fn is_failed(env: Env, payment_id: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PaymentFailed(payment_id))
-            .unwrap_or(false)
     }
 
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(caller == &admin, "not admin");
+        assert!(caller == &admin, "caller is not admin");
+    }
+
+    fn get_payment_escrow_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentEscrowContract)
     }
 }

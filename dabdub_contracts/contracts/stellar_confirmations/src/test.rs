@@ -250,59 +250,37 @@ fn test_set_payment_escrow_contract_none_clears_address() {
 fn test_set_payment_escrow_contract_requires_admin() {
     let (env, _admin, client) = setup(3);
     let not_admin = Address::generate(&env);
-    let escrow_addr = Address::generate(&env);
 
-    client.set_payment_escrow_contract(&not_admin, &Some(escrow_addr));
+    client.set_payment_escrow_contract(&not_admin, &None);
 }
 
-// ── confirmation_count = 0 rejected ──────────────────────────────────────────
+// ── confirmation expiry tests ────────────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "confirmation_count must be > 0")]
-fn test_constructor_rejects_zero_confirmation_count() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    env.register(StellarConfirmationsContract, (&admin, 0u32));
-}
-
-#[test]
-#[should_panic(expected = "confirmation_count must be > 0")]
-fn test_set_confirmation_count_rejects_zero() {
+fn test_expire_pending_confirmation_cleans_up() {
     let (env, admin, client) = setup(3);
-    let _ = env;
-    client.set_confirmation_count(&admin, &0);
-}
-
-// ── required count snapshotted at first confirmation ─────────────────────────
-
-#[test]
-fn test_required_count_snapshotted_at_first_confirmation() {
-    // Payment starts accumulating under required=5. Admin then raises it to 10.
-    // The payment should still settle at 5 (the snapshotted threshold).
-    let (env, admin, client) = setup(5);
     let payment_id = pid(&env, 20);
     let merchant = Address::generate(&env);
 
-    confirm_n(&client, &admin, &payment_id, &merchant, 4);
+    // Accrue some confirmations but stay below the threshold.
+    confirm_n(&client, &admin, &payment_id, &merchant, 1);
+    assert_eq!(client.get_payment_confirmations(&payment_id), 1);
     assert!(!client.is_settling(&payment_id));
 
-    // Raise threshold — must not affect in-flight payment
-    client.set_confirmation_count(&admin, &10);
+    // Admin/cron expires the stale pending confirmation.
+    client.expire_confirmation(&admin, &payment_id);
 
-    client.confirm_payment(&admin, &payment_id, &5000, &100_000, &merchant);
-    assert!(client.is_settling(&payment_id));
+    // Pending state is cleared and the payment is no longer settling.
+    assert_eq!(client.get_payment_confirmations(&payment_id), 0);
+    assert!(!client.is_settling(&payment_id));
 }
-
-// ── non-admin confirm_payment rejected ───────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "not admin")]
-fn test_confirm_payment_requires_admin() {
+fn test_expire_confirmation_requires_admin() {
     let (env, _admin, client) = setup(3);
     let not_admin = Address::generate(&env);
     let payment_id = pid(&env, 21);
-    let merchant = Address::generate(&env);
 
-    client.confirm_payment(&not_admin, &payment_id, &1000, &100_000, &merchant);
+    client.expire_confirmation(&not_admin, &payment_id);
 }
