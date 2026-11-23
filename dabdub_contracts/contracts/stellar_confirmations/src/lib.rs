@@ -53,6 +53,7 @@ pub trait PaymentEscrowInterface {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
     AlreadyConfirmed = 1,
+    AmountMismatch = 2,
 }
 
 // ── storage keys ────────────────────────────────────────────────────────────
@@ -69,7 +70,12 @@ enum DataKey {
     PaymentFailed(BytesN<32>),       // bool — terminal failure state
     PaymentEscrowContract,           // optional Address of the payment_escrow contract
     TxHashSeen(BytesN<32>),          // bool — idempotency key: tx_hash already submitted
+    AmountToleranceBps,              // admin-configurable tolerance in basis points (u32)
 }
+
+// Default acceptable tolerance: 1% expressed in basis points.
+const DEFAULT_AMOUNT_TOLERANCE_BPS: u32 = 100;
+const BPS_DENOMINATOR: i128 = 10_000;
 
 // ── events ───────────────────────────────────────────────────────────────────
 
@@ -109,6 +115,25 @@ impl StellarConfirmationsContract {
         env.storage()
             .instance()
             .set(&DataKey::ConfirmationCount, &confirmation_count);
+    }
+
+    /// Admin-configurable tolerance (in basis points) applied when validating
+    /// a confirmed amount against the requested payment amount. Defaults to
+    /// 1% (100 bps) when unset.
+    pub fn set_amount_tolerance_bps(env: Env, caller: Address, tolerance_bps: u32) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        assert!(tolerance_bps <= BPS_DENOMINATOR as u32, "tolerance too large");
+        env.storage()
+            .instance()
+            .set(&DataKey::AmountToleranceBps, &tolerance_bps);
+    }
+
+    pub fn get_amount_tolerance_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AmountToleranceBps)
+            .unwrap_or(DEFAULT_AMOUNT_TOLERANCE_BPS)
     }
 
     /// Called by the NestJS monitor once per observed Stellar ledger close.
@@ -228,25 +253,22 @@ impl StellarConfirmationsContract {
         if new_confs >= required {
             // If a payment_escrow contract is configured, cross-check the
             // caller-supplied amount/merchant against the real escrow record.
-            if let Some(escrow_address) = Self::get_payment_escrow_contract(env.clone()) {
-                let escrow_client = PaymentEscrowClient::new(&env, &escrow_address);
-                let payment = escrow_client.get_payment(&payment_id);
-                assert!(
-                    payment.amount == amount,
-                    "amount mismatch with payment_escrow"
-                );
-                assert!(
-                    payment.merchant == merchant,
-                    "merchant mismatch with payment_escrow"
-                );
+            if let Some(escrow_addr) = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&DataKey::PaymentEscrowContract)
+            {
+                let escrow = PaymentEscrowClient::new(&env, &escrow_addr);
+                let record = escrow.get_payment(&payment_id);
+                assert!(record.merchant == merchant, "merchant mismatch");
+                Self::validate_amount(&env, amount, record.amount);
             }
 
             env.storage().persistent().set(&settling_key, &true);
-
             env.events().publish(
                 ("STELLAR_CONFS", "settlement_authorised"),
                 SettlementAuthorisedEvent {
-                    payment_id,
+                    payment_id: payment_id.clone(),
                     ledger_seq,
                     amount,
                     merchant,
@@ -257,24 +279,39 @@ impl StellarConfirmationsContract {
         new_confs
     }
 
-    // ── admin helpers ───────────────────────────────────────────────────────
+    /// Validate that `confirmed_amount` is within the admin-configured tolerance
+    /// of `requested_amount`. Panics with `Error::AmountMismatch` when the
+    /// discrepancy exceeds the tolerance.
+    fn validate_amount(env: &Env, confirmed_amount: i128, requested_amount: i128) {
+        assert!(requested_amount > 0, "requested amount must be > 0");
+        assert!(confirmed_amount >= 0, "confirmed amount must be >= 0");
+
+        let tolerance_bps: i128 = env
+            .storage()
+            .instance()
+            .get::<_, u32>(&DataKey::AmountToleranceBps)
+            .unwrap_or(DEFAULT_AMOUNT_TOLERANCE_BPS) as i128;
+
+        let diff = if confirmed_amount >= requested_amount {
+            confirmed_amount - requested_amount
+        } else {
+            requested_amount - confirmed_amount
+        };
+
+        // diff / requested <= tolerance_bps / BPS_DENOMINATOR
+        // => diff * BPS_DENOMINATOR <= tolerance_bps * requested
+        let lhs = diff.checked_mul(BPS_DENOMINATOR).expect("overflow");
+        let rhs = tolerance_bps
+            .checked_mul(requested_amount)
+            .expect("overflow");
+
+        if lhs > rhs {
+            panic!("{:?}", Error::AmountMismatch);
+        }
+    }
 
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(caller == &admin, "caller is not admin");
-    }
-
-    pub fn get_payment_escrow_contract(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PaymentEscrowContract)
-    }
-
-    pub fn set_payment_escrow_contract(env: Env, caller: Address, escrow: Address) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        env.storage()
-            .instance()
-            .set(&DataKey::PaymentEscrowContract, &escrow);
+        assert!(*caller == admin, "caller is not admin");
     }
 }

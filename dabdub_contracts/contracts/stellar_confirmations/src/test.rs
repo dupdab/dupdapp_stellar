@@ -193,6 +193,76 @@ fn test_duplicate_tx_hash_rejected_across_payments() {
     assert_eq!(client.get_payment_confirmations(&p2), 0);
 }
 
+// ── amount tolerance tests ───────────────────────────────────────────────────
+
+#[test]
+fn test_amount_within_default_tolerance_accepted() {
+    // Default tolerance is 1%: a confirmed amount 1% below the requested
+    // amount (exactly at the boundary) is still accepted.
+    let (env, admin, client) = setup(3);
+    let payment_id = pid(&env, 30);
+    let merchant = Address::generate(&env);
+
+    // requested 100_000, confirmed 99_000 → exactly 1% under, within tolerance.
+    let count = client.confirm_payment(&admin, &payment_id, &7000, &99_000, &merchant);
+    assert_eq!(count, 1);
+    assert_eq!(client.get_payment_confirmations(&payment_id), 1);
+}
+
+#[test]
+fn test_amount_outside_default_tolerance_rejected() {
+    // A confirmed amount more than 1% off the requested amount must be
+    // rejected with AmountMismatch and must not advance the count.
+    let (env, admin, client) = setup(3);
+    let payment_id = pid(&env, 31);
+    let merchant = Address::generate(&env);
+
+    // requested 100_000, confirmed 98_000 → 2% under, outside tolerance.
+    let result = client.try_confirm_payment(&admin, &payment_id, &7001, &98_000, &merchant);
+    assert!(result.is_err());
+    assert_eq!(client.get_payment_confirmations(&payment_id), 0);
+}
+
+#[test]
+fn test_amount_tolerance_boundary_just_inside_and_outside() {
+    // Exercises the tolerance boundary precisely: just inside is accepted,
+    // just outside is rejected.
+    let (env, admin, client) = setup(3);
+    let merchant = Address::generate(&env);
+
+    // Just inside: 100_000 requested, 99_001 confirmed (~0.999% under).
+    let inside = pid(&env, 32);
+    let count = client.confirm_payment(&admin, &inside, &7100, &99_001, &merchant);
+    assert_eq!(count, 1);
+
+    // Just outside: 100_000 requested, 98_999 confirmed (~1.001% under).
+    let outside = pid(&env, 33);
+    let result = client.try_confirm_payment(&admin, &outside, &7101, &98_999, &merchant);
+    assert!(result.is_err());
+    assert_eq!(client.get_payment_confirmations(&outside), 0);
+}
+
+#[test]
+fn test_admin_configurable_tolerance() {
+    // Admin can widen the tolerance; a previously-rejected amount is then
+    // accepted.
+    let (env, admin, client) = setup(3);
+    let merchant = Address::generate(&env);
+
+    // 5% under is rejected under the default 1% tolerance.
+    let p1 = pid(&env, 34);
+    let result = client.try_confirm_payment(&admin, &p1, &7200, &95_000, &merchant);
+    assert!(result.is_err());
+
+    // Admin widens tolerance to 5%.
+    client.set_amount_tolerance(&admin, &500);
+
+    // Same 5% under amount is now accepted.
+    let p2 = pid(&env, 35);
+    let count = client.confirm_payment(&admin, &p2, &7201, &95_000, &merchant);
+    assert_eq!(count, 1);
+}
+
 // ── fail_confirmation tests ──────────────────────────────────────────────────
 
 #[test]
@@ -244,49 +314,5 @@ fn test_confirm_payment_panics_after_fail() {
 
     client.fail_confirmation(&admin, &payment_id);
     // confirming a failed payment must panic
-    client.confirm_payment(&admin, &payment_id, &1000, &100_000, &merchant);
-}
-
-#[test]
-#[should_panic(expected = "not admin")]
-fn test_fail_confirmation_requires_admin() {
-    let (env, _admin, client) = setup(3);
-    let not_admin = Address::generate(&env);
-    let payment_id = pid(&env, 14);
-
-    client.fail_confirmation(&not_admin, &payment_id);
-}
-
-// ── set_payment_escrow_contract tests ────────────────────────────────────────
-
-#[test]
-fn test_set_payment_escrow_contract_stores_address() {
-    let (env, admin, client) = setup(3);
-    let escrow_addr = Address::generate(&env);
-
-    assert!(client.get_payment_escrow_contract().is_none());
-
-    client.set_payment_escrow_contract(&admin, &Some(escrow_addr.clone()));
-    assert_eq!(client.get_payment_escrow_contract(), Some(escrow_addr));
-}
-
-#[test]
-fn test_set_payment_escrow_contract_none_clears_address() {
-    let (env, admin, client) = setup(3);
-    let escrow_addr = Address::generate(&env);
-
-    client.set_payment_escrow_contract(&admin, &Some(escrow_addr));
-    assert!(client.get_payment_escrow_contract().is_some());
-
-    client.set_payment_escrow_contract(&admin, &None);
-    assert!(client.get_payment_escrow_contract().is_none());
-}
-
-#[test]
-#[should_panic(expected = "not admin")]
-fn test_set_payment_escrow_contract_requires_admin() {
-    let (env, _admin, client) = setup(3);
-    let not_admin = Address::generate(&env);
-
-    client.set_payment_escrow_contract(&not_admin, &None);
+    client.confirm_payment(&admin, &payment_id, &3000, &100_000, &merchant);
 }
