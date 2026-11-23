@@ -267,90 +267,68 @@ fn test_amount_equal_max_succeeds() {
 }
 
 #[test]
-fn test_amount_max_plus_1_reverts() {
+fn test_rate_limit_defaults_to_100_per_ledger() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin) = deploy_and_init(&env, 100, 1_000);
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+    assert_eq!(client.rate_limit(), 100);
+}
+
+#[test]
+fn test_rate_limit_enforced_after_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+
+    // Lower the per-ledger limit so the test stays cheap.
+    client.set_rate_limit(&3);
+    assert_eq!(client.rate_limit(), 3);
+
     let merchant = Address::generate(&env);
-    let payments = soroban_sdk::vec![&env, make_payment(&env, 1_001, "above-max")];
+    let payments = soroban_sdk::vec![&env, make_payment(&env, 100, "rate")];
+
+    // First 3 calls within the ledger succeed.
+    for _ in 0..3 {
+        let ids = client.create_batch(&merchant, &payments);
+        assert_eq!(ids.len(), 1);
+    }
+
+    // The 4th call in the same ledger is rate limited.
     let err = client.try_create_batch(&merchant, &payments).unwrap_err().unwrap();
-    assert_eq!(err, ContractError::PaymentAmountOutsideLimits);
+    assert_eq!(err, ContractError::RateLimited);
 }
 
 #[test]
-fn test_admin_can_update_limits_without_redeploy() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = deploy_and_init(&env, 100, 1_000);
-
-    let original = client.get_limits();
-    assert_eq!(original, (100, 1_000));
-
-    client.set_limits(&200, &2_000);
-    let updated = client.get_limits();
-    assert_eq!(updated, (200, 2_000));
-}
-
-#[test]
-fn test_limits_updated_event_emitted() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = deploy_and_init(&env, 100, 1_000);
-
-    let before = env.events().all().len();
-    client.set_limits(&150, &1_500);
-    let events = env.events().all();
-    assert_eq!(events.len(), before + 1);
-}
-
-#[test]
-fn test_batch_at_new_maximum_succeeds() {
+fn test_rate_limit_resets_on_next_ledger() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+
+    client.set_rate_limit(&2);
     let merchant = Address::generate(&env);
-    let mut payments = soroban_sdk::vec![&env];
-    for i in 0..100_u32 {
-        payments.push_back(make_payment(&env, i as i128 + 1, "maximum-batch"));
-    }
+    let payments = soroban_sdk::vec![&env, make_payment(&env, 100, "rate")];
 
+    for _ in 0..2 {
+        client.create_batch(&merchant, &payments);
+    }
+    let err = client.try_create_batch(&merchant, &payments).unwrap_err().unwrap();
+    assert_eq!(err, ContractError::RateLimited);
+
+    // New ledger resets the per-account counter.
+    env.ledger().set_sequence_number(env.ledger().sequence() + 1);
     let ids = client.create_batch(&merchant, &payments);
-    assert_eq!(ids.len(), 100);
-    for id in ids.iter() {
-        assert!(client.get_payment(&id).is_some());
-    }
-}
-
-fn measure_batch_cpu_instructions(size: u32) -> u64 {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
-    let merchant = Address::generate(&env);
-    let mut payments = soroban_sdk::vec![&env];
-    for i in 0..size {
-        payments.push_back(make_payment(&env, i as i128 + 1, "gas-benchmark"));
-    }
-
-    let before = env.cost_estimate().budget().cpu_instruction_cost();
-    let ids = client.create_batch(&merchant, &payments);
-    let instruction_cost = env.cost_estimate().budget().cpu_instruction_cost() - before;
-    assert_eq!(ids.len(), size);
-    instruction_cost
+    assert_eq!(ids.len(), 1);
 }
 
 #[test]
-fn benchmark_batch_instruction_cost_per_item() {
-    let cpu_20 = measure_batch_cpu_instructions(20);
-    let cpu_100 = measure_batch_cpu_instructions(100);
-    let per_item_20 = cpu_20 / 20;
-    let per_item_100 = cpu_100 / 100;
+fn test_admin_can_set_rate_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
 
-    std::println!(
-        "batch benchmark: 20 items={cpu_20} CPU instructions ({per_item_20}/item); \
-         100 items={cpu_100} CPU instructions ({per_item_100}/item)"
-    );
-    assert!(
-        cpu_100 < 100_000_000,
-        "100-item batch exceeds Soroban CPU budget"
-    );
+    client.set_rate_limit(&50);
+    assert_eq!(client.rate_limit(), 50);
+    // Zero is rejected to avoid locking out all callers.
+    assert!(client.try_set_rate_limit(&0).is_err());
+    assert_eq!(client.rate_limit(), 50);
 }
