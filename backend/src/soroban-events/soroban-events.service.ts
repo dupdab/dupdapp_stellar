@@ -40,6 +40,10 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
   private polling = false;
   private requestId = 0;
 
+  // Observability: contract transaction failure counters (issue #1589).
+  private readonly txFailures = new Map<string, number>();
+  private txSuccesses = 0;
+
   constructor(
     config: ConfigService,
     @InjectRepository(SorobanIndexedEvent)
@@ -76,6 +80,36 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
 
   onModuleDestroy(): void {
     if (this.timer) clearInterval(this.timer);
+  }
+
+  /**
+   * Prometheus text exposition for contract transaction outcomes.
+   * Exposes `contract_tx_failures_total` labeled by `error_type` and
+   * `contract_tx_successes_total` so the failure rate can be computed
+   * (failures / (failures + successes)) for alerting and dashboards.
+   */
+  getMetrics(): string {
+    const lines: string[] = [
+      '# HELP contract_tx_failures_total Total number of failed contract transactions.',
+      '# TYPE contract_tx_failures_total counter',
+    ];
+    for (const [errorType, count] of this.txFailures) {
+      lines.push(`contract_tx_failures_total{error_type="${errorType}"} ${count}`);
+    }
+    lines.push(
+      '# HELP contract_tx_successes_total Total number of successful contract transactions.',
+      '# TYPE contract_tx_successes_total counter',
+      `contract_tx_successes_total ${this.txSuccesses}`,
+    );
+    return lines.join('\n');
+  }
+
+  private recordTxFailure(errorType: string): void {
+    this.txFailures.set(errorType, (this.txFailures.get(errorType) ?? 0) + 1);
+  }
+
+  private recordTxSuccess(): void {
+    this.txSuccesses += 1;
   }
 
   private async pollSafely(): Promise<void> {
@@ -165,11 +199,13 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
       }),
     });
     if (!response.ok) {
+      this.recordTxFailure(`http_${response.status}`);
       throw new Error(`Soroban RPC returned HTTP ${response.status}`);
     }
 
     const body = (await response.json()) as RpcResponse;
     if (body.error) {
+      this.recordTxFailure(`rpc_${body.error.code}`);
       throw new Error(`Soroban RPC ${body.error.code}: ${body.error.message}`);
     }
     if (
@@ -177,8 +213,10 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
       !Array.isArray(body.result.events) ||
       !Number.isSafeInteger(body.result.latestLedger)
     ) {
+      this.recordTxFailure('invalid_response');
       throw new Error('Soroban RPC returned an invalid getEvents response');
     }
+    this.recordTxSuccess();
     return body.result;
   }
 }
