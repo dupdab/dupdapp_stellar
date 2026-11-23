@@ -43,17 +43,24 @@ attacker from racing to apply an admin operation before the proposer cancels it:
 
 ## Events
 
-- `scheduled` — emitted when an operation is queued; includes the operation id and the earliest executable ledger.
-- `executed` — emitted when a queued operation is applied after the delay.
-- `cancelled` — emitted when a queued operation is removed before execution.
+Off-chain monitoring can subscribe to these events to detect and alert on
+pending high-risk operations before they take effect:
+
+- `OperationQueued { op_id, operation, proposer, execute_after }` — emitted when
+  an operation is queued; includes the operation id, the operation payload, the
+  proposer, and the earliest executable ledger.
+- `OperationExecuted { op_id, executed_by }` — emitted when a queued operation is
+  applied after the delay; includes the operation id and the caller that executed it.
+- `OperationCancelled { op_id, cancelled_by }` — emitted when a queued operation is
+  removed before execution; includes the operation id and the caller that cancelled it.
 
 ## Admin operations
 
 - `initialize(admin, delay)` — set the initial admin and delay. Callable once. Rejects delays below the minimum.
-- `schedule(op_id, op)` — admin-only; queue an operation for later execution. Records the proposer.
+- `schedule(op_id, op)` — admin-only; queue an operation for later execution. Records the proposer and emits `OperationQueued`.
 - `set_executor(op_id, executor)` — admin-only; assign an executor allowed to execute the queued operation.
-- `execute(op_id)` — proposer- or executor-only; apply a queued operation once the delay has elapsed.
-- `cancel(op_id)` — admin-only; remove a queued operation before it executes.
+- `execute(op_id)` — proposer- or executor-only; apply a queued operation once the delay has elapsed. Emits `OperationExecuted`.
+- `cancel(op_id)` — admin-only; remove a queued operation before it executes. Emits `OperationCancelled`.
 - `set_delay(delay)` — admin-only; update the delay for future schedules. Rejects delays below the minimum.
 - `set_min_delay(min_delay)` — governance-only; update the minimum allowed delay (never below 24 hours).
 

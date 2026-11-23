@@ -2,8 +2,8 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, BytesN, Env,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, BytesN, Env, IntoVal, Symbol, TryIntoVal,
 };
 
 fn setup_env() -> (Env, Address, AdminTimelockContractClient<'static>) {
@@ -135,4 +135,64 @@ fn test_designated_executor_can_execute() {
 
     client.execute_action(&executor, &action_id);
     assert!(client.get_pending_action(&action_id).is_none());
+}
+
+#[test]
+fn test_queue_action_emits_operation_queued_event() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 8);
+
+    let queued = client.queue_action(&admin, &action_id);
+
+    let events = env.events().all();
+    let (_, topics, data) = events.last().expect("expected an event to be emitted");
+
+    let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "op_queued"));
+
+    let (op_id, operation, proposer, execute_after): (BytesN<32>, BytesN<32>, Address, u64) =
+        data.try_into_val(&env).unwrap();
+    assert_eq!(op_id, action_id);
+    assert_eq!(operation, action_id);
+    assert_eq!(proposer, admin);
+    assert_eq!(execute_after, queued.execute_after);
+}
+
+#[test]
+fn test_execute_action_emits_operation_executed_event() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 9);
+    client.queue_action(&admin, &action_id);
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS);
+
+    client.execute_action(&admin, &action_id);
+
+    let events = env.events().all();
+    let (_, topics, data) = events.last().expect("expected an event to be emitted");
+
+    let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "op_executed"));
+
+    let (op_id, executed_by): (BytesN<32>, Address) = data.try_into_val(&env).unwrap();
+    assert_eq!(op_id, action_id);
+    assert_eq!(executed_by, admin);
+}
+
+#[test]
+fn test_cancel_timelock_emits_operation_cancelled_event() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 10);
+    client.queue_action(&admin, &action_id);
+
+    client.cancel_timelock(&admin, &action_id);
+
+    let events = env.events().all();
+    let (_, topics, data) = events.last().expect("expected an event to be emitted");
+
+    let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "op_cancelled"));
+
+    let (op_id, cancelled_by): (BytesN<32>, Address) = data.try_into_val(&env).unwrap();
+    assert_eq!(op_id, action_id);
+    assert_eq!(cancelled_by, admin);
 }

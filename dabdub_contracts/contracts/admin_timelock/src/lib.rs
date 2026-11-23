@@ -2,7 +2,7 @@
 
 mod test;
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol};
 
 const DEFAULT_MIN_DELAY_SECONDS: u64 = 48 * 60 * 60;
 const MIN_TIMELOCK_SECONDS: u64 = 24 * 60 * 60;
@@ -85,6 +85,10 @@ impl AdminTimelockContract {
         env.storage()
             .persistent()
             .set(&DataKey::PendingAction(action_id.clone()), &action);
+        env.events().publish(
+            (Symbol::new(&env, "OperationQueued"), action_id.clone()),
+            (action_id, caller, action.execute_after),
+        );
         action
     }
 
@@ -125,6 +129,10 @@ impl AdminTimelockContract {
             panic!("pending action not found");
         }
         env.storage().persistent().remove(&key);
+        env.events().publish(
+            (Symbol::new(&env, "OperationCancelled"), action_id.clone()),
+            (action_id, caller),
+        );
     }
 
     pub fn cancel_change(env: Env, caller: Address, action_id: BytesN<32>) {
@@ -146,6 +154,10 @@ impl AdminTimelockContract {
             panic!("timelock has not elapsed");
         }
         env.storage().persistent().remove(&key);
+        env.events().publish(
+            (Symbol::new(&env, "OperationExecuted"), action_id.clone()),
+            (action_id, caller),
+        );
     }
 
     pub fn apply_change(env: Env, caller: Address, action_id: BytesN<32>) {
