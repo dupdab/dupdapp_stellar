@@ -3,7 +3,7 @@
 use fee_calculator::{FeeCalculatorContract, FeeCalculatorContractClient, FeeTier};
 use soroban_sdk::{testutils::{Address as _, Ledger as _}, vec, Address, BytesN, Env, String};
 
-use crate::{SettlementLedgerContract, SettlementLedgerContractClient};
+use crate::{Error, SettlementLedgerContract, SettlementLedgerContractClient};
 
 fn pid(env: &Env, seed: u8) -> BytesN<32> {
     BytesN::from_array(env, &[seed; 32])
@@ -225,6 +225,59 @@ fn test_get_merchant_settlements_empty_and_past_end() {
     let past = client.get_merchant_settlements(&merchant, &10, &5);
     assert_eq!(past.settlement_ids.len(), 0);
     assert_eq!(past.next_cursor, None);
+}
+
+// ── escrow amount validation ────────────────────────────────────────────────
+
+fn record_checked(
+    client: &SettlementLedgerContractClient,
+    admin: &Address,
+    env: &Env,
+    seed: u8,
+    merchant: &Address,
+    escrow_release_amount: i128,
+) -> Result<(), Error> {
+    let result = client.try_record_settlement_checked(
+        admin,
+        &pid(env, seed),
+        merchant,
+        &5_000,
+        &100,
+        &4_900,
+        &1_700_000_000u64,
+        &fiat_ref(env, "REF-ESC"),
+        &currency(env, "NGN"),
+        &escrow_release_amount,
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(Ok(err)) => Err(err),
+        Err(Err(_)) => panic!("unexpected host error"),
+    }
+}
+
+#[test]
+fn test_escrow_check_allows_amount_up_to_release_amount() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+
+    // Boundary: amount == release amount, and amount < release amount.
+    assert!(record_checked(&client, &admin, &env, 130, &merchant, 5_000).is_ok());
+    assert!(record_checked(&client, &admin, &env, 131, &merchant, 6_000).is_ok());
+    assert_eq!(client.get_settlement(&pid(&env, 130)).amount, 5_000);
+}
+
+#[test]
+fn test_escrow_check_rejects_amount_above_release_amount() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+
+    let result = record_checked(&client, &admin, &env, 132, &merchant, 4_999);
+    assert_eq!(result, Err(Error::AmountMismatch));
+    assert_eq!(client.settlement_count(&merchant), 0);
+
+    let zero = record_checked(&client, &admin, &env, 133, &merchant, 0);
+    assert_eq!(zero, Err(Error::AmountMismatch));
 }
 
 #[test]

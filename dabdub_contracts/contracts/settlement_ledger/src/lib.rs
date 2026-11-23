@@ -3,7 +3,7 @@
 mod test;
 
 use fee_calculator::FeeCalculatorContractClient;
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, vec, Address, BytesN, Env, String, Vec};
 
 const PAGE_SIZE: u32 = 20;
 /// Upper bound on `limit` for cursor-based merchant queries.
@@ -59,6 +59,15 @@ pub struct SettlementReversal {
 pub struct MerchantSettlementsPage {
     pub settlement_ids: Vec<BytesN<32>>,
     pub next_cursor: Option<u32>,
+}
+
+/// Errors returned by the escrow-validated recording path.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// The settlement amount exceeds the escrow release amount.
+    AmountMismatch = 1,
 }
 
 #[contracttype]
@@ -220,6 +229,51 @@ impl SettlementLedgerContract {
             );
         }
         archived
+    }
+
+    /// Escrow-validated variant of `record_settlement`. `payment_id` is the
+    /// escrow payment ID the settlement refers to, and `escrow_release_amount`
+    /// is the amount the escrow released for it. Returns
+    /// `Error::AmountMismatch` unless `amount <= escrow_release_amount`
+    /// (and the release amount is positive); otherwise it records the
+    /// settlement exactly like `record_settlement`.
+    ///
+    /// Scope note: no payment_escrow contract exists in this workspace, so the
+    /// release amount is supplied by the caller (the authorized backend)
+    /// instead of being read cross-contract. The check itself is enforced
+    /// on-chain here, before anything is written.
+    pub fn record_settlement_checked(
+        env: Env,
+        caller: Address,
+        payment_id: BytesN<32>,
+        merchant: Address,
+        amount: i128,
+        fee: i128,
+        net: i128,
+        timestamp: u64,
+        fiat_ref: String,
+        currency: String,
+        escrow_release_amount: i128,
+    ) -> Result<SettlementRecord, Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        if escrow_release_amount <= 0 || amount > escrow_release_amount {
+            return Err(Error::AmountMismatch);
+        }
+
+        Ok(Self::record_settlement(
+            env,
+            caller,
+            payment_id,
+            merchant,
+            amount,
+            fee,
+            net,
+            timestamp,
+            fiat_ref,
+            currency,
+        ))
     }
 
     /// Cursor-paginated settlement IDs for a merchant, oldest first, read from
