@@ -2,7 +2,7 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Vec};
 
 const DEFAULT_MIN_DELAY_SECONDS: u64 = 48 * 60 * 60;
 
@@ -20,6 +20,8 @@ pub enum DataKey {
     Admin,
     MinDelay,
     PendingAction(BytesN<32>),
+    DrainAllowlist,
+    PendingAllowlist,
 }
 
 #[contract]
@@ -113,6 +115,76 @@ impl AdminTimelockContract {
         env.storage()
             .persistent()
             .get(&DataKey::PendingAction(action_id))
+    }
+
+    pub fn get_drain_allowlist(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DrainAllowlist)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    pub fn is_drain_allowed(env: Env, recipient: Address) -> bool {
+        Self::get_drain_allowlist(env).contains(&recipient)
+    }
+
+    pub fn queue_allowlist_change(env: Env, caller: Address, allowlist: Vec<Address>) -> TimelockAction {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let now = env.ledger().timestamp();
+        let delay = Self::get_min_delay(env.clone());
+        let action_id = Self::allowlist_action_id(&env);
+        let action = TimelockAction {
+            action_id: action_id.clone(),
+            queued_at: now,
+            execute_after: now.saturating_add(delay),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAction(action_id.clone()), &action);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAllowlist, &allowlist);
+        action
+    }
+
+    pub fn execute_allowlist_change(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let action_id = Self::allowlist_action_id(&env);
+        let key = DataKey::PendingAction(action_id.clone());
+        let action: TimelockAction = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("pending allowlist change not found");
+        if env.ledger().timestamp() < action.execute_after {
+            panic!("timelock has not elapsed");
+        }
+        let allowlist: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAllowlist)
+            .expect("pending allowlist change not found");
+        env.storage()
+            .instance()
+            .set(&DataKey::DrainAllowlist, &allowlist);
+        env.storage().persistent().remove(&key);
+        env.storage().persistent().remove(&DataKey::PendingAllowlist);
+    }
+
+    pub fn emergency_drain(env: Env, caller: Address, recipient: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        if !Self::is_drain_allowed(env.clone(), recipient.clone()) {
+            panic!("recipient not in drain allowlist");
+        }
+    }
+
+    fn allowlist_action_id(env: &Env) -> BytesN<32> {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xAL;
+        BytesN::from_array(env, &bytes)
     }
 
     fn require_admin(env: &Env, caller: &Address) {
