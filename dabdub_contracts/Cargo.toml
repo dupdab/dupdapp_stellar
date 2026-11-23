@@ -7,6 +7,18 @@ members = [
 [workspace.dependencies]
 soroban-sdk = { version = "22.0.0" }
 
+# Feature flags
+#
+# The workspace itself does not define any features; feature flags are declared
+# per-contract in each `contracts/*/Cargo.toml`. CI runs the test suite twice:
+# once with default features and once with `--all-features` so that
+# feature-gated code paths are compiled and tested.
+#
+# To exercise a specific combination locally, run from this directory:
+#   cargo test                          # default features
+#   cargo test --all-features           # every feature enabled
+#   cargo test -p <contract> --features <feature>
+
 [profile.release]
 opt-level = "z"
 # LOAD-BEARING: several contracts perform raw (non-`checked_`/non-`saturating_`)

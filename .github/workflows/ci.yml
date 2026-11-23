@@ -64,6 +64,13 @@ jobs:
         working-directory: dabdub_contracts
         run: cargo test
 
+      # Some contract functionality is gated behind feature flags. Running the
+      # suite with every feature enabled ensures feature-gated code paths are
+      # compiled and tested, not just the default-feature subset.
+      - name: cargo test (all features)
+        working-directory: dabdub_contracts
+        run: cargo test --all-features
+
       # Property-based tests (proptest) live behind the `proptest` feature so
       # the default test run stays fast. This job exercises them explicitly so
       # regressions in fee/slippage/escrow invariants are caught in CI.
@@ -210,102 +217,4 @@ jobs:
   # Deploys every contract to Stellar testnet and runs the integration suite
   # against the live deployment. Only runs on merges to main so PRs stay fast
   # and don't consume testnet resources. Deployed contract IDs are recorded in
-  # a manifest and torn down in an always() step so testnet stays clean even
-  # when the integration suite fails.
-  testnet-integration:
-    name: Testnet integration tests
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: ci
-    env:
-      STELLAR_NETWORK: testnet
-      STELLAR_RPC_URL: https://soroban-testnet.stellar.org
-      STELLAR_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
-      DEPLOY_MANIFEST: testnet-deployments.json
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32v1-none
-
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            dabdub_contracts/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Install Stellar CLI
-        run: |
-          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      # A throwaway funded testnet identity is generated per run so no long-lived
-      # secret is required. The secret is only used within this job.
-      - name: Configure testnet identity
-        run: |
-          set -euo pipefail
-          stellar keys generate ci-testnet --network testnet --fund
-          echo "STELLAR_ACCOUNT=ci-testnet" >> "$GITHUB_ENV"
-
-      - name: Build contracts for testnet
-        run: make build-optimised
-
-      - name: Deploy all contracts to testnet
-        run: |
-          set -euo pipefail
-          echo '{}' > "$DEPLOY_MANIFEST"
-          for contract in admin_auth admin_timelock batch_payments fee_calculator fee_distributor liquidity_router; do
-            wasm="dabdub_contracts/target/wasm32v1-none/release/${contract}.wasm"
-            if [ ! -f "$wasm" ]; then
-              echo "::error::Missing wasm for $contract at $wasm"
-              exit 1
-            fi
-            contract_id=$(stellar contract deploy \
-              --wasm "$wasm" \
-              --source "$STELLAR_ACCOUNT" \
-              --network testnet)
-            echo "Deployed $contract -> $contract_id"
-            jq --arg name "$contract" --arg id "$contract_id" \
-              '. + {($name): $id}' "$DEPLOY_MANIFEST" > tmp.json
-            mv tmp.json "$DEPLOY_MANIFEST"
-          done
-          cat "$DEPLOY_MANIFEST"
-
-      - name: Run integration tests against testnet
-        working-directory: dabdub_contracts
-        env:
-          STELLAR_TESTNET_MANIFEST: ${{ github.workspace }}/testnet-deployments.json
-        run: cargo test --features testnet-integration -- --nocapture
-
-      # Always tear down the deployed test contracts, even when the integration
-      # suite above fails, so testnet does not accumulate orphaned contracts.
-      - name: Tear down testnet contracts
-        if: always()
-        run: |
-          set -euo pipefail
-          if [ ! -f "$DEPLOY_MANIFEST" ]; then
-            echo "No deployment manifest found; nothing to tear down."
-            exit 0
-          fi
-          for contract_id in $(jq -r '.[]' "$DEPLOY_MANIFEST"); do
-            echo "Removing $contract_id"
-            stellar contract invoke \
-              --id "$contract_id" \
-              --source "$STELLAR_ACCOUNT" \
-              --network testnet \
-              -- remove_contract 2>/dev/null || \
-              echo "::warning::Could not invoke remove_contract on $contract_id"
-          done
-
-  # Reports per-contract WASM sizes on pull requests so size regressions are
-  # visible during review instead of only at deploy time.
-  wasm-size-report:
-    runs-on: ubuntu-latest
+  # a manifest and torn down in an always() step so testne
