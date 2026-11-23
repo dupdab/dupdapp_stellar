@@ -55,6 +55,16 @@ struct FeeDistributedEvent {
     payouts: Vec<FeePayout>,
 }
 
+/// Emitted once per recipient transfer so indexers can track fee flows
+/// without diffing contract state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeDistributed {
+    pub recipient: Address,
+    pub amount: i128,
+    pub payment_id: u64,
+}
+
 #[contract]
 pub struct FeeDistributorContract;
 
@@ -89,6 +99,17 @@ impl FeeDistributorContract {
     /// Pull and split a fee atomically. The final recipient receives any
     /// integer-division remainder so the full amount is always distributed.
     pub fn distribute(env: Env, caller: Address, total_amount: i128) {
+        Self::distribute_for_payment(env, caller, total_amount, 0)
+    }
+
+    /// Same as `distribute`, tagging each per-recipient `FeeDistributed`
+    /// event with the originating `payment_id`.
+    pub fn distribute_for_payment(
+        env: Env,
+        caller: Address,
+        total_amount: i128,
+        payment_id: u64,
+    ) {
         caller.require_auth();
         Self::require_allowed_caller(&env, &caller);
         assert!(total_amount > 0, "total_amount must be > 0");
@@ -121,6 +142,14 @@ impl FeeDistributorContract {
 
             if payout_amount > 0 {
                 token.transfer(&contract_address, &recipient.address, &payout_amount);
+                env.events().publish(
+                    ("FEE_DISTRIBUTOR", "FeeDistributed"),
+                    FeeDistributed {
+                        recipient: recipient.address.clone(),
+                        amount: payout_amount,
+                        payment_id,
+                    },
+                );
             }
             distributed = distributed
                 .checked_add(payout_amount)

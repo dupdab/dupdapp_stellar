@@ -9,6 +9,7 @@ use soroban_sdk::{
 use crate::{
     FeeDistributorContract, FeeDistributorContractClient, FeeRecipient, PendingRecipientUpdate,
 };
+use soroban_sdk::{IntoVal, Symbol, Val};
 
 struct Setup<'a> {
     env: Env,
@@ -357,4 +358,26 @@ fn test_non_admin_cannot_manage_allowlist() {
         .client
         .try_remove_allowed_recipient(&stranger, &s.lp)
         .is_err());
+}
+
+// ── per-recipient events ─────────────────────────────────────────────────────
+
+#[test]
+fn test_distribute_emits_fee_distributed_event_per_recipient() {
+    let s = default_setup();
+    s.client.distribute_for_payment(&s.caller, &10_000, &42);
+
+    let topic: soroban_sdk::Vec<Val> = vec![
+        &s.env,
+        Symbol::new(&s.env, "FEE_DISTRIBUTOR").into_val(&s.env),
+        Symbol::new(&s.env, "FeeDistributed").into_val(&s.env),
+    ];
+    let per_recipient = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|(contract, topics, _)| *contract == s.contract_id && *topics == topic)
+        .count();
+    assert_eq!(per_recipient, 2);
 }
