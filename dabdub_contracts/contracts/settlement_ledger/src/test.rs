@@ -185,6 +185,48 @@ fn test_archive_settlements_unauthorized_caller_fails() {
     assert!(client.try_archive_settlements(&caller, &0, &10).is_err());
 }
 
+// ── merchant settlement history (cursor pagination) ─────────────────────────
+
+#[test]
+fn test_get_merchant_settlements_paginates_with_cursor() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    let other = Address::generate(&env);
+    for seed in 100u8..105 {
+        record(&client, &admin, &env, seed, &merchant, 5_000, 100);
+    }
+    record(&client, &admin, &env, 110, &other, 5_000, 100);
+
+    let first = client.get_merchant_settlements(&merchant, &2, &0);
+    assert_eq!(first.settlement_ids.len(), 2);
+    assert_eq!(first.settlement_ids.get(0).unwrap(), pid(&env, 100));
+    assert_eq!(first.settlement_ids.get(1).unwrap(), pid(&env, 101));
+    assert_eq!(first.next_cursor, Some(2));
+
+    let second = client.get_merchant_settlements(&merchant, &2, &first.next_cursor.unwrap());
+    assert_eq!(second.settlement_ids.get(0).unwrap(), pid(&env, 102));
+    assert_eq!(second.next_cursor, Some(4));
+
+    let last = client.get_merchant_settlements(&merchant, &2, &4);
+    assert_eq!(last.settlement_ids.len(), 1);
+    assert_eq!(last.settlement_ids.get(0).unwrap(), pid(&env, 104));
+    assert_eq!(last.next_cursor, None);
+}
+
+#[test]
+fn test_get_merchant_settlements_empty_and_past_end() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    let empty = client.get_merchant_settlements(&merchant, &10, &0);
+    assert_eq!(empty.settlement_ids.len(), 0);
+    assert_eq!(empty.next_cursor, None);
+
+    record(&client, &admin, &env, 120, &merchant, 5_000, 100);
+    let past = client.get_merchant_settlements(&merchant, &10, &5);
+    assert_eq!(past.settlement_ids.len(), 0);
+    assert_eq!(past.next_cursor, None);
+}
+
 #[test]
 #[should_panic(expected = "not admin")]
 fn test_record_settlement_unauthorized_caller_panics() {

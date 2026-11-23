@@ -6,6 +6,8 @@ use fee_calculator::FeeCalculatorContractClient;
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, String, Vec};
 
 const PAGE_SIZE: u32 = 20;
+/// Upper bound on `limit` for cursor-based merchant queries.
+const MAX_MERCHANT_QUERY_LIMIT: u32 = 100;
 /// Archived records have their TTL bumped to ~30 days once their remaining TTL
 /// drops below ~1 day (ledgers close roughly every 5 seconds).
 const ARCHIVE_TTL_THRESHOLD: u32 = 17_280;
@@ -48,6 +50,15 @@ pub struct SettlementReversal {
     pub amount: i128,
     pub reason: String,
     pub reversed_at: u64,
+}
+
+/// One page of a merchant's settlement IDs. `next_cursor` is `None` once the
+/// merchant's history is exhausted.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantSettlementsPage {
+    pub settlement_ids: Vec<BytesN<32>>,
+    pub next_cursor: Option<u32>,
 }
 
 #[contracttype]
@@ -209,6 +220,44 @@ impl SettlementLedgerContract {
             );
         }
         archived
+    }
+
+    /// Cursor-paginated settlement IDs for a merchant, oldest first, read from
+    /// the merchant-indexed storage (no scan of other merchants' entries).
+    /// `cursor` is the 0-based position to start from (use 0 first, then the
+    /// returned `next_cursor`). `limit` is clamped to 1..=100.
+    pub fn get_merchant_settlements(
+        env: Env,
+        merchant: Address,
+        limit: u32,
+        cursor: u32,
+    ) -> MerchantSettlementsPage {
+        let limit = limit.clamp(1, MAX_MERCHANT_QUERY_LIMIT);
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantCount(merchant.clone()))
+            .unwrap_or(0);
+        let end = cursor.saturating_add(limit).min(count);
+
+        let mut settlement_ids: Vec<BytesN<32>> = vec![&env];
+        let mut position = cursor;
+        while position < end {
+            let page_key = DataKey::MerchantPage(merchant.clone(), position / PAGE_SIZE);
+            let page: Vec<BytesN<32>> = env
+                .storage()
+                .persistent()
+                .get(&page_key)
+                .unwrap_or_else(|| vec![&env]);
+            match page.get(position % PAGE_SIZE) {
+                Some(id) => settlement_ids.push_back(id),
+                None => break,
+            }
+            position += 1;
+        }
+
+        let next_cursor = if position < count { Some(position) } else { None };
+        MerchantSettlementsPage { settlement_ids, next_cursor }
     }
 
     /// True if the settlement has been moved to the archive.
