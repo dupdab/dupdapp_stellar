@@ -28,6 +28,10 @@ pub enum DataKey {
     DepthThresholdBps,
     // Issue #1223: Address of the slippage_protection contract
     SlippageProtection,
+    // Issue #1516: Consecutive failure count per route
+    RouteFailures(Route),
+    // Issue #1516: Circuit-breaker flag per route (true = disabled)
+    RouteDisabled(Route),
 }
 
 #[contracttype]
@@ -86,6 +90,21 @@ pub trait TokenInterface {
 pub enum Error {
     SlippageExceeded = 1,
     InvalidInput = 2,
+    // Issue #1516
+    NotAdmin = 3,
+    RouteDisabled = 4,
+}
+
+// Issue #1516: Consecutive failures after which a route's circuit opens.
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+
+fn require_router_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    admin.require_auth();
+    let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+    match stored_admin {
+        Some(a) if a == *admin => Ok(()),
+        _ => Err(Error::NotAdmin),
+    }
 }
 
 // Issue #1515: Fixed-point scale for quoted/actual rates (7 decimals, as on Stellar).
@@ -413,6 +432,67 @@ impl LiquidityRouter {
                 return Err(Error::SlippageExceeded);
             }
         }
-        Ok(Self::check_and_route(env, pool_address, amount_in))
+        let route = Self::check_and_route(env.clone(), pool_address, amount_in);
+        // Issue #1516: Refuse a route whose circuit breaker is open.
+        if Self::is_route_disabled(env, route.clone()) {
+            return Err(Error::RouteDisabled);
+        }
+        Ok(route)
+    }
+
+    /// Issue #1516: Whether the circuit breaker for `route` is open.
+    pub fn is_route_disabled(env: Env, route: Route) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::RouteDisabled(route))
+            .unwrap_or(false)
+    }
+
+    /// Issue #1516: Consecutive failure count currently tracked for `route`.
+    pub fn get_route_failures(env: Env, route: Route) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RouteFailures(route))
+            .unwrap_or(0)
+    }
+
+    /// Issue #1516: Records a failed execution on `route` (admin/backend
+    /// reporter). After `MAX_CONSECUTIVE_FAILURES` consecutive failures the
+    /// route is disabled and a `route_circuit_open` event is emitted.
+    pub fn record_route_failure(env: Env, admin: Address, route: Route) -> Result<u32, Error> {
+        require_router_admin(&env, &admin)?;
+        let failures = Self::get_route_failures(env.clone(), route.clone()) + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteFailures(route.clone()), &failures);
+        if failures >= MAX_CONSECUTIVE_FAILURES
+            && !Self::is_route_disabled(env.clone(), route.clone())
+        {
+            env.storage()
+                .instance()
+                .set(&DataKey::RouteDisabled(route.clone()), &true);
+            env.events().publish(
+                ("LIQUIDITY_ROUTER", "route_circuit_open"),
+                (route, failures),
+            );
+        }
+        Ok(failures)
+    }
+
+    /// Issue #1516: Records a successful execution, resetting the failure streak.
+    pub fn record_route_success(env: Env, admin: Address, route: Route) -> Result<(), Error> {
+        require_router_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::RouteFailures(route), &0u32);
+        Ok(())
+    }
+
+    /// Issue #1516: Admin re-enables a route and clears its failure count.
+    pub fn reenable_route(env: Env, admin: Address, route: Route) -> Result<(), Error> {
+        require_router_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::RouteDisabled(route.clone()), &false);
+        env.storage().instance().set(&DataKey::RouteFailures(route.clone()), &0u32);
+        env.events()
+            .publish(("LIQUIDITY_ROUTER", "route_reenabled"), (route,));
+        Ok(())
     }
 }

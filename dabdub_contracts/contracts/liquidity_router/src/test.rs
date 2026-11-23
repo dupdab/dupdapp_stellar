@@ -445,3 +445,41 @@ fn test_slippage_exceeded_rejected() {
     let res = client.try_check_and_route_with_slippage(&pool, &1_000, &10_000_000, &9_500_000, &200);
     assert_eq!(res, Err(Ok(Error::SlippageExceeded)));
 }
+
+// Issue #1516: circuit breaker opens after 5 consecutive failures.
+#[test]
+fn test_circuit_opens_after_five_failures_and_reenables() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+
+    for _ in 0..4 {
+        client.record_route_failure(&admin, &Route::SorobanAMM);
+    }
+    assert!(!client.is_route_disabled(&Route::SorobanAMM));
+    client.record_route_failure(&admin, &Route::SorobanAMM);
+    assert!(client.is_route_disabled(&Route::SorobanAMM));
+
+    let res = client.try_check_and_route_with_slippage(&pool, &1_000, &10_000_000, &10_000_000, &100);
+    assert_eq!(res, Err(Ok(Error::RouteDisabled)));
+
+    client.reenable_route(&admin, &Route::SorobanAMM);
+    assert!(!client.is_route_disabled(&Route::SorobanAMM));
+    assert_eq!(client.get_route_failures(&Route::SorobanAMM), 0);
+}
+
+#[test]
+fn test_success_resets_failure_streak() {
+    let (_env, client, admin) = setup();
+    client.record_route_failure(&admin, &Route::StellarClassicDEX);
+    client.record_route_success(&admin, &Route::StellarClassicDEX);
+    assert_eq!(client.get_route_failures(&Route::StellarClassicDEX), 0);
+}
+
+#[test]
+fn test_record_route_failure_non_admin_rejected() {
+    let (env, client, _admin) = setup();
+    let other = Address::generate(&env);
+    let res = client.try_record_route_failure(&other, &Route::SorobanAMM);
+    assert_eq!(res, Err(Ok(Error::NotAdmin)));
+}
