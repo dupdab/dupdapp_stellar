@@ -75,6 +75,24 @@ struct AdminDeactivatedEvent {
     admin: Address,
 }
 
+/// Emitted when a role is assigned to an account (issue #1531).
+#[contracttype]
+struct RoleAssignedEvent {
+    account: Address,
+    role: AdminRole,
+    assigned_by: Address,
+    timestamp: u64,
+}
+
+/// Emitted when a role is revoked from an account (issue #1531).
+#[contracttype]
+struct RoleRevokedEvent {
+    account: Address,
+    role: AdminRole,
+    revoked_by: Address,
+    timestamp: u64,
+}
+
 #[contract]
 pub struct AdminAuthContract;
 
@@ -133,9 +151,9 @@ impl AdminAuthContract {
             env.events().publish(
                 ("ADMIN_AUTH", "admin_role_changed"),
                 AdminRoleChangedEvent {
-                    admin,
+                    admin: admin.clone(),
                     old_role: old_user.role.clone(),
-                    new_role: role,
+                    new_role: role.clone(),
                 },
             );
         } else {
@@ -158,9 +176,23 @@ impl AdminAuthContract {
             env.storage().instance().set(&DataKey::AdminIndex, &index);
             env.events().publish(
                 ("ADMIN_AUTH", "admin_added"),
-                AdminAddedEvent { admin, role },
+                AdminAddedEvent {
+                    admin: admin.clone(),
+                    role: role.clone(),
+                },
             );
         }
+
+        // Audit trail: emit a role-assignment event for off-chain monitoring.
+        env.events().publish(
+            ("ADMIN_AUTH", "role_assigned"),
+            RoleAssignedEvent {
+                account: admin,
+                role,
+                assigned_by: caller,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// Remove an admin from the credential store. SuperAdmin only.
@@ -179,6 +211,12 @@ impl AdminAuthContract {
         if !env.storage().persistent().has(&key) {
             panic!("{}", errors::ADMIN_NOT_FOUND);
         }
+        let revoked_role = env
+            .storage()
+            .persistent()
+            .get::<DataKey, AdminUser>(&key)
+            .map(|u| u.role)
+            .unwrap_or(AdminRole::Admin);
         env.storage().persistent().remove(&key);
 
         // Remove from index
@@ -192,8 +230,23 @@ impl AdminAuthContract {
             env.storage().instance().set(&DataKey::AdminIndex, &index);
         }
 
-        env.events()
-            .publish(("ADMIN_AUTH", "admin_revoked"), AdminRevokedEvent { admin });
+        env.events().publish(
+            ("ADMIN_AUTH", "admin_revoked"),
+            AdminRevokedEvent {
+                admin: admin.clone(),
+            },
+        );
+
+        // Audit trail: emit a role-revocation event for off-chain monitoring.
+        env.events().publish(
+            ("ADMIN_AUTH", "role_revoked"),
+            RoleRevokedEvent {
+                account: admin,
+                role: revoked_role,
+                revoked_by: caller,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// Transfer SuperAdmin rights to a new address. SuperAdmin only (#1042).
@@ -247,24 +300,20 @@ impl AdminAuthContract {
         Self::require_super_admin(&env, &caller);
 
         let key = DataKey::Admin(admin.clone());
-        let mut user: AdminUser = env
-            .storage()
-            .instance()
-            .get(&key)
-            .unwrap_or_else(|| panic!("{}", errors::ADMIN_NOT_FOUND));
+        if !env.storage().persistent().has(&key) {
+            panic!("{}", errors::ADMIN_NOT_FOUND);
+        }
+        let mut user: AdminUser = env.storage().persistent().get(&key).unwrap();
         user.active = false;
         Self::save(&env, user);
+
         env.events().publish(
             ("ADMIN_AUTH", "admin_deactivated"),
             AdminDeactivatedEvent { admin },
         );
     }
 
-    pub fn get_admin(env: Env, admin: Address) -> Option<AdminUser> {
-        env.storage().persistent().get(&DataKey::Admin(admin))
-    }
-
-    /// True when the address is an active admin in the store.
+    /// Returns true if `admin` is an active admin (any role).
     pub fn is_admin(env: Env, admin: Address) -> bool {
         match env
             .storage()
@@ -274,6 +323,27 @@ impl AdminAuthContract {
             Some(user) => user.active,
             None => false,
         }
+    }
+
+    /// Returns the role of `admin`, if present.
+    pub fn get_role(env: Env, admin: Address) -> Option<AdminRole> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, AdminUser>(&DataKey::Admin(admin))
+            .map(|u| u.role)
+    }
+
+    /// Returns the current SuperAdmin address.
+    pub fn get_super_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::SuperAdmin).unwrap()
+    }
+
+    /// Returns all admin addresses in the index.
+    pub fn get_admins(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminIndex)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     fn save(env: &Env, user: AdminUser) {
@@ -287,11 +357,5 @@ impl AdminAuthContract {
         if caller != &super_admin {
             panic!("{}", errors::NOT_ADMIN);
         }
-    }
-
-    fn save(env: &Env, user: AdminUser) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
     }
 }

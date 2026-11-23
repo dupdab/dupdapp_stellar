@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{testutils::Address as _, testutils::Events as _, Env, IntoVal, Symbol};
 
 fn setup() -> (Env, AdminAuthContractClient<'static>, Address) {
     let env = Env::default();
@@ -159,4 +159,55 @@ fn test_revoke_then_readd_admin_restores_access() {
     let user = client.get_admin(&admin).unwrap();
     assert_eq!(user.role, AdminRole::SuperAdmin);
     assert!(user.active);
+}
+
+// Issue #1531 — role assignment emits a RoleAssigned event with the expected
+// account, role, assigned_by, and timestamp fields for off-chain audit indexing.
+#[test]
+fn test_add_admin_emits_role_assigned_event() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+
+    let expected = RoleAssigned {
+        account: admin.clone(),
+        role: AdminRole::Admin,
+        assigned_by: super_admin.clone(),
+        timestamp: env.ledger().timestamp(),
+    };
+
+    let found = env.events().all().iter().any(|(_, topics, data)| {
+        topics
+            .iter()
+            .any(|t| t == Symbol::new(&env, "role_assigned").into_val(&env))
+            && data == expected.clone().into_val(&env)
+    });
+    assert!(found, "RoleAssigned event not emitted");
+}
+
+// Issue #1531 — role revocation emits a RoleRevoked event with the expected
+// account, role, revoked_by, and timestamp fields for off-chain audit indexing.
+#[test]
+fn test_revoke_admin_emits_role_revoked_event() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+    client.revoke_admin(&super_admin, &admin);
+
+    let expected = RoleRevoked {
+        account: admin.clone(),
+        role: AdminRole::Admin,
+        revoked_by: super_admin.clone(),
+        timestamp: env.ledger().timestamp(),
+    };
+
+    let found = env.events().all().iter().any(|(_, topics, data)| {
+        topics
+            .iter()
+            .any(|t| t == Symbol::new(&env, "role_revoked").into_val(&env))
+            && data == expected.clone().into_val(&env)
+    });
+    assert!(found, "RoleRevoked event not emitted");
 }
