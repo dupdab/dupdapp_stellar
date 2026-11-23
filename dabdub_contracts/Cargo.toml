@@ -7,6 +7,13 @@ members = [
 [workspace.dependencies]
 soroban-sdk = { version = "22.0.0" }
 
+# Unused-dependency hygiene (issue #1569): CI runs `cargo machete` against this
+# workspace and fails the build when a dependency declared in any member's
+# Cargo.toml is not actually referenced by that crate's source. Keep this
+# workspace free of unused dependencies; if a dependency is only needed for
+# tests/benches, declare it under `[dev-dependencies]` so machete recognizes
+# the usage.
+
 [profile.release]
 opt-level = "z"
 # LOAD-BEARING: several contracts perform raw (non-`checked_`/non-`saturating_`)
