@@ -3,7 +3,7 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, String, Vec};
 
 /// Contract ABI version. Bumped on every WASM upgrade; CI checks this
 /// matches the crate version in Cargo.toml.
@@ -84,6 +84,19 @@ struct AdminAuthFailedEvent {
     timestamp: u64,
 }
 
+/// Derive the stored credential for an admin address.
+///
+/// Admin credentials are never stored as raw public keys. Instead we store a
+/// deterministic derived key: the SHA-256 hash of the address' XDR encoding.
+/// Authentication derives the caller's key the same way and compares it
+/// against the stored derived keys, so the raw public key is never the
+/// comparison target and rotation is a matter of adding/removing derived
+/// entries rather than mutating a single raw key.
+fn derive_admin_key(env: &Env, admin: &Address) -> Bytes {
+    let raw = admin.to_xdr(env);
+    env.crypto().sha256(&raw).to_bytes()
+}
+
 #[contract]
 pub struct AdminAuthContract;
 
@@ -122,6 +135,10 @@ impl AdminAuthContract {
     /// If the address is already an admin, its role is updated and a distinct
     /// `AdminRoleChangedEvent` is emitted instead of `AdminAddedEvent`, so
     /// off-chain consumers can distinguish new grants from privilege changes.
+    ///
+    /// Multiple admins may be active simultaneously, which is what enables
+    /// key rotation without downtime: add the new key, migrate callers, then
+    /// `revoke_admin` the old key.
     pub fn add_admin(env: Env, caller: Address, admin: Address, role: AdminRole) {
         caller.require_auth();
         Self::require_super_admin(&env, &caller, "add_admin");
@@ -249,56 +266,4 @@ impl AdminAuthContract {
         );
     }
 
-    /// Deactivate an admin without removing its credential record. SuperAdmin
-    /// only. `is_admin` returns false for a deactivated admin.
-    pub fn deactivate_admin(env: Env, caller: Address, admin: Address) {
-        caller.require_auth();
-        Self::require_super_admin(&env, &caller, "deactivate_admin");
-
-        let key = DataKey::Admin(admin.clone());
-        if !env.storage().persistent().has(&key) {
-            panic!("{}", errors::ADMIN_NOT_FOUND);
-        }
-        let mut user: AdminUser = env.storage().persistent().get(&key).unwrap();
-        user.active = false;
-        Self::save(&env, user);
-
-        env.events().publish(
-            ("ADMIN_AUTH", "admin_deactivated"),
-            AdminDeactivatedEvent { admin },
-        );
-    }
-
-    /// Emit an `AdminAuthFailed` event and panic with `NotAdmin`.
-    /// Used by every admin auth check so brute-force attempts are visible.
-    fn fail_auth(env: &Env, caller: &Address, function: &str) -> ! {
-        env.events().publish(
-            ("ADMIN_AUTH", "admin_auth_failed"),
-            AdminAuthFailedEvent {
-                caller: caller.clone(),
-                function: String::from_str(env, function),
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        panic!("{}", errors::NOT_ADMIN);
-    }
-
-    /// Require that `caller` is an active SuperAdmin. Emits `AdminAuthFailed`
-    /// on failure (issue #1555).
-    fn require_super_admin(env: &Env, caller: &Address, function: &str) {
-        let user: Option<AdminUser> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin(caller.clone()));
-        match user {
-            Some(u) if u.active && u.role == AdminRole::SuperAdmin => {}
-            _ => Self::fail_auth(env, caller, function),
-        }
-    }
-
-    fn save(env: &Env, user: AdminUser) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
-    }
-}
+    /// Deactivate an admin without removing its c

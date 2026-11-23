@@ -228,17 +228,69 @@ fn test_admin_auth_failure_emits_event() {
         function: Symbol::new(&env, "authorize"),
         timestamp,
     };
-    let expected_topics = (Symbol::new(&env, "admin_auth_failed"),).into_val(&env);
+    let expected_topics = (Symbol::new(&env, "admin_auth"), Symbol::new(&env, "auth_failed")).into_val(&env);
     let expected_data = expected.into_val(&env);
+    assert!(env.events().all().iter().any(|(_, topics, data)| {
+        topics == expected_topics && data == expected_data
+    }));
+}
 
-    let events = env.events().all();
-    let mut found = false;
-    for event in events.iter() {
-        let (_contract, topics, data) = event;
-        if topics == expected_topics && data == expected_data {
-            found = true;
-            break;
-        }
-    }
-    assert!(found, "AdminAuthFailed event was not emitted");
+// Issue #1556 — admin credentials are stored as derived keys (a hash of the
+// public key) rather than the raw public key. The derived key must be stable
+// and must not equal the raw address, so credential rotation can be reasoned
+// about without exposing the raw key in storage.
+#[test]
+fn test_admin_credential_is_derived_not_raw() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+
+    let derived = client.derive_admin_key(&admin);
+    // The stored credential is a derivation of the public key, not the key itself.
+    assert_ne!(derived, admin);
+    // Derivation is deterministic.
+    assert_eq!(derived, client.derive_admin_key(&admin));
+    // The derived credential is what the contract stores and checks.
+    assert!(client.has_admin_key(&derived));
+    assert!(!client.has_admin_key(&admin));
+}
+
+// Issue #1556 — multiple admin keys can be active simultaneously so a new key
+// can be added before an old one is removed, enabling rotation without downtime.
+#[test]
+fn test_multiple_admin_keys_active_during_rotation() {
+    let (env, client, super_admin) = setup();
+    let old_key = Address::generate(&env);
+    let new_key = Address::generate(&env);
+
+    // Grant the old key.
+    client.add_admin(&super_admin, &old_key, &AdminRole::Admin);
+    assert!(client.is_admin(&old_key));
+
+    // Add the new key BEFORE removing the old one — both must be authorized.
+    client.add_admin(&super_admin, &new_key, &AdminRole::Admin);
+    assert!(client.is_admin(&old_key));
+    assert!(client.is_admin(&new_key));
+    client.authorize(&old_key);
+    client.authorize(&new_key);
+
+    // Now retire the old key; the new key remains authorized.
+    client.revoke_admin(&super_admin, &old_key);
+    assert!(!client.is_admin(&old_key));
+    assert!(client.is_admin(&new_key));
+    client.authorize(&new_key);
+}
+
+// Issue #1556 — a removed key's derived credential is no longer recognized.
+#[test]
+fn test_removed_admin_key_credential_rejected() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+
+    let derived = client.derive_admin_key(&admin);
+    assert!(client.has_admin_key(&derived));
+
+    client.revoke_admin(&super_admin, &admin);
+    assert!(!client.has_admin_key(&derived));
 }

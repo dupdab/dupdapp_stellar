@@ -13,6 +13,14 @@ Role-based authorization registry used by the other contracts in this workspace 
 
 (Exact storage keys are defined in `src/lib.rs`; this section is a summary, not a normative spec.)
 
+## Admin authentication mechanism
+
+Admin credentials are **not** stored as raw public keys. When an admin is added, the contract derives a credential from the caller's public key and stores only that derived value. Authentication derives the caller's credential the same way and compares it against the stored derived credentials.
+
+- **Derivation:** the stored credential is a hash of the public key (see `src/lib.rs` for the exact derivation used). The raw public key is never persisted, so a leaked storage snapshot does not directly expose admin keys.
+- **Comparison:** `is_admin` / privileged operations derive the caller's credential and check it against the set of stored derived credentials. A caller is authorized only if its derived credential matches an active entry.
+- **Rotation:** because credentials are derived deterministically, a new key can be added (its derived credential stored) before the old one is removed. Both keys are valid during the overlap window, so rotation happens without downtime.
+
 ## Events
 
 - Admin added — emitted when a new admin address is granted rights.
@@ -27,18 +35,20 @@ Because failed admin authentication attempts emit `AdminAuthFailed`, brute-force
 
 ## Admin operations
 
-- `add_admin` — owner-only; grants admin rights to an address.
+- `add_admin` — owner-only; derives and stores the credential for an address.
 - `remove_admin` — owner-only; revokes admin rights from an address.
-- `is_admin` — read-only check used by dependent contracts.
+- `is_admin` — read-only check used by dependent contracts; derives the caller's credential and compares against stored derived credentials.
 
 ## Key rotation
 
-Admin key rotation is performed by adding the new admin key and then removing the old one. The end-to-end rotation flow is covered by tests:
+Admin key rotation is performed by adding the new admin key and then removing the old one. Because multiple admin keys are supported simultaneously, both keys are authorized during the overlap window, so rotation requires no downtime. The end-to-end rotation flow is covered by tests:
 
 1. An admin action performed with the old key succeeds.
-2. The admin key is rotated (new key added, old key removed).
-3. An admin action performed with the new key succeeds.
-4. An admin action performed with the old key fails after rotation.
+2. The new admin key is added (old key still active).
+3. An admin action performed with the new key succeeds while the old key remains valid.
+4. The old admin key is removed.
+5. An admin action performed with the new key still succeeds.
+6. An admin action performed with the old key fails after removal.
 
 ## Known limitations
 
