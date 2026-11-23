@@ -64,3 +64,41 @@ fn test_execute_before_delay_panics() {
     client.queue_action(&admin, &action_id);
     client.execute_action(&admin, &action_id);
 }
+
+#[test]
+fn test_cannot_execute_before_timelock_expires() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 5);
+    let queued = client.queue_action(&admin, &action_id);
+
+    // Advance the ledger clock to one second before the timelock expires.
+    env.ledger()
+        .with_mut(|li| li.timestamp = queued.executable_at - 1);
+    assert!(client.try_execute_action(&admin, &action_id).is_err());
+    assert!(client.get_pending_action(&action_id).is_some());
+}
+
+#[test]
+fn test_executes_exactly_at_timelock_expiry() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 6);
+    let queued = client.queue_action(&admin, &action_id);
+
+    // Advance the ledger clock to exactly the timelock expiry timestamp.
+    env.ledger()
+        .with_mut(|li| li.timestamp = queued.executable_at);
+    client.execute_action(&admin, &action_id);
+    assert!(client.get_pending_action(&action_id).is_none());
+}
+
+#[test]
+fn test_operation_expires_after_execution_window() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 7);
+    let queued = client.queue_action(&admin, &action_id);
+
+    // Advance the ledger clock past the execution window.
+    env.ledger()
+        .with_mut(|li| li.timestamp = queued.expires_at + 1);
+    assert!(client.try_execute_action(&admin, &action_id).is_err());
+}
