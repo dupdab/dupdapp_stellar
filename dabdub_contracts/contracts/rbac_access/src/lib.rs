@@ -32,6 +32,10 @@ pub struct RoleRevokedEvent {
     pub revoked_by: Address,
 }
 
+/// Maximum number of roles that may be assigned to a single account.
+/// Issue #1534: cap roles per account to prevent unbounded storage growth.
+pub const MAX_ROLES_PER_ACCOUNT: u32 = 10;
+
 #[contract]
 pub struct RbacAccessContract;
 
@@ -51,6 +55,16 @@ impl RbacAccessContract {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::SuperAdmin);
 
+        // Issue #1534: enforce a maximum number of roles per account.
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoleCount(account.clone()))
+            .unwrap_or(0);
+        if current_count >= MAX_ROLES_PER_ACCOUNT {
+            panic!("too many roles");
+        }
+
         let is_new_super_admin = role == Role::SuperAdmin
             && !env
                 .storage()
@@ -60,6 +74,9 @@ impl RbacAccessContract {
         env.storage()
             .persistent()
             .set(&DataKey::Role(account.clone()), &role);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleCount(account.clone()), &(current_count + 1));
 
         if is_new_super_admin {
             let count: u32 = env
@@ -117,6 +134,18 @@ impl RbacAccessContract {
         }
 
         env.storage().persistent().remove(&key);
+
+        // Issue #1534: decrement the per-account role count on revoke.
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoleCount(account.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::RoleCount(account.clone()),
+            &current_count.saturating_sub(1),
+        );
+
         env.events().publish(
             ("RBAC", "role_revoked"),
             RoleRevokedEvent {
