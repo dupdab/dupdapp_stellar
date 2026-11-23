@@ -79,6 +79,18 @@ pub trait TokenInterface {
     fn transfer(env: Env, from: Address, to: Address, amount: i128);
 }
 
+// Issue #1515: Contract-level errors returned by the slippage-aware routing entrypoint.
+#[soroban_sdk::contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    SlippageExceeded = 1,
+    InvalidInput = 2,
+}
+
+// Issue #1515: Fixed-point scale for quoted/actual rates (7 decimals, as on Stellar).
+const RATE_SCALE: i128 = 10_000_000;
+
 #[contract]
 pub struct LiquidityRouter;
 
@@ -377,5 +389,30 @@ impl LiquidityRouter {
             );
             Route::StellarClassicDEX
         }
+    }
+
+    /// Issue #1515: Slippage-enforcing variant of `check_and_route`. The caller
+    /// supplies the quoted rate, the actual rate and `max_slippage_bps`; the
+    /// contract itself rejects the route with `Error::SlippageExceeded` when the
+    /// actual rate is worse than the quote by more than the tolerance, so the
+    /// backend cannot bypass protection. Rates are scaled by `RATE_SCALE`.
+    pub fn check_and_route_with_slippage(
+        env: Env,
+        pool_address: Address,
+        amount_in: i128,
+        quoted_rate: i128,
+        actual_rate: i128,
+        max_slippage_bps: u32,
+    ) -> Result<Route, Error> {
+        if amount_in <= 0 || quoted_rate <= 0 || actual_rate <= 0 || max_slippage_bps > 10_000 {
+            return Err(Error::InvalidInput);
+        }
+        if actual_rate < quoted_rate {
+            let slippage_bps = (quoted_rate - actual_rate) * 10_000 / quoted_rate;
+            if slippage_bps > (max_slippage_bps as i128) {
+                return Err(Error::SlippageExceeded);
+            }
+        }
+        Ok(Self::check_and_route(env, pool_address, amount_in))
     }
 }

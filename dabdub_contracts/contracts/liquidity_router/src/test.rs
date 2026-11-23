@@ -424,3 +424,24 @@ fn test_fee_deducted_before_swap() {
     let net_in = amount_in - fee;
     assert_eq!(net_in, 997);
 }
+
+// Issue #1515: slippage tolerance is enforced by the contract itself.
+#[test]
+fn test_slippage_within_tolerance_routes() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+    // 1% slippage against a 2% tolerance
+    let route = client.check_and_route_with_slippage(&pool, &1_000, &10_000_000, &9_900_000, &200);
+    assert_eq!(route, Route::SorobanAMM);
+}
+
+#[test]
+fn test_slippage_exceeded_rejected() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+    // 5% slippage against a 2% tolerance
+    let res = client.try_check_and_route_with_slippage(&pool, &1_000, &10_000_000, &9_500_000, &200);
+    assert_eq!(res, Err(Ok(Error::SlippageExceeded)));
+}
