@@ -2,7 +2,7 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Bytes, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, vec, Address, Bytes, Env, String, Vec};
 
 /// Minimum number of approvals required before a proposal auto-executes.
 ///
@@ -15,6 +15,13 @@ use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Bytes, Env
 /// MUST enforce `assert!(new_threshold >= 2)`.
 const THRESHOLD: u32 = 2;
 const EXPIRY_SECONDS: u64 = 24 * 60 * 60; // 24 hours
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    DuplicateSigner = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +114,30 @@ impl MultisigAdminContract {
         env.storage()
             .instance()
             .set(&DataKey::NextProposalId, &0u64);
+    }
+
+    /// Initializes the multisig with an arbitrary signer list.
+    ///
+    /// SECURITY: every signer address MUST be unique. Duplicate signers would
+    /// let the same key satisfy quorum multiple times, so a duplicate is
+    /// rejected with [`Error::DuplicateSigner`].
+    pub fn initialize(env: Env, signers: Vec<Address>) -> Result<(), Error> {
+        let len = signers.len();
+        for i in 0..len {
+            let signer = signers.get_unchecked(i);
+            for j in (i + 1)..len {
+                if signer == signers.get_unchecked(j) {
+                    return Err(Error::DuplicateSigner);
+                }
+            }
+        }
+
+        env.storage().instance().set(&DataKey::Admins, &signers);
+        env.storage().instance().set(&DataKey::Threshold, &2u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextProposalId, &0u64);
+        Ok(())
     }
 
     pub fn propose(env: Env, caller: Address, operation: String, args: Bytes) -> u64 {
@@ -243,222 +274,6 @@ impl MultisigAdminContract {
         let key = DataKey::Proposal(proposal_id);
         let mut proposal: Proposal = env
             .storage()
-            .persistent()
-            .get(&key)
-            .expect("proposal not found");
+            .persiste
 
-        if env.ledger().timestamp() > proposal.expires_at {
-            panic!("proposal expired");
-        }
-        if proposal.executed {
-            panic!("proposal already executed");
-        }
-        if proposal.rejected {
-            panic!("proposal already rejected");
-        }
-        if caller == proposal.proposer {
-            panic!("proposer cannot approve twice");
-        }
-        if Self::has_approved(&proposal.approvals, &caller) {
-            panic!("already approved");
-        }
-
-        proposal.approvals.push_back(caller.clone());
-        env.events().publish(
-            ("MULTISIG", "proposal_approved"),
-            ProposalApprovedEvent {
-                proposal_id,
-                approver: caller,
-                approvals: proposal.approvals.len(),
-            },
-        );
-
-        // Auto-executes only once approvals reach THRESHOLD (>= 2), which
-        // requires at least one distinct approver beyond the proposer.
-        Self::maybe_execute(&env, &mut proposal);
-        env.storage().persistent().set(&key, &proposal);
-    }
-
-    /// Approves a proposed action. Restricted to signers 2+ (signer 1 is the
-    /// proposer and cannot approve its own action). Prevents double approval.
-    pub fn approve_action(env: Env, caller: Address, action_id: u64) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        if caller == Self::signer_one(&env) {
-            panic!("signer 1 cannot approve its own action");
-        }
-
-        let key = DataKey::Proposal(action_id);
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("proposal not found");
-
-        if env.ledger().timestamp() > proposal.expires_at {
-            panic!("proposal expired");
-        }
-        if proposal.executed {
-            panic!("proposal already executed");
-        }
-        if proposal.rejected {
-            panic!("proposal already rejected");
-        }
-        if Self::has_approved(&proposal.approvals, &caller) {
-            panic!("already approved");
-        }
-
-        proposal.approvals.push_back(caller.clone());
-        env.events().publish(
-            ("MULTISIG", "proposal_approved"),
-            ProposalApprovedEvent {
-                proposal_id: action_id,
-                approver: caller,
-                approvals: proposal.approvals.len(),
-            },
-        );
-
-        Self::maybe_execute(&env, &mut proposal);
-        env.storage().persistent().set(&key, &proposal);
-    }
-
-    /// Executes a proposed action once quorum (THRESHOLD) is reached.
-    ///
-    /// Panics if the proposal does not exist, has expired, was already
-    /// executed/rejected, or has not yet gathered enough approvals.
-    pub fn execute_action(env: Env, caller: Address, action_id: u64) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let key = DataKey::Proposal(action_id);
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("proposal not found");
-
-        if env.ledger().timestamp() > proposal.expires_at {
-            panic!("proposal expired");
-        }
-        if proposal.executed {
-            panic!("proposal already executed");
-        }
-        if proposal.rejected {
-            panic!("proposal already rejected");
-        }
-        if proposal.approvals.len() < THRESHOLD {
-            panic!("quorum not reached");
-        }
-
-        proposal.executed = true;
-        env.events().publish(
-            ("MULTISIG", "proposal_executed"),
-            ProposalExecutedEvent {
-                proposal_id: action_id,
-                operation: proposal.operation.clone(),
-            },
-        );
-        env.storage().persistent().set(&key, &proposal);
-    }
-
-    /// Removes an expired, never-executed proposal from persistent storage.
-    ///
-    /// Permissionless: expiry is objectively checkable on-chain via
-    /// `env.ledger().timestamp() > proposal.expires_at`, matching the check
-    /// used by `approve`/`maybe_execute`. This lets anyone reclaim the rent
-    /// and footprint of proposals that expired without reaching [`THRESHOLD`].
-    ///
-    /// Panics if the proposal does not exist, has already been executed, or
-    /// has not yet expired — so live or executed proposals can never be pruned.
-    pub fn prune_expired_proposal(env: Env, proposal_id: u64) {
-        let key = DataKey::Proposal(proposal_id);
-        let proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("proposal not found");
-
-        if proposal.executed {
-            panic!("proposal already executed");
-        }
-        if env.ledger().timestamp() <= proposal.expires_at {
-            panic!("proposal not expired");
-        }
-
-        env.storage().persistent().remove(&key);
-        env.events().publish(
-            ("MULTISIG", "proposal_pruned"),
-            ProposalPrunedEvent { proposal_id },
-        );
-    }
-
-    pub fn get_admins(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admins)
-            .expect("admins not set")
-    }
-
-    pub fn get_threshold(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(THRESHOLD)
-    }
-
-    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .expect("proposal not found")
-    }
-
-    fn signer_one(env: &Env) -> Address {
-        let admins: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admins)
-            .expect("admins not set");
-        admins.get(0).expect("no signer 1")
-    }
-
-    fn require_admin(env: &Env, caller: &Address) {
-        let admins: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admins)
-            .expect("admins not set");
-        if !Self::has_approved(&admins, caller) {
-            panic!("caller is not an admin");
-        }
-    }
-
-    fn has_approved(list: &Vec<Address>, who: &Address) -> bool {
-        for a in list.iter() {
-            if &a == who {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn maybe_execute(env: &Env, proposal: &mut Proposal) {
-        if proposal.executed || proposal.rejected {
-            return;
-        }
-        if env.ledger().timestamp() > proposal.expires_at {
-            return;
-        }
-        if proposal.approvals.len() < THRESHOLD {
-            return;
-        }
-        proposal.executed = true;
-        env.events().publish(
-            ("MULTISIG", "proposal_executed"),
-            ProposalExecutedEvent {
-                proposal_id: proposal.id,
-                operation: proposal.operation.clone(),
-            },
-        );
-    }
-}
+/* … truncated 7053 chars — edit only what you need near the top … */
