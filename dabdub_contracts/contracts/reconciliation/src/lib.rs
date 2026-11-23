@@ -224,35 +224,52 @@ impl ReconciliationContract {
         env.storage().persistent().get(&DataKey::Batch(batch_id))
     }
 
-    /// Returns the latest batch together with its ID.
-    ///
-    /// The ID is what a caller needs in order to verify a proof against this
-    /// root later, once further batches have been submitted.
-    pub fn get_latest_stored_batch(env: Env) -> Option<StoredBatch> {
+    /// Returns the latest batch together with its ID, or `None` if no batch
+    /// has been submitted yet.
+    pub fn get_latest_batch(env: Env) -> Option<StoredBatch> {
         let batch_id = Self::latest_batch_id(&env)?;
-        env.storage()
+        let batch: ReconciliationBatch = env
+            .storage()
             .persistent()
-            .get(&DataKey::Batch(batch_id))
-            .map(|batch| StoredBatch { batch_id, batch })
+            .get(&DataKey::Batch(batch_id))?;
+        Some(StoredBatch { batch_id, batch })
     }
 
-    /// Number of batches submitted so far. The valid IDs are `0..batch_count`.
-    pub fn batch_count(env: Env) -> u32 {
+    /// Returns the ID of the most recently submitted batch, or `None` if no
+    /// batch has been submitted yet.
+    pub fn latest_batch_id(env: &Env) -> Option<u32> {
         env.storage()
             .instance()
-            .get(&DataKey::NextBatchId)
-            .unwrap_or(0)
+            .get::<DataKey, u32>(&DataKey::NextBatchId)
+            .map(|next| next - 1)
     }
 
-    /// Permanently archives batches with IDs below `before_batch_id`, bounded
-    /// by `max_batches` so retention can be applied incrementally. Current and
-    /// newer batches remain available for proof verification.
-    pub fn archive_batches(
-        env: Env,
-        caller: Address,
-        before_batch_id: u32,
-        max_batches: u32,
-    ) -> u32 {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        let upper = before_
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if &admin != caller {
+            panic!("Caller is not the admin");
+        }
+    }
+
+    fn require_proof_depth(proof: &Vec<MerkleProofNode>) {
+        if proof.len() > MAX_PROOF_DEPTH {
+            panic!("Proof exceeds maximum depth");
+        }
+    }
+
+    fn compute_root(env: &Env, leaf: &BytesN<32>, proof: &Vec<MerkleProofNode>) -> BytesN<32> {
+        let mut current = leaf.clone();
+        for node in proof.iter() {
+            let mut buf = Bytes::new(env);
+            if node.is_left {
+                buf.append(&node.sibling.clone().into());
+                buf.append(&current.clone().into());
+            } else {
+                buf.append(&current.clone().into());
+                buf.append(&node.sibling.clone().into());
+            }
+            current = env.crypto().sha256(&buf).into();
+        }
+        current
+    }
+}
