@@ -510,3 +510,18 @@ fn test_set_max_oracle_age_non_admin_rejected() {
     let res = client.try_set_max_oracle_age_seconds(&other, &60);
     assert_eq!(res, Err(Ok(Error::NotAdmin)));
 }
+
+// Issue #1518: RouteSelected event carries route id, rate and amounts.
+#[test]
+fn test_route_selected_event_emitted() {
+    use soroban_sdk::{testutils::Events, IntoVal};
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+    client.check_and_route_with_slippage(&pool, &1_000, &10_000_000, &20_000_000, &100, &env.ledger().timestamp());
+
+    let expected = RouteSelected { route_id: 0, rate: 20_000_000, amount_in: 1_000, amount_out: 2_000 };
+    let events = env.events().all();
+    let found = events.iter().any(|(_, _, data)| data == expected.clone().into_val(&env));
+    assert!(found);
+}

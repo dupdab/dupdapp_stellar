@@ -58,6 +58,18 @@ pub struct PoolRemovedEvent {
     pub pool_id: Address,
 }
 
+// Issue #1518: Event emitted when a route is selected for a conversion so the
+// backend can audit which route was used and at what rate.
+// route_id: 0 = SorobanAMM, 1 = StellarClassicDEX. rate is scaled by RATE_SCALE.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteSelected {
+    pub route_id: u32,
+    pub rate: i128,
+    pub amount_in: i128,
+    pub amount_out: i128,
+}
+
 #[soroban_sdk::contractclient(name = "AmmClient")]
 pub trait AmmInterface {
     fn get_reserves(env: Env) -> (i128, i128);
@@ -447,6 +459,20 @@ impl LiquidityRouter {
         if Self::is_route_disabled(env, route.clone()) {
             return Err(Error::RouteDisabled);
         }
+        // Issue #1518: Emit the selected route, executed rate and amounts.
+        let route_id: u32 = match route {
+            Route::SorobanAMM => 0,
+            Route::StellarClassicDEX => 1,
+        };
+        env.events().publish(
+            (Symbol::new(&env, "RouteSelected"),),
+            RouteSelected {
+                route_id,
+                rate: actual_rate,
+                amount_in,
+                amount_out: amount_in * actual_rate / RATE_SCALE,
+            },
+        );
         Ok(route)
     }
 
