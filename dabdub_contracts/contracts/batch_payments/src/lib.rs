@@ -240,3 +240,79 @@ impl BatchPaymentContract {
         if count > max_batch_size {
             return Err(ContractError::BatchTooLarge);
         }
+
+        // Validate every input before writing any state (atomicity).
+        for i in 0..count {
+            let payment = payments.get(i).unwrap();
+            if payment.amount < min_amount || payment.amount > max_amount {
+                return Err(ContractError::InvalidAmount);
+            }
+            if payment.memo.len() == 0 {
+                return Err(ContractError::EmptyMemo);
+            }
+        }
+
+        let mut counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Counter)
+            .unwrap_or(0);
+        let mut ids: Vec<BytesN<32>> = vec![&env];
+
+        for i in 0..count {
+            let payment = payments.get(i).unwrap();
+            counter += 1;
+
+            // Derive a deterministic 32-byte payment ID from merchant, ledger
+            // sequence, and the per-contract counter.
+            let mut preimage: Bytes = merchant.clone().to_xdr(&env);
+            preimage.extend_from_array(&current_ledger.to_be_bytes());
+            preimage.extend_from_array(&counter.to_be_bytes());
+            let id: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+            let record = PaymentRecord {
+                id: id.clone(),
+                amount: payment.amount,
+                memo: payment.memo.clone(),
+                merchant: merchant.clone(),
+                customer: payment.customer.clone(),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(id.clone()), &record);
+
+            env.events().publish(
+                (soroban_sdk::Symbol::new(&env, "PaymentCreated"),),
+                (id.clone(), payment.amount, payment.memo.clone()),
+            );
+
+            ids.push_back(id);
+        }
+
+        env.storage().instance().set(&DataKey::Counter, &counter);
+        env.storage()
+            .persistent()
+            .set(&batch_count_key, &(current_ledger, batches_in_ledger + 1));
+
+        // Emit a batch-level event carrying every created payment ID so the
+        // backend can correlate the batch to its individual payments (#1529).
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "BatchCreated"),),
+            (merchant.clone(), ids.clone()),
+        );
+
+        Ok(ids)
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContractError {
+    AlreadyInitialized = 1,
+    ContractNotInitialized = 2,
+    InvalidAmount = 3,
+    InvalidLimits = 4,
+    BatchEmpty = 5,
+    BatchTooLarge = 6,
+    EmptyMemo = 7,
+}

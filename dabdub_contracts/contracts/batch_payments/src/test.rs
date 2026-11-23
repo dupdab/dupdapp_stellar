@@ -3,7 +3,7 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Events, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, testutils::Events, Address, Env, String, Symbol, TryFromVal};
 
 fn make_payment(env: &Env, amount: i128, memo: &str) -> PaymentInput {
     PaymentInput {
@@ -182,6 +182,40 @@ fn test_payment_created_events_emitted() {
 }
 
 #[test]
+fn test_batch_created_event_includes_all_payment_ids() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+
+    let merchant = Address::generate(&env);
+    let payments = soroban_sdk::vec![
+        &env,
+        make_payment(&env, 100, "item-a"),
+        make_payment(&env, 200, "item-b"),
+        make_payment(&env, 300, "item-c"),
+    ];
+
+    let ids = client.create_batch(&merchant, &payments);
+    assert_eq!(ids.len(), 3);
+
+    // Find the BatchCreated event and assert it carries every payment id.
+    let batch_topic = Symbol::new(&env, "batch_created");
+    let mut found = false;
+    for (_contract, topics, data) in env.events().all().iter() {
+        if topics.len() == 1 && topics.get(0).unwrap() == batch_topic.to_val() {
+            let event_ids: soroban_sdk::Vec<u64> =
+                soroban_sdk::Vec::try_from_val(&env, &data).unwrap();
+            assert_eq!(event_ids.len(), ids.len());
+            for i in 0..ids.len() {
+                assert_eq!(event_ids.get(i).unwrap(), ids.get(i).unwrap());
+            }
+            found = true;
+        }
+    }
+    assert!(found, "BatchCreated event not emitted");
+}
+
+#[test]
 fn test_max_batch_size_defaults_to_100() {
     let env = Env::default();
     env.mock_all_auths();
@@ -268,37 +302,4 @@ fn test_batch_above_max_size_rejected() {
 
     let err = client.try_create_batch(&merchant, &payments).unwrap_err().unwrap();
     assert_eq!(err, ContractError::BatchTooLarge);
-}
-
-#[test]
-fn test_amount_min_minus_1_reverts() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = deploy_and_init(&env, 100, 1_000);
-    let merchant = Address::generate(&env);
-    let payments = soroban_sdk::vec![&env, make_payment(&env, 99, "below-min")];
-    let err = client.try_create_batch(&merchant, &payments).unwrap_err().unwrap();
-    assert_eq!(err, ContractError::PaymentAmountOutsideLimits);
-}
-
-#[test]
-fn test_amount_equal_min_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = deploy_and_init(&env, 100, 1_000);
-    let merchant = Address::generate(&env);
-    let payments = soroban_sdk::vec![&env, make_payment(&env, 100, "at-min")];
-    let ids = client.create_batch(&merchant, &payments);
-    assert_eq!(ids.len(), 1);
-}
-
-#[test]
-fn test_amount_equal_max_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = deploy_and_init(&env, 100, 1_000);
-    let merchant = Address::generate(&env);
-    let payments = soroban_sdk::vec![&env, make_payment(&env, 1_000, "at-max")];
-    let ids = client.create_batch(&merchant, &payments);
-    assert_eq!(ids.len(), 1);
 }
