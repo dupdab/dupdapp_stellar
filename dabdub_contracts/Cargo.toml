@@ -33,6 +33,12 @@ debug-assertions = false
 panic = "abort"
 codegen-units = 1
 lto = true
+# Reproducible builds (issue #1567): force a deterministic, absolute-path-free
+# build so the same source produces the same WASM hash on every machine/CI
+# agent. `trim-paths` strips machine-specific paths from the binary and
+# `incremental = false` avoids non-deterministic incremental artifacts.
+trim-paths = "all"
+incremental = false
 
 # For more information about this profile see https://soroban.stellar.org/docs/basic-tutorials/logging#cargotoml-profile
 [profile.release-with-logs]

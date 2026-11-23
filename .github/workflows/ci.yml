@@ -16,10 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The toolchain is pinned in rust-toolchain.toml (issue #1567) so the
+      # compiler version is identical on every machine and CI agent. The
+      # action reads that file instead of tracking `stable`.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.82.0"
           targets: wasm32v1-none
+          components: rustfmt, clippy
 
       - name: Check Rust formatting
         working-directory: dabdub_contracts
@@ -118,6 +123,32 @@ jobs:
       - name: Build WASM and check size budget
         run: make check-wasm-size
 
+      # Reproducible-build verification (issue #1567): rebuild the wasm from a
+      # clean target directory with the pinned toolchain and locked deps, then
+      # compare the resulting hashes against the first build. Any mismatch
+      # means the build is not deterministic and fails CI.
+      - name: Verify reproducible WASM build
+        run: |
+          set -euo pipefail
+          wasm_dir="dabdub_contracts/target/wasm32v1-none/release"
+          sha256sum "$wasm_dir"/*.wasm | sort -k2 > /tmp/wasm-hashes-first.txt
+          echo "First build hashes:"
+          cat /tmp/wasm-hashes-first.txt
+
+          # Clean rebuild with the same pinned toolchain and locked deps.
+          ( cd dabdub_contracts && cargo clean )
+          make build-optimised
+
+          sha256sum "$wasm_dir"/*.wasm | sort -k2 > /tmp/wasm-hashes-second.txt
+          echo "Second build hashes:"
+          cat /tmp/wasm-hashes-second.txt
+
+          if ! diff -u /tmp/wasm-hashes-first.txt /tmp/wasm-hashes-second.txt; then
+            echo "::error::WASM output is not reproducible across builds."
+            exit 1
+          fi
+          echo "WASM build is reproducible."
+
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -145,7 +176,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.82.0"
 
       # The cargo workspace lives in dabdub_contracts/; there is no manifest at
       # the repository root, so the audit runs from there.
@@ -211,5 +244,6 @@ jobs:
 
   # Reports per-contract WASM sizes on pull requests so size regressions are
   # visible during review instead of only at deploy time.
-  wasm-size-report:
-    runs-on: ubuntu-latest
+  wasm-size-repo
+
+/* … truncated 31 chars — edit only what you need near the top … */
