@@ -12,8 +12,11 @@ pub const VERSION: u32 = 1u32;
 /// Shared PascalCase error codes for panic messages (issue #1314).
 /// These will be replaced by `#[contracterror]` enums in a future change.
 pub mod errors {
+    /// Caller is not a registered admin (or is deactivated).
     pub const NOT_ADMIN: &str = "NotAdmin";
+    /// Target admin address has no credential record in storage.
     pub const ADMIN_NOT_FOUND: &str = "AdminNotFound";
+    /// Attempt to revoke the current SuperAdmin's own record.
     pub const CANNOT_REVOKE_SUPER_ADMIN: &str = "CannotRevokeSuperAdmin";
 }
 
@@ -24,7 +27,11 @@ pub mod errors {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum AdminRole {
+    /// Standard admin: may perform admin-gated operations but cannot manage
+    /// other admins.
     Admin,
+    /// Super admin: may add/revoke admins, deactivate admins, and transfer
+    /// SuperAdmin rights. Exactly one SuperAdmin exists at a time.
     SuperAdmin,
 }
 
@@ -32,17 +39,26 @@ pub enum AdminRole {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct AdminUser {
+    /// The admin's Stellar address.
     pub admin: Address,
+    /// Role granted to this admin.
     pub role: AdminRole,
+    /// Whether the admin is currently active. Deactivated admins keep their
+    /// record but fail `is_admin` checks.
     pub active: bool,
 }
 
+/// Storage keys used by the contract.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Instance key holding the current SuperAdmin address.
     SuperAdmin,
+    /// Persistent key holding an `AdminUser` record for the given address.
     Admin(Address),
+    /// Instance key holding the `Vec<Address>` index of all admin addresses.
     AdminIndex,
+    /// Instance key holding the contract ABI version.
     Version,
 }
 
@@ -82,6 +98,13 @@ pub struct AdminAuthContract;
 impl AdminAuthContract {
     /// Bootstrap the store with a single SuperAdmin. All other admin accounts
     /// are created exclusively through `add_admin` (the CLI seed/script path).
+    ///
+    /// # Parameters
+    /// - `super_admin`: address to register as the initial SuperAdmin. Must be
+    ///   a valid Stellar address; no range constraints beyond that.
+    ///
+    /// # Panics
+    /// Does not panic; called once at deployment.
     pub fn __constructor(env: Env, super_admin: Address) {
         env.storage().instance().set(&DataKey::Version, &VERSION);
         env.storage()
@@ -102,6 +125,12 @@ impl AdminAuthContract {
     }
 
     /// Return the contract ABI version stored at construction time.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    ///
+    /// # Returns
+    /// The stored `VERSION` (currently `1`), or `VERSION` if unset.
     pub fn get_version(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -113,6 +142,14 @@ impl AdminAuthContract {
     /// If the address is already an admin, its role is updated and a distinct
     /// `AdminRoleChangedEvent` is emitted instead of `AdminAddedEvent`, so
     /// off-chain consumers can distinguish new grants from privilege changes.
+    ///
+    /// # Parameters
+    /// - `caller`: must be the current SuperAdmin; must authorize the call.
+    /// - `admin`: address to add or update. Any valid Stellar address.
+    /// - `role`: `AdminRole::Admin` or `AdminRole::SuperAdmin`.
+    ///
+    /// # Panics
+    /// - `NotAdmin` if `caller` is not the SuperAdmin.
     pub fn add_admin(env: Env, caller: Address, admin: Address, role: AdminRole) {
         caller.require_auth();
         Self::require_super_admin(&env, &caller);
@@ -165,6 +202,15 @@ impl AdminAuthContract {
 
     /// Remove an admin from the credential store. SuperAdmin only.
     /// The SuperAdmin cannot revoke their own admin record (fix for #1041).
+    ///
+    /// # Parameters
+    /// - `caller`: must be the current SuperAdmin; must authorize the call.
+    /// - `admin`: address to revoke. Must exist and must not be the SuperAdmin.
+    ///
+    /// # Panics
+    /// - `NotAdmin` if `caller` is not the SuperAdmin.
+    /// - `CannotRevokeSuperAdmin` if `admin` is the current SuperAdmin.
+    /// - `AdminNotFound` if `admin` has no credential record.
     pub fn revoke_admin(env: Env, caller: Address, admin: Address) {
         caller.require_auth();
         Self::require_super_admin(&env, &caller);
@@ -197,6 +243,14 @@ impl AdminAuthContract {
     }
 
     /// Transfer SuperAdmin rights to a new address. SuperAdmin only (#1042).
+    ///
+    /// # Parameters
+    /// - `caller`: must be the current SuperAdmin; must authorize the call.
+    /// - `new_super_admin`: address to become the new SuperAdmin. Any valid
+    ///   Stellar address; a credential record is created if absent.
+    ///
+    /// # Panics
+    /// - `NotAdmin` if `caller` is not the SuperAdmin.
     pub fn transfer_super_admin(env: Env, caller: Address, new_super_admin: Address) {
         caller.require_auth();
         Self::require_super_admin(&env, &caller);
@@ -242,56 +296,18 @@ impl AdminAuthContract {
 
     /// Deactivate an admin without removing its credential record. SuperAdmin
     /// only. `is_admin` returns false for a deactivated admin.
+    ///
+    /// # Parameters
+    /// - `caller`: must be the current SuperAdmin; must authorize the call.
+    /// - `admin`: address to deactivate. Must have an existing credential record.
+    ///
+    /// # Panics
+    /// - `NotAdmin` if `caller` is not the SuperAdmin.
+    /// - `AdminNotFound` if `admin` has no credential record.
     pub fn deactivate_admin(env: Env, caller: Address, admin: Address) {
         caller.require_auth();
         Self::require_super_admin(&env, &caller);
 
-        let key = DataKey::Admin(admin.clone());
-        let mut user: AdminUser = env
-            .storage()
-            .instance()
-            .get(&key)
-            .unwrap_or_else(|| panic!("{}", errors::ADMIN_NOT_FOUND));
-        user.active = false;
-        Self::save(&env, user);
-        env.events().publish(
-            ("ADMIN_AUTH", "admin_deactivated"),
-            AdminDeactivatedEvent { admin },
-        );
-    }
+        let key = DataKey::Admin(admin.clone()
 
-    pub fn get_admin(env: Env, admin: Address) -> Option<AdminUser> {
-        env.storage().persistent().get(&DataKey::Admin(admin))
-    }
-
-    /// True when the address is an active admin in the store.
-    pub fn is_admin(env: Env, admin: Address) -> bool {
-        match env
-            .storage()
-            .persistent()
-            .get::<DataKey, AdminUser>(&DataKey::Admin(admin))
-        {
-            Some(user) => user.active,
-            None => false,
-        }
-    }
-
-    fn save(env: &Env, user: AdminUser) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
-    }
-
-    fn require_super_admin(env: &Env, caller: &Address) {
-        let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
-        if caller != &super_admin {
-            panic!("{}", errors::NOT_ADMIN);
-        }
-    }
-
-    fn save(env: &Env, user: AdminUser) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
-    }
-}
+/* … truncated 1438 chars — edit only what you need near the top … */
