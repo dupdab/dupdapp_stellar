@@ -34,6 +34,20 @@ Storage entries are written on `schedule` and removed on `execute` or `cancel`.
 
 All mutating entry points require the stored admin's authorisation.
 
+## Admin key ceremony
+
+The `Admin` address is a high-value mainnet key. It must never be generated on a
+networked machine. The full procedure for generating, storing, and recovering
+this key (and the `multisig_admin` keys) is documented in
+[`docs/security/key-ceremony.md`](../../../docs/security/key-ceremony.md).
+
+In short:
+
+- Keys are generated **offline on airgapped hardware** dedicated to the ceremony.
+- Generation requires **multi-party computation (MPC)** or a **hardware security
+  module (HSM)**; no single operator ever holds the full private key.
+- A documented **disaster recovery** procedure covers loss of admin keys.
+
 ## Known limitations
 
 - The delay is enforced in ledgers, not wall-clock time; actual latency depends on ledger cadence.
@@ -45,3 +59,4 @@ All mutating entry points require the stored admin's authorisation.
 
 - [`admin_auth`](../admin_auth/README.md) — authorisation primitives used to gate admin-only entry points.
 - [`access_control`](../access_control/README.md) — role checks that scheduled operations may target.
+- [`docs/security/key-ceremony.md`](../../../docs/security/key-ceremony.md) — mainnet admin key ceremony and disaster recovery.
