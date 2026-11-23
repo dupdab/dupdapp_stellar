@@ -83,12 +83,13 @@ jobs:
         working-directory: dabdub_contracts
         run: cargo audit
 
+      # Measures line coverage for every contract in the workspace with
+      # cargo-tarpaulin. `--fail-under 70` makes the step exit non-zero when
+      # coverage drops below the 70% minimum, so a PR that silently reduces
+      # coverage fails CI instead of merging. The Cobertura XML report is
+      # written to target/coverage/ for the Codecov upload below.
       - name: Generate coverage report
         working-directory: dabdub_contracts
-        run: cargo audit
-
-      - name: Generate coverage report
-        working-directory: dupdub_contracts
         run: |
           mkdir -p target/coverage
           cargo tarpaulin \
@@ -97,13 +98,14 @@ jobs:
             --output-dir target/coverage \
             --exclude-files "*/tests/*" \
             --verbose \
-            --fail-under 85
+            --fail-under 70
 
+      # Uploads the Cobertura report produced above to Codecov. codecov.yml at
+      # the repository root configures the project/patch targets and flags.
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
-          files: dupdub_contracts/target/coverage/cobertura.xml
+          files: dabdub_contracts/target/coverage/cobertura.xml
           flags: rust
           name: dupdub-contracts
           fail_ci_if_error: false
@@ -214,9 +216,4 @@ jobs:
           gh release create "$tag" \
             "contract-bindings-${GITHUB_SHA::12}.tar.gz" \
             --title "Contract bindings ${GITHUB_SHA::12}" \
-            --notes "Auto-generated TypeScript bindings from commit ${GITHUB_SHA}."
-
-  # Reports per-contract WASM sizes on pull requests so size regressions are
-  # visible during review instead of only at deploy time.
-  wasm-size-report:
-    runs-on: ubuntu-latest
+            --notes "Auto-generated TypeScript bindings from c

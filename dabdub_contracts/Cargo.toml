@@ -37,3 +37,20 @@ lto = true
 # For more information about this profile see https://soroban.stellar.org/docs/basic-tutorials/logging#cargotoml-profile
 [profile.release-with-logs]
 inherits = "release"
+
+# Coverage profile used by `cargo tarpaulin` in CI (issue #1581).
+# Tarpaulin instruments the test build, so it must NOT inherit the release
+# profile's `panic = "abort"` / `strip = "symbols"` / `lto = true` settings —
+# those break instrumentation and symbol resolution. Keep this profile close
+# to a normal debug build so coverage numbers reflect the code under test.
+[profile.coverage]
+inherits = "dev"
+opt-level = 0
+debug = true
+strip = "none"
+debug-assertions = true
+overflow-checks = true
+panic = "unwind"
+codegen-units = 256
+lto = false
+incremental = false

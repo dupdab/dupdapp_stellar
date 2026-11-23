@@ -7,11 +7,15 @@ WASM_SIZE_WARN  := 52428  # 80% of 64 KB
 WASM_SIZE_REPORT := $(CONTRACTS_DIR)/wasm-size-report.md
 WASM_SIZE_CHECK := scripts/check-wasm-size.sh
 
+# Minimum line coverage (percent) required per contract. CI fails below this.
+COVERAGE_THRESHOLD := 70
+COVERAGE_DIR       := $(CONTRACTS_DIR)/coverage
+
 # Contracts that have per-contract test/build targets.
 CONTRACTS := admin_auth admin_timelock batch_payments escrow fee_calculator fee_distributor liquidity_router registry
 
-.PHONY: all help build build-optimised check-wasm-size wasm-size-report test integration-test verify-deployment lint lint-clippy lint-fmt lint-audit \
-        $(addprefix build-,$(CONTRACTS)) $(addprefix test-,$(CONTRACTS)) \
+.PHONY: all help build build-optimised check-wasm-size wasm-size-report test integration-test verify-deployment lint lint-clippy lint-fmt lint-audit coverage coverage-check \
+        $(addprefix build-,$(CONTRACTS)) $(addprefix test-,$(CONTRACTS)) $(addprefix coverage-,$(CONTRACTS)) \
         deploy-testnet local-testnet-start local-testnet-stop local-testnet-deploy \
         dev dev-down simnet-start simnet-stop simnet-deploy simnet-fund
 
@@ -26,6 +30,8 @@ help:
 	@echo "  make test               Run all contract tests"
 	@echo "  make clean              Remove all build artifacts"
 	@echo "  make check-wasm-size    Enforce 64KB WASM size budget on all contracts"
+	@echo "  make coverage           Run cargo tarpaulin coverage for all contracts"
+	@echo "  make coverage-check     Fail if any contract is below $(COVERAGE_THRESHOLD)% coverage"
 	@echo "  make help               Show this help message"
 	@echo "  make deploy-testnet     Build and deploy all contracts to Stellar testnet"
 	@echo ""
@@ -49,6 +55,9 @@ help:
 	@echo ""
 	@echo "Per-contract test targets:"
 	@$(foreach c,$(CONTRACTS),echo "  make test-$(c)";)
+	@echo ""
+	@echo "Per-contract coverage targets:"
+	@$(foreach c,$(CONTRACTS),echo "  make coverage-$(c)";)
 
 build:
 	cargo build --workspace
@@ -67,6 +76,39 @@ $(addprefix build-,$(CONTRACTS)): build-%:
 
 $(addprefix test-,$(CONTRACTS)): test-%:
 	cargo test -p $*
+
+# Run cargo tarpaulin for every contract, emitting a per-contract Cobertura
+# report under $(COVERAGE_DIR). Requires `cargo install cargo-tarpaulin`.
+coverage:
+	@mkdir -p $(COVERAGE_DIR)
+	@for contract in $(CONTRACTS); do \
+		echo "==> coverage: $$contract"; \
+		cargo tarpaulin \
+			--package $$contract \
+			--out Xml \
+			--output-dir $(COVERAGE_DIR) \
+			--fail-under $(COVERAGE_THRESHOLD) || exit 1; \
+	done
+	@echo "Coverage reports written to $(COVERAGE_DIR)."
+
+# Enforce the per-contract coverage threshold. Fails if any contract's
+# Cobertura report reports line-rate below $(COVERAGE_THRESHOLD)%.
+coverage-check: coverage
+	@for report in $(COVERAGE_DIR)/*.xml; do \
+		[ -f "$$report" ] || continue; \
+		rate=$$(grep -o 'line-rate="[0-9.]*"' "$$report" | head -n1 | sed 's/[^0-9.]//g'); \
+		pct=$$(awk "BEGIN { printf \"%.2f\", $$rate * 100 }"); \
+		if awk "BEGIN { exit !($$pct < $(COVERAGE_THRESHOLD)) }"; then \
+			echo "ERROR: $$report coverage $$pct% is below $(COVERAGE_THRESHOLD)%" >&2; \
+			exit 1; \
+		fi; \
+		echo "  OK  $$report ($$pct%)"; \
+	done
+	@echo "All contracts meet the $(COVERAGE_THRESHOLD)% coverage threshold."
+
+$(addprefix coverage-,$(CONTRACTS)): coverage-%:
+	@mkdir -p $(COVERAGE_DIR)
+	cargo tarpaulin --package $* --out Xml --output-dir $(COVERAGE_DIR) --fail-under $(COVERAGE_THRESHOLD)
 
 # Single command to bring up the full local dev environment: start the
 # Stellar simnet container and deploy the contracts to it.
