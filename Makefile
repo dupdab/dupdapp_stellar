@@ -10,10 +10,13 @@ WASM_SIZE_CHECK := scripts/check-wasm-size.sh
 # Contracts that have per-contract test/build targets.
 CONTRACTS := admin_auth admin_timelock batch_payments escrow fee_calculator fee_distributor liquidity_router registry
 
-.PHONY: all build build-optimised check-wasm-size wasm-size-report test integration-test verify-deployment lint lint-clippy lint-fmt lint-audit \
+.PHONY: all help build build-optimised check-wasm-size wasm-size-report test integration-test verify-deployment lint lint-clippy lint-fmt lint-audit \
         $(addprefix build-,$(CONTRACTS)) $(addprefix test-,$(CONTRACTS)) \
         deploy-testnet local-testnet-start local-testnet-stop local-testnet-deploy \
         dev dev-down simnet-start simnet-stop simnet-deploy simnet-fund
+
+# Bare `make` shows help so available commands are discoverable.
+.DEFAULT_GOAL := help
 
 all: build
 
