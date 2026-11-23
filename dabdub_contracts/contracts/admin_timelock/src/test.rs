@@ -64,3 +64,37 @@ fn test_execute_before_delay_panics() {
     client.queue_action(&admin, &action_id);
     client.execute_action(&admin, &action_id);
 }
+
+#[test]
+fn test_min_delay_enforced_at_or_above_minimum() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 5);
+
+    // Exactly the minimum delay is accepted.
+    client.set_min_delay(&admin, &DEFAULT_MIN_DELAY_SECONDS);
+    assert_eq!(client.get_min_delay(), DEFAULT_MIN_DELAY_SECONDS);
+
+    // A larger, governance-configured delay is also accepted.
+    let larger = DEFAULT_MIN_DELAY_SECONDS + 3_600;
+    client.set_min_delay(&admin, &larger);
+    assert_eq!(client.get_min_delay(), larger);
+
+    client.queue_action(&admin, &action_id);
+    assert!(client.get_pending_action(&action_id).is_some());
+}
+
+#[test]
+fn test_min_delay_rejects_zero_and_below_minimum() {
+    let (env, admin, client) = setup_env();
+
+    // A 0-second timelock must be rejected.
+    let zero_result = client.try_set_min_delay(&admin, &0);
+    assert_eq!(zero_result, Err(Ok(Error::TimelockTooShort)));
+    assert_eq!(client.get_min_delay(), DEFAULT_MIN_DELAY_SECONDS);
+
+    // Any duration below the minimum must be rejected.
+    let below = DEFAULT_MIN_DELAY_SECONDS - 1;
+    let below_result = client.try_set_min_delay(&admin, &below);
+    assert_eq!(below_result, Err(Ok(Error::TimelockTooShort)));
+    assert_eq!(client.get_min_delay(), DEFAULT_MIN_DELAY_SECONDS);
+}

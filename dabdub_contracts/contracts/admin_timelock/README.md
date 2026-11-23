@@ -14,9 +14,21 @@ This gives users and other stakeholders a window to react to sensitive changes
 | --- | --- | --- |
 | `Admin` | `Address` | Current admin authorised to schedule/cancel/execute operations. |
 | `Delay` | `u64` | Minimum number of ledgers that must pass between scheduling and execution. |
+| `MinDelay` | `u64` | Governance-configurable minimum allowed delay (defaults to 24 hours). |
 | `Pending` | `Map<Bytes, ScheduledOp>` | Scheduled operations keyed by an operation id, including the earliest executable ledger. |
 
 Storage entries are written on `schedule` and removed on `execute` or `cancel`.
+
+## Delay validation
+
+A timelock delay of `0` would effectively bypass the timelock, so every delay is
+validated against a minimum before it is stored or used:
+
+- The minimum defaults to **24 hours** and is configurable by governance via
+  `set_min_delay(min_delay)`.
+- `initialize`, `set_delay`, and `set_min_delay` return `Error::TimelockTooShort`
+  when the supplied duration is below the configured minimum.
+- `set_min_delay` itself cannot lower the minimum below the 24-hour floor.
 
 ## Events
 
@@ -26,11 +38,12 @@ Storage entries are written on `schedule` and removed on `execute` or `cancel`.
 
 ## Admin operations
 
-- `initialize(admin, delay)` — set the initial admin and delay. Callable once.
+- `initialize(admin, delay)` — set the initial admin and delay. Callable once. Rejects delays below the minimum.
 - `schedule(op_id, op)` — admin-only; queue an operation for later execution.
 - `execute(op_id)` — admin-only; apply a queued operation once the delay has elapsed.
 - `cancel(op_id)` — admin-only; remove a queued operation before it executes.
-- `set_delay(delay)` — admin-only; update the delay for future schedules.
+- `set_delay(delay)` — admin-only; update the delay for future schedules. Rejects delays below the minimum.
+- `set_min_delay(min_delay)` — governance-only; update the minimum allowed delay (never below 24 hours).
 
 All mutating entry points require the stored admin's authorisation.
 

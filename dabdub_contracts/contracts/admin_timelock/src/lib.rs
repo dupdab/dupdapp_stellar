@@ -2,9 +2,16 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env};
 
 const DEFAULT_MIN_DELAY_SECONDS: u64 = 48 * 60 * 60;
+const MIN_TIMELOCK_SECONDS: u64 = 24 * 60 * 60;
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Error {
+    TimelockTooShort = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -45,15 +52,20 @@ impl AdminTimelockContract {
             .unwrap_or(DEFAULT_MIN_DELAY_SECONDS)
     }
 
-    pub fn set_min_delay(env: Env, caller: Address, min_delay_seconds: u64) {
+    pub fn set_min_delay(
+        env: Env,
+        caller: Address,
+        min_delay_seconds: u64,
+    ) -> Result<(), Error> {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        if min_delay_seconds == 0 {
-            panic!("minimum delay must be > 0");
+        if min_delay_seconds < MIN_TIMELOCK_SECONDS {
+            return Err(Error::TimelockTooShort);
         }
         env.storage()
             .instance()
             .set(&DataKey::MinDelay, &min_delay_seconds);
+        Ok(())
     }
 
     pub fn queue_action(env: Env, caller: Address, action_id: BytesN<32>) -> TimelockAction {
