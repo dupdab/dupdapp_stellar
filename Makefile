@@ -3,7 +3,7 @@
 CONTRACTS_DIR := dupdub_contracts
 WASM_DIR      := $(CONTRACTS_DIR)/target/wasm32v1-none/release
 WASM_SIZE_LIMIT := 65536  # 64 KB
-WASM_SIZE_WARN  := 52428  # 80% of 64 KB
+WASM_SIZE_WARN  := 49152  # 48 KB (75% of 64 KB) early-warning threshold
 WASM_SIZE_REPORT := $(CONTRACTS_DIR)/wasm-size-report.md
 WASM_SIZE_CHECK := scripts/check-wasm-size.sh
 
@@ -89,7 +89,9 @@ build-optimised: build
 	@echo "Done."
 
 # Enforce the per-contract WASM size budget (WASM_SIZE_LIMIT). Reports the
-# size of every contract and fails if any exceeds the limit.
+# size of every contract and fails if any exceeds the limit. Contracts over
+# WASM_SIZE_WARN (75% of the budget) emit an early-warning alert without
+# failing the build.
 check-wasm-size: build-optimised
 	@WASM_DIR=$(WASM_DIR) WASM_SIZE_LIMIT=$(WASM_SIZE_LIMIT) WASM_SIZE_WARN=$(WASM_SIZE_WARN) bash $(WASM_SIZE_CHECK)
 
@@ -104,7 +106,7 @@ lint-audit:
 
 # Emit a Markdown table of contract WASM sizes for posting to a PR comment.
 # Columns: contract | current size | previous size | delta.
-# Contracts over 80% of the budget are highlighted yellow; over budget red.
+# Contracts over 75% of the budget are highlighted yellow; over budget red.
 # Set PREVIOUS_WASM_DIR to a directory of baseline WASMs to compute deltas.
 wasm-size-report: build-optimised
 	@echo "Generating WASM size report -> $(WASM_SIZE_REPORT)"
