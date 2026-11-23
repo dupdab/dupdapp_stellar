@@ -2,7 +2,10 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env,
+    Vec,
+};
 
 const BPS_DENOMINATOR: i128 = 10_000;
 const MAX_FEE_RECIPIENTS: u32 = 10;
@@ -29,6 +32,13 @@ pub struct PendingRecipientUpdate {
     pub execute_after: u32,
 }
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    InvalidRecipient = 1,
+}
+
 #[contracttype]
 enum DataKey {
     Admin,
@@ -36,6 +46,7 @@ enum DataKey {
     UsdcToken,
     AllowedCaller,
     PendingRecipients,
+    AllowedRecipient(Address),
 }
 
 #[contracttype]
@@ -67,6 +78,12 @@ impl FeeDistributorContract {
         env.storage()
             .instance()
             .set(&DataKey::AllowedCaller, &allowed_caller);
+        // Seed the allowlist with the initial recipients.
+        for recipient in recipients.iter() {
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedRecipient(recipient.address), &true);
+        }
     }
 
     /// Pull and split a fee atomically. The final recipient receives any
@@ -81,6 +98,11 @@ impl FeeDistributorContract {
             .instance()
             .get(&DataKey::Recipients)
             .expect("recipients not configured");
+        for recipient in recipients.iter() {
+            if !Self::is_allowed_recipient(env.clone(), recipient.address) {
+                panic_with_error!(&env, Error::InvalidRecipient);
+            }
+        }
         let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
         let token = token::Client::new(&env, &usdc_token);
         let contract_address = env.current_contract_address();
@@ -187,6 +209,34 @@ impl FeeDistributorContract {
         env.storage().instance().remove(&DataKey::PendingRecipients);
         env.events()
             .publish(("FEE_DISTRIBUTOR", "recipients_update_cancelled"), ());
+    }
+
+    /// Add an address to the recipient allowlist. Admin-only.
+    pub fn add_allowed_recipient(env: Env, caller: Address, recipient: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedRecipient(recipient.clone()), &true);
+        env.events()
+            .publish(("FEE_DISTRIBUTOR", "recipient_allowed"), recipient);
+    }
+
+    /// Remove an address from the recipient allowlist. Admin-only.
+    pub fn remove_allowed_recipient(env: Env, caller: Address, recipient: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedRecipient(recipient.clone()));
+        env.events()
+            .publish(("FEE_DISTRIBUTOR", "recipient_disallowed"), recipient);
+    }
+
+    pub fn is_allowed_recipient(env: Env, recipient: Address) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::AllowedRecipient(recipient))
     }
 
     /// Rotate the address permitted to invoke `distribute`. Admin-only.

@@ -299,3 +299,62 @@ fn test_zero_amount_rejected() {
     let s = default_setup();
     s.client.distribute(&s.caller, &0);
 }
+
+// ── recipient allowlist ──────────────────────────────────────────────────────
+
+#[test]
+fn test_initial_recipients_are_allowlisted() {
+    let s = default_setup();
+    assert!(s.client.is_allowed_recipient(&s.treasury));
+    assert!(s.client.is_allowed_recipient(&s.lp));
+    assert!(!s.client.is_allowed_recipient(&Address::generate(&s.env)));
+}
+
+#[test]
+fn test_distribute_fails_for_recipient_not_on_allowlist() {
+    let s = default_setup();
+    s.client.remove_allowed_recipient(&s.admin, &s.lp);
+    assert!(s.client.try_distribute(&s.caller, &10_000).is_err());
+    assert_eq!(s.token.balance(&s.treasury), 0);
+
+    s.client.add_allowed_recipient(&s.admin, &s.lp);
+    s.client.distribute(&s.caller, &10_000);
+    assert_eq!(s.token.balance(&s.lp), 5_000);
+}
+
+#[test]
+fn test_distribute_after_update_requires_new_recipient_allowlisted() {
+    let s = default_setup();
+    let replacement = Address::generate(&s.env);
+    let pending = schedule_update(
+        &s,
+        vec![
+            &s.env,
+            FeeRecipient {
+                address: replacement.clone(),
+                share_bps: 10_000,
+            },
+        ],
+    );
+    s.env.ledger().set_sequence_number(pending.execute_after);
+    s.client.apply_recipients(&s.admin);
+    assert!(s.client.try_distribute(&s.caller, &10_000).is_err());
+
+    s.client.add_allowed_recipient(&s.admin, &replacement);
+    s.client.distribute(&s.caller, &10_000);
+    assert_eq!(s.token.balance(&replacement), 10_000);
+}
+
+#[test]
+fn test_non_admin_cannot_manage_allowlist() {
+    let s = default_setup();
+    let stranger = Address::generate(&s.env);
+    assert!(s
+        .client
+        .try_add_allowed_recipient(&stranger, &Address::generate(&s.env))
+        .is_err());
+    assert!(s
+        .client
+        .try_remove_allowed_recipient(&stranger, &s.lp)
+        .is_err());
+}
