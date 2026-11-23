@@ -17,8 +17,13 @@ Role-based authorization registry used by the other contracts in this workspace 
 
 - Admin added — emitted when a new admin address is granted rights.
 - Admin removed — emitted when an admin address is revoked.
+- `AdminAuthFailed { caller, function, timestamp }` — emitted on every failed admin authentication attempt. `caller` is the address that attempted the privileged operation, `function` identifies the operation being attempted, and `timestamp` is the ledger timestamp at the time of failure.
 
 Consumers should index these events to keep off-chain views of admin membership in sync.
+
+### Auth failure monitoring
+
+Because failed admin authentication attempts emit `AdminAuthFailed`, brute-force attempts against admin keys are visible on-chain. Backends should index these events and alert when the number of failures from a single `caller` (or against a single `function`) crosses a configured threshold within a time window. Successful authentication does not emit this event, so the stream is a clean signal of rejected attempts.
 
 ## Admin operations
 

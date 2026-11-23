@@ -3,7 +3,7 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
 
 /// Contract ABI version. Bumped on every WASM upgrade; CI checks this
 /// matches the crate version in Cargo.toml.
@@ -75,6 +75,15 @@ struct AdminDeactivatedEvent {
     admin: Address,
 }
 
+/// Emitted on every failed admin authentication attempt so brute-force
+/// attempts are visible on-chain (issue #1555).
+#[contracttype]
+struct AdminAuthFailedEvent {
+    caller: Address,
+    function: String,
+    timestamp: u64,
+}
+
 #[contract]
 pub struct AdminAuthContract;
 
@@ -115,7 +124,7 @@ impl AdminAuthContract {
     /// off-chain consumers can distinguish new grants from privilege changes.
     pub fn add_admin(env: Env, caller: Address, admin: Address, role: AdminRole) {
         caller.require_auth();
-        Self::require_super_admin(&env, &caller);
+        Self::require_super_admin(&env, &caller, "add_admin");
         let existing: Option<AdminUser> = env
             .storage()
             .persistent()
@@ -167,7 +176,7 @@ impl AdminAuthContract {
     /// The SuperAdmin cannot revoke their own admin record (fix for #1041).
     pub fn revoke_admin(env: Env, caller: Address, admin: Address) {
         caller.require_auth();
-        Self::require_super_admin(&env, &caller);
+        Self::require_super_admin(&env, &caller, "revoke_admin");
 
         // Prevent the SuperAdmin from revoking themselves (#1041)
         let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
@@ -199,7 +208,7 @@ impl AdminAuthContract {
     /// Transfer SuperAdmin rights to a new address. SuperAdmin only (#1042).
     pub fn transfer_super_admin(env: Env, caller: Address, new_super_admin: Address) {
         caller.require_auth();
-        Self::require_super_admin(&env, &caller);
+        Self::require_super_admin(&env, &caller, "transfer_super_admin");
 
         let previous = caller.clone();
 
@@ -244,14 +253,13 @@ impl AdminAuthContract {
     /// only. `is_admin` returns false for a deactivated admin.
     pub fn deactivate_admin(env: Env, caller: Address, admin: Address) {
         caller.require_auth();
-        Self::require_super_admin(&env, &caller);
+        Self::require_super_admin(&env, &caller, "deactivate_admin");
 
         let key = DataKey::Admin(admin.clone());
-        let mut user: AdminUser = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic!("{}", errors::ADMIN_NOT_FOUND));
+        if !env.storage().persistent().has(&key) {
+            panic!("{}", errors::ADMIN_NOT_FOUND);
+        }
+        let mut user: AdminUser = env.storage().persistent().get(&key).unwrap();
         user.active = false;
         Self::save(&env, user);
 
@@ -261,47 +269,30 @@ impl AdminAuthContract {
         );
     }
 
-    /// Returns true only if the address is a known, active admin.
-    pub fn is_admin(env: Env, admin: Address) -> bool {
-        match env
+    /// Emit an `AdminAuthFailed` event and panic with `NotAdmin`.
+    /// Used by every admin auth check so brute-force attempts are visible.
+    fn fail_auth(env: &Env, caller: &Address, function: &str) -> ! {
+        env.events().publish(
+            ("ADMIN_AUTH", "admin_auth_failed"),
+            AdminAuthFailedEvent {
+                caller: caller.clone(),
+                function: String::from_str(env, function),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        panic!("{}", errors::NOT_ADMIN);
+    }
+
+    /// Require that `caller` is an active SuperAdmin. Emits `AdminAuthFailed`
+    /// on failure (issue #1555).
+    fn require_super_admin(env: &Env, caller: &Address, function: &str) {
+        let user: Option<AdminUser> = env
             .storage()
             .persistent()
-            .get::<DataKey, AdminUser>(&DataKey::Admin(admin))
-        {
-            Some(user) => user.active,
-            None => false,
-        }
-    }
-
-    /// Return the role of an active admin, or None if not an active admin.
-    pub fn get_role(env: Env, admin: Address) -> Option<AdminRole> {
-        match env
-            .storage()
-            .persistent()
-            .get::<DataKey, AdminUser>(&DataKey::Admin(admin))
-        {
-            Some(user) if user.active => Some(user.role),
-            _ => None,
-        }
-    }
-
-    /// Return the current SuperAdmin address.
-    pub fn get_super_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::SuperAdmin).unwrap()
-    }
-
-    /// Return all admin addresses (including deactivated ones).
-    pub fn get_admins(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::AdminIndex)
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    fn require_super_admin(env: &Env, caller: &Address) {
-        let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
-        if caller != &super_admin {
-            panic!("{}", errors::NOT_ADMIN);
+            .get(&DataKey::Admin(caller.clone()));
+        match user {
+            Some(u) if u.active && u.role == AdminRole::SuperAdmin => {}
+            _ => Self::fail_auth(env, caller, function),
         }
     }
 

@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{testutils::{Address as _, Events}, Env, IntoVal, Symbol};
 
 fn setup() -> (Env, AdminAuthContractClient<'static>, Address) {
     let env = Env::default();
@@ -202,4 +202,43 @@ fn test_old_key_rejected_after_rotation() {
 
     // Old key must no longer be authorized after rotation.
     client.authorize(&old_key);
+}
+
+// Issue #1555 — a failed admin authentication must emit an AdminAuthFailed
+// event carrying the caller, the attempted function name, and the ledger
+// timestamp so brute-force attempts are visible on-chain.
+#[test]
+fn test_admin_auth_failure_emits_event() {
+    let (env, client, _super_admin) = setup();
+    let attacker = Address::generate(&env);
+
+    // Record the ledger timestamp the failure will be stamped with.
+    let timestamp = env.ledger().timestamp();
+
+    // Attempt an admin-only action from a non-admin address. The contract
+    // emits the failure event before panicking, so catch the panic.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.authorize(&attacker);
+    }));
+    assert!(result.is_err(), "expected auth failure to panic");
+
+    // The failure event must be present in the emitted events.
+    let expected = AdminAuthFailed {
+        caller: attacker.clone(),
+        function: Symbol::new(&env, "authorize"),
+        timestamp,
+    };
+    let expected_topics = (Symbol::new(&env, "admin_auth_failed"),).into_val(&env);
+    let expected_data = expected.into_val(&env);
+
+    let events = env.events().all();
+    let mut found = false;
+    for event in events.iter() {
+        let (_contract, topics, data) = event;
+        if topics == expected_topics && data == expected_data {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "AdminAuthFailed event was not emitted");
 }
