@@ -8,6 +8,6 @@ import { ContractTxMetricsService } from './contract-tx-metrics.service';
 @Module({
   imports: [TypeOrmModule.forFeature([SorobanIndexedEvent, SorobanIndexerState])],
   providers: [SorobanEventsService, ContractTxMetricsService],
-  exports: [ContractTxMetricsService],
+  exports: [SorobanEventsService, ContractTxMetricsService],
 })
 export class SorobanEventsModule {}

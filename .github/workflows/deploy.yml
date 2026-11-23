@@ -12,7 +12,62 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Deploy contracts
-        run: echo "Deploying contracts..."
+        id: deploy
+        env:
+          DEPLOYER: ${{ github.actor }}
+          NETWORK: ${{ github.ref == 'refs/heads/main' && 'mainnet' || 'testnet' }}
+        run: |
+          echo "Deploying contracts..."
+          TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          CONTRACT_NAME="${CONTRACT_NAME:-dabdub}"
+          WASM_HASH="${WASM_HASH:-$(git rev-parse HEAD)}"
+          echo "contract_name=${CONTRACT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "wasm_hash=${WASM_HASH}" >> "$GITHUB_OUTPUT"
+          echo "deployer=${DEPLOYER}" >> "$GITHUB_OUTPUT"
+          echo "timestamp=${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+          echo "network=${NETWORK}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Contract Deployment::contract_name=${CONTRACT_NAME} wasm_hash=${WASM_HASH} deployer=${DEPLOYER} timestamp=${TIMESTAMP} network=${NETWORK}"
+
+      - name: Emit deployment event
+        env:
+          CONTRACT_NAME: ${{ steps.deploy.outputs.contract_name }}
+          WASM_HASH: ${{ steps.deploy.outputs.wasm_hash }}
+          DEPLOYER: ${{ steps.deploy.outputs.deployer }}
+          TIMESTAMP: ${{ steps.deploy.outputs.timestamp }}
+          NETWORK: ${{ steps.deploy.outputs.network }}
+        run: |
+          mkdir -p observability
+          EVENT_FILE="observability/deployment-event.json"
+          cat > "$EVENT_FILE" <<EOF
+          {
+            "event": "contract_deployment",
+            "contract_name": "${CONTRACT_NAME}",
+            "wasm_hash": "${WASM_HASH}",
+            "deployer": "${DEPLOYER}",
+            "timestamp": "${TIMESTAMP}",
+            "network": "${NETWORK}"
+          }
+          EOF
+          echo "Emitted deployment event:"
+          cat "$EVENT_FILE"
+
+      - name: Alert admin on mainnet deployment
+        if: steps.deploy.outputs.network == 'mainnet'
+        env:
+          CONTRACT_NAME: ${{ steps.deploy.outputs.contract_name }}
+          WASM_HASH: ${{ steps.deploy.outputs.wasm_hash }}
+          DEPLOYER: ${{ steps.deploy.outputs.deployer }}
+          TIMESTAMP: ${{ steps.deploy.outputs.timestamp }}
+          ADMIN_ALERT_WEBHOOK: ${{ secrets.ADMIN_ALERT_WEBHOOK }}
+        run: |
+          echo "::warning title=Mainnet Deployment::contract_name=${CONTRACT_NAME} wasm_hash=${WASM_HASH} deployer=${DEPLOYER} timestamp=${TIMESTAMP}"
+          if [ -n "$ADMIN_ALERT_WEBHOOK" ]; then
+            curl -fsS -X POST "$ADMIN_ALERT_WEBHOOK" \
+              -H 'Content-Type: application/json' \
+              -d "{\"event\":\"contract_deployment\",\"network\":\"mainnet\",\"contract_name\":\"${CONTRACT_NAME}\",\"wasm_hash\":\"${WASM_HASH}\",\"deployer\":\"${DEPLOYER}\",\"timestamp\":\"${TIMESTAMP}\"}"
+          else
+            echo "ADMIN_ALERT_WEBHOOK not configured; mainnet deployment alert surfaced via workflow warning."
+          fi
 
       - name: Publish observability assets
         run: |

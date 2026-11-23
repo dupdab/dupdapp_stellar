@@ -26,8 +26,16 @@ interface RpcResponse {
   error?: { code: number; message: string };
 }
 
+interface DeploymentEvent {
+  contract_name: string;
+  wasm_hash: string;
+  deployer: string;
+  timestamp: string;
+}
+
 const INDEXER_STATE_ID = 'contract-events';
 const PAGE_SIZE = 100;
+const DEPLOYMENT_TOPIC = 'contract_deployed';
 
 @Injectable()
 export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
@@ -36,6 +44,8 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
   private readonly contractIds: string[];
   private readonly pollIntervalMs: number;
   private readonly initialLedger: number;
+  private readonly network: string;
+  private readonly adminAlertWebhookUrl: string | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
   private polling = false;
   private requestId = 0;
@@ -43,6 +53,9 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
   // Observability: contract transaction failure counters (issue #1589).
   private readonly txFailures = new Map<string, number>();
   private txSuccesses = 0;
+
+  // Observability: contract deployment counters (issue #1591).
+  private deploymentCount = 0;
 
   constructor(
     config: ConfigService,
@@ -67,6 +80,8 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
     }
     this.pollIntervalMs = pollIntervalMs;
     this.initialLedger = initialLedger;
+    this.network = config.get<string>('STELLAR_NETWORK') ?? 'testnet';
+    this.adminAlertWebhookUrl = config.get<string>('ADMIN_ALERT_WEBHOOK_URL');
   }
 
   onModuleInit(): void {
@@ -100,6 +115,9 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
       '# HELP contract_tx_successes_total Total number of successful contract transactions.',
       '# TYPE contract_tx_successes_total counter',
       `contract_tx_successes_total ${this.txSuccesses}`,
+      '# HELP contract_deployments_total Total number of captured contract deployment events.',
+      '# TYPE contract_deployments_total counter',
+      `contract_deployments_total ${this.deploymentCount}`,
     );
     return lines.join('\n');
   }
@@ -110,6 +128,102 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
 
   private recordTxSuccess(): void {
     this.txSuccesses += 1;
+  }
+
+  /**
+   * Captures a structured contract deployment event (issue #1591).
+   * Emits a structured log line and, on mainnet, alerts the admin.
+   */
+  private async recordDeployment(event: RpcEvent): Promise<void> {
+    const deployment = this.parseDeployment(event);
+    if (!deployment) return;
+
+    this.deploymentCount += 1;
+    this.logger.log(
+      `Contract deployment captured: ${JSON.stringify({
+        contract_name: deployment.contract_name,
+        wasm_hash: deployment.wasm_hash,
+        deployer: deployment.deployer,
+        timestamp: deployment.timestamp,
+        contract_id: event.contractId,
+        ledger: event.ledger,
+        tx_hash: event.txHash,
+        network: this.network,
+      })}`,
+    );
+
+    if (this.network === 'mainnet' || this.network === 'public') {
+      await this.alertAdmin(deployment, event);
+    }
+  }
+
+  private parseDeployment(event: RpcEvent): DeploymentEvent | null {
+    const topics = Array.isArray(event.topic) ? event.topic : [];
+    const isDeployment = topics.some(
+      (topic) => typeof topic === 'string' && topic === DEPLOYMENT_TOPIC,
+    );
+    if (!isDeployment) return null;
+
+    const value = event.value;
+    if (!value || typeof value !== 'object') return null;
+    const data = value as Record<string, unknown>;
+    const contractName = data.contract_name ?? data.contractName;
+    const wasmHash = data.wasm_hash ?? data.wasmHash;
+    const deployer = data.deployer;
+    const timestamp = data.timestamp;
+    if (
+      typeof contractName !== 'string' ||
+      typeof wasmHash !== 'string' ||
+      typeof deployer !== 'string'
+    ) {
+      return null;
+    }
+    return {
+      contract_name: contractName,
+      wasm_hash: wasmHash,
+      deployer,
+      timestamp:
+        typeof timestamp === 'string'
+          ? timestamp
+          : typeof timestamp === 'number'
+            ? new Date(timestamp).toISOString()
+            : new Date().toISOString(),
+    };
+  }
+
+  private async alertAdmin(deployment: DeploymentEvent, event: RpcEvent): Promise<void> {
+    const message =
+      `Mainnet contract deployment: ${deployment.contract_name} ` +
+      `(wasm ${deployment.wasm_hash}) by ${deployment.deployer} at ${deployment.timestamp} ` +
+      `[tx ${event.txHash}, ledger ${event.ledger}]`;
+    this.logger.warn(`ADMIN ALERT: ${message}`);
+
+    if (!this.adminAlertWebhookUrl) return;
+    try {
+      const response = await fetch(this.adminAlertWebhookUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          severity: 'critical',
+          event: 'contract_deployed',
+          network: this.network,
+          contract_name: deployment.contract_name,
+          wasm_hash: deployment.wasm_hash,
+          deployer: deployment.deployer,
+          timestamp: deployment.timestamp,
+          contract_id: event.contractId,
+          ledger: event.ledger,
+          tx_hash: event.txHash,
+          message,
+        }),
+      });
+      if (!response.ok) {
+        this.logger.error(`Admin deployment alert failed: HTTP ${response.status}`);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Admin deployment alert failed: ${detail}`);
+    }
   }
 
   private async pollSafely(): Promise<void> {
@@ -169,6 +283,10 @@ export class SorobanEventsService implements OnModuleInit, OnModuleDestroy {
         });
       });
       await this.events.upsert(page, ['id']);
+
+      for (const event of result.events) {
+        await this.recordDeployment(event);
+      }
 
       const nextCursor = result.events[result.events.length - 1].pagingToken;
       if (!nextCursor) {
