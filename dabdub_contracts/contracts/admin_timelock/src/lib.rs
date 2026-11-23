@@ -5,6 +5,7 @@ mod test;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
 
 const DEFAULT_MIN_DELAY_SECONDS: u64 = 48 * 60 * 60;
+const MIN_SIGNER_ROTATION_DELAY_SECONDS: u64 = 48 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -74,6 +75,26 @@ impl AdminTimelockContract {
 
     pub fn schedule_change(env: Env, caller: Address, action_id: BytesN<32>) -> TimelockAction {
         Self::queue_action(env, caller, action_id)
+    }
+
+    pub fn queue_signer_rotation(
+        env: Env,
+        caller: Address,
+        action_id: BytesN<32>,
+    ) -> TimelockAction {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let now = env.ledger().timestamp();
+        let delay = Self::get_min_delay(env.clone()).max(MIN_SIGNER_ROTATION_DELAY_SECONDS);
+        let action = TimelockAction {
+            action_id: action_id.clone(),
+            queued_at: now,
+            execute_after: now.saturating_add(delay),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAction(action_id.clone()), &action);
+        action
     }
 
     pub fn cancel_timelock(env: Env, caller: Address, action_id: BytesN<32>) {

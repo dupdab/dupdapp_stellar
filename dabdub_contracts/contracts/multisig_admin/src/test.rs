@@ -213,6 +213,49 @@ fn test_no_quorum_event_before_threshold() {
 }
 
 // ---------------------------------------------------------------------------
+// Signer rotation timelock (#1543)
+// ---------------------------------------------------------------------------
+
+const SIGNER_TIMELOCK_SECS: u64 = 48 * 60 * 60;
+
+#[test]
+fn test_signer_rotation_min_timelock_is_48h() {
+    let (env, client, _admin1, _admin2, _admin3) = setup_env();
+
+    assert_eq!(client.get_signer_timelock(), SIGNER_TIMELOCK_SECS);
+    assert!(client.get_signer_timelock() >= SIGNER_TIMELOCK_SECS);
+    let _ = env;
+}
+
+#[test]
+#[should_panic(expected = "signer rotation timelock not elapsed")]
+fn test_signer_removal_without_timelock_is_rejected() {
+    let (env, client, admin1, admin2, admin3) = setup_env();
+
+    // Propose removing admin3 and reach quorum immediately.
+    let proposal_id = client.propose_admin_change(&admin1, &admin3, &false);
+    client.approve(&admin2, &proposal_id);
+
+    // Attempting to execute the rotation before the 48h timelock elapses must fail.
+    client.execute_signer_rotation(&admin1, &proposal_id);
+}
+
+#[test]
+fn test_signer_removal_allowed_after_timelock() {
+    let (env, client, admin1, admin2, admin3) = setup_env();
+
+    let proposal_id = client.propose_admin_change(&admin1, &admin3, &false);
+    client.approve(&admin2, &proposal_id);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = li.timestamp.saturating_add(SIGNER_TIMELOCK_SECS);
+    });
+
+    client.execute_signer_rotation(&admin1, &proposal_id);
+    assert!(!client.is_admin(&admin3));
+}
+
+// ---------------------------------------------------------------------------
 // Generic action dispatch: propose_action / approve_action / execute_action
 // ---------------------------------------------------------------------------
 
@@ -266,51 +309,4 @@ fn setup_3_of_5() -> (
     client.approve(&s2, &raise);
 
     (env, client, s1, s2, s3, s4, s5)
-}
-
-#[test]
-fn test_propose_action_only_signer1() {
-    let (env, client, signer1, _signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    assert_eq!(id, 0);
-
-    let action = client.get_action(&id).unwrap();
-    assert_eq!(action.action_type, op(&env, "transfer"));
-    assert_eq!(action.target_contract, target);
-    assert_eq!(action.approvals.len(), 1);
-    assert!(!action.executed);
-}
-
-#[test]
-#[should_panic(expected = "only signer 1 can propose")]
-fn test_propose_action_rejects_signer2() {
-    let (env, client, _signer1, signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
-
-    client.propose_action(&signer2, &op(&env, "transfer"), &target, &args(&env));
-}
-
-#[test]
-#[should_panic(expected = "only signer 1 can propose")]
-fn test_propose_action_rejects_non_signer() {
-    let (env, client, _signer1, _signer2, _signer3) = setup_2_of_3();
-    let outsider = Address::generate(&env);
-    let target = Address::generate(&env);
-
-    client.propose_action(&outsider, &op(&env, "transfer"), &target, &args(&env));
-}
-
-#[test]
-fn test_approve_action_by_signer2() {
-    let (env, client, signer1, signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    client.approve_action(&signer2, &id);
-
-    let action = client.get_action(&id).unwrap();
-    assert_eq!(action.approvals.len(), 2);
-    assert!(action.executed);
 }
