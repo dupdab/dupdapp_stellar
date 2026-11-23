@@ -1,5 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Counter, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
+import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
+
+/**
+ * Number of ledgers the Soroban event indexer may fall behind before an alert
+ * should fire (indexed_ledger < current_ledger - threshold).
+ */
+export const SOROBAN_INDEXER_LAG_THRESHOLD = 1000;
 
 @Injectable()
 export class SorobanEventsService {
@@ -28,6 +34,12 @@ export class SorobanEventsService {
     registers: [this.registry],
   });
 
+  private readonly sorobanIndexerLagLedgers = new Gauge({
+    name: 'soroban_indexer_lag_ledgers',
+    help: 'Number of ledgers the Soroban event indexer is behind the current ledger',
+    registers: [this.registry],
+  });
+
   constructor() {
     collectDefaultMetrics({ register: this.registry });
   }
@@ -45,6 +57,22 @@ export class SorobanEventsService {
    */
   recordError(errorType: string): void {
     this.contractErrorsTotal.inc({ error_type: errorType });
+  }
+
+  /**
+   * Updates the indexer lag gauge from the indexed and current ledger numbers.
+   * Emits a warning log when the indexer falls behind the alert threshold so
+   * PagerDuty/Slack routing (see observability alert rules) can be triggered.
+   */
+  recordIndexerProgress(indexedLedger: number, currentLedger: number): void {
+    const lag = Math.max(0, currentLedger - indexedLedger);
+    this.sorobanIndexerLagLedgers.set(lag);
+
+    if (indexedLedger < currentLedger - SOROBAN_INDEXER_LAG_THRESHOLD) {
+      this.logger.warn(
+        `Soroban event indexer is behind: indexed_ledger=${indexedLedger} current_ledger=${currentLedger} lag=${lag} (threshold=${SOROBAN_INDEXER_LAG_THRESHOLD})`,
+      );
+    }
   }
 
   /**
