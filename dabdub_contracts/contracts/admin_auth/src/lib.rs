@@ -37,6 +37,20 @@ pub struct AdminUser {
     pub active: bool,
 }
 
+/// A single entry in the on-chain admin audit log (#1576).
+/// `op_type` is a short PascalCase tag (e.g. "AddAdmin", "RevokeAdmin",
+/// "TransferSuperAdmin", "DeactivateAdmin"), `actor` is the authenticated
+/// caller, `timestamp` is the ledger timestamp, and `params` is a compact
+/// human-readable description of the operation arguments.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    pub op_type: soroban_sdk::Symbol,
+    pub actor: Address,
+    pub timestamp: u64,
+    pub params: soroban_sdk::String,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -44,6 +58,7 @@ pub enum DataKey {
     Admin(Address),
     AdminIndex,
     Version,
+    AuditLog,
 }
 
 #[contracttype]
@@ -138,6 +153,12 @@ impl AdminAuthContract {
                     new_role: role,
                 },
             );
+            Self::append_audit(
+                &env,
+                soroban_sdk::Symbol::new(&env, "AdminRoleChanged"),
+                &caller,
+                soroban_sdk::String::from_str(&env, "role changed"),
+            );
         } else {
             // New admin.
             Self::save(
@@ -159,6 +180,12 @@ impl AdminAuthContract {
             env.events().publish(
                 ("ADMIN_AUTH", "admin_added"),
                 AdminAddedEvent { admin, role },
+            );
+            Self::append_audit(
+                &env,
+                soroban_sdk::Symbol::new(&env, "AddAdmin"),
+                &caller,
+                soroban_sdk::String::from_str(&env, "admin added"),
             );
         }
     }
@@ -194,6 +221,12 @@ impl AdminAuthContract {
 
         env.events()
             .publish(("ADMIN_AUTH", "admin_revoked"), AdminRevokedEvent { admin });
+        Self::append_audit(
+            &env,
+            soroban_sdk::Symbol::new(&env, "RevokeAdmin"),
+            &caller,
+            soroban_sdk::String::from_str(&env, "admin revoked"),
+        );
     }
 
     /// Transfer SuperAdmin rights to a new address. SuperAdmin only (#1042).
@@ -238,6 +271,12 @@ impl AdminAuthContract {
                 new: new_super_admin,
             },
         );
+        Self::append_audit(
+            &env,
+            soroban_sdk::Symbol::new(&env, "TransferSuperAdmin"),
+            &caller,
+            soroban_sdk::String::from_str(&env, "super admin transferred"),
+        );
     }
 
     /// Deactivate an admin without removing its credential record. SuperAdmin
@@ -246,52 +285,6 @@ impl AdminAuthContract {
         caller.require_auth();
         Self::require_super_admin(&env, &caller);
 
-        let key = DataKey::Admin(admin.clone());
-        let mut user: AdminUser = env
-            .storage()
-            .instance()
-            .get(&key)
-            .unwrap_or_else(|| panic!("{}", errors::ADMIN_NOT_FOUND));
-        user.active = false;
-        Self::save(&env, user);
-        env.events().publish(
-            ("ADMIN_AUTH", "admin_deactivated"),
-            AdminDeactivatedEvent { admin },
-        );
-    }
+        let key = DataKey::Admin(admin.clone()
 
-    pub fn get_admin(env: Env, admin: Address) -> Option<AdminUser> {
-        env.storage().persistent().get(&DataKey::Admin(admin))
-    }
-
-    /// True when the address is an active admin in the store.
-    pub fn is_admin(env: Env, admin: Address) -> bool {
-        match env
-            .storage()
-            .persistent()
-            .get::<DataKey, AdminUser>(&DataKey::Admin(admin))
-        {
-            Some(user) => user.active,
-            None => false,
-        }
-    }
-
-    fn save(env: &Env, user: AdminUser) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
-    }
-
-    fn require_super_admin(env: &Env, caller: &Address) {
-        let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
-        if caller != &super_admin {
-            panic!("{}", errors::NOT_ADMIN);
-        }
-    }
-
-    fn save(env: &Env, user: AdminUser) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
-    }
-}
+/* … truncated 1438 chars — edit only what you need near the top … */

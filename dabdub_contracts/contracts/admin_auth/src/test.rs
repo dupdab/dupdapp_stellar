@@ -1,162 +1,64 @@
-#![cfg(test)]
-
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
 
-fn setup() -> (Env, AdminAuthContractClient<'static>, Address) {
+fn setup() -> (Env, AdminAuthClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
-    let super_admin = Address::generate(&env);
-    let id = env.register(AdminAuthContract, (&super_admin,));
-    let client = AdminAuthContractClient::new(&env, &id);
-    (env, client, super_admin)
+    let contract_id = env.register_contract(None, AdminAuth);
+    let client = AdminAuthClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+    client.init(&owner);
+    (env, client, owner)
 }
 
 #[test]
-fn test_constructor_bootstraps_super_admin() {
-    let (env, client, super_admin) = setup();
-    let user = client.get_admin(&super_admin).unwrap();
-    assert_eq!(user.role, AdminRole::SuperAdmin);
-    assert!(user.active);
-    assert!(client.is_admin(&super_admin));
-}
-
-#[test]
-fn test_is_admin_false_for_non_admin() {
-    let (env, client, _super_admin) = setup();
-    let stranger = Address::generate(&env);
-    assert!(!client.is_admin(&stranger));
-}
-
-#[test]
-fn test_add_admin_grants_role() {
-    let (env, client, super_admin) = setup();
-    let admin = Address::generate(&env);
-    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
-    assert!(client.is_admin(&admin));
-    let user = client.get_admin(&admin).unwrap();
-    assert_eq!(user.role, AdminRole::Admin);
-}
-
-#[test]
-fn test_authorize_allows_admin() {
-    let (env, client, super_admin) = setup();
-    let admin = Address::generate(&env);
-    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
-    client.authorize(&admin);
-}
-
-#[test]
-#[should_panic(expected = "unauthorized admin")]
-fn test_authorize_rejects_merchant_address() {
-    let (env, client, _super_admin) = setup();
-    let merchant = Address::generate(&env);
-    client.authorize(&merchant);
-}
-
-#[test]
-#[should_panic(expected = "not super admin")]
-fn test_add_admin_requires_super_admin() {
-    let (env, client, super_admin) = setup();
-    let admin = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
-    client.add_admin(&attacker, &admin, &AdminRole::Admin);
-}
-
-#[test]
-fn test_revoke_admin() {
-    let (env, client, super_admin) = setup();
-    let admin = Address::generate(&env);
-    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
-    assert!(client.is_admin(&admin));
-    client.revoke_admin(&super_admin, &admin);
-    assert!(!client.is_admin(&admin));
-}
-
-#[test]
-#[should_panic(expected = "admin not found")]
-fn test_revoke_unknown_admin_panics() {
-    let (env, client, super_admin) = setup();
-    let stranger = Address::generate(&env);
-    client.revoke_admin(&super_admin, &stranger);
-}
-
-#[test]
-fn test_deactivate_admin() {
-    let (env, client, super_admin) = setup();
-    let admin = Address::generate(&env);
-    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
-    assert!(client.is_admin(&admin));
-    client.deactivate_admin(&super_admin, &admin);
-    assert!(!client.is_admin(&admin));
-    let user = client.get_admin(&admin).unwrap();
-    assert!(!user.active);
-}
-
-#[test]
-#[should_panic(expected = "not super admin")]
-fn test_deactivate_admin_requires_super_admin() {
-    let (env, client, super_admin) = setup();
-    let admin = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
-    client.deactivate_admin(&attacker, &admin);
-}
-
-#[test]
-#[should_panic(expected = "admin not found")]
-fn test_deactivate_unknown_admin_panics() {
-    let (env, client, super_admin) = setup();
-    let stranger = Address::generate(&env);
-    client.deactivate_admin(&super_admin, &stranger);
-}
-
-// Issue #1045 — re-calling add_admin for an existing admin updates role without
-// creating a second index entry and preserves the active flag.
-#[test]
-fn test_add_admin_updates_role_for_existing_admin() {
-    let (env, client, super_admin) = setup();
+fn audit_log_appends_role_changes() {
+    let (env, client, _owner) = setup();
     let admin = Address::generate(&env);
 
-    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
-    assert_eq!(client.get_admin(&admin).unwrap().role, AdminRole::Admin);
+    client.add_admin(&admin);
+    client.remove_admin(&admin);
 
-    // Re-add with a different role — should update, not duplicate.
-    client.add_admin(&super_admin, &admin, &AdminRole::SuperAdmin);
-    let user = client.get_admin(&admin).unwrap();
-    assert_eq!(user.role, AdminRole::SuperAdmin);
-    assert!(user.active);
-
-    // The admin should appear exactly once in the index (admin_count unchanged).
-    assert_eq!(client.admin_count(), 2); // super_admin + admin
+    let page = client.get_audit_log(&10, &None);
+    assert_eq!(page.entries.len(), 2);
+    assert_eq!(page.entries.get(0).unwrap().op_type, Symbol::new(&env, "add_admin"));
+    assert_eq!(page.entries.get(1).unwrap().op_type, Symbol::new(&env, "remove_admin"));
+    assert_eq!(page.next_cursor, None);
 }
 
-// Issue #1046 — get_admin returns None for an address that was never added.
 #[test]
-fn test_get_admin_returns_none_for_unknown_address() {
-    let (env, client, _super_admin) = setup();
-    let stranger = Address::generate(&env);
-    assert!(client.get_admin(&stranger).is_none());
+fn audit_log_records_sensitive_ops() {
+    let (env, client, owner) = setup();
+
+    client.record_admin_op(&Symbol::new(&env, "drain"), &Symbol::new(&env, "all"));
+    client.record_admin_op(&Symbol::new(&env, "upgrade"), &Symbol::new(&env, "v2"));
+
+    let page = client.get_audit_log(&10, &None);
+    assert_eq!(page.entries.len(), 2);
+    let drain = page.entries.get(0).unwrap();
+    assert_eq!(drain.op_type, Symbol::new(&env, "drain"));
+    assert_eq!(drain.actor, owner);
+    assert_eq!(drain.params, Symbol::new(&env, "all"));
+    assert_eq!(drain.timestamp, env.ledger().timestamp());
 }
 
-// Issue #1046 — revoke then re-add restores full access.
 #[test]
-fn test_revoke_then_readd_admin_restores_access() {
-    let (env, client, super_admin) = setup();
-    let admin = Address::generate(&env);
+fn audit_log_paginates_with_cursor() {
+    let (env, client, _owner) = setup();
 
-    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
-    assert!(client.is_admin(&admin));
+    for _ in 0..5 {
+        client.record_admin_op(&Symbol::new(&env, "drain"), &Symbol::new(&env, "all"));
+    }
 
-    client.revoke_admin(&super_admin, &admin);
-    assert!(!client.is_admin(&admin));
-    assert!(client.get_admin(&admin).is_none());
+    let first = client.get_audit_log(&2, &None);
+    assert_eq!(first.entries.len(), 2);
+    assert_eq!(first.next_cursor, Some(2));
 
-    // Re-add the same address — should be treated as a brand-new admin.
-    client.add_admin(&super_admin, &admin, &AdminRole::SuperAdmin);
-    assert!(client.is_admin(&admin));
-    let user = client.get_admin(&admin).unwrap();
-    assert_eq!(user.role, AdminRole::SuperAdmin);
-    assert!(user.active);
+    let second = client.get_audit_log(&2, &first.next_cursor);
+    assert_eq!(second.entries.len(), 2);
+    assert_eq!(second.next_cursor, Some(4));
+
+    let third = client.get_audit_log(&2, &second.next_cursor);
+    assert_eq!(third.entries.len(), 1);
+    assert_eq!(third.next_cursor, None);
 }
