@@ -98,3 +98,41 @@ fn test_min_delay_rejects_zero_and_below_minimum() {
     assert_eq!(below_result, Err(Ok(Error::TimelockTooShort)));
     assert_eq!(client.get_min_delay(), DEFAULT_MIN_DELAY_SECONDS);
 }
+
+#[test]
+fn test_non_proposer_cannot_execute() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 6);
+    let proposer = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    client.queue_action(&proposer, &action_id);
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS);
+
+    // A non-proposer without executor designation cannot execute.
+    let result = client.try_execute_action(&attacker, &action_id);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert!(client.get_pending_action(&action_id).is_some());
+
+    // The original proposer can still execute.
+    client.execute_action(&proposer, &action_id);
+    assert!(client.get_pending_action(&action_id).is_none());
+
+    // Silence unused warning for admin binding.
+    let _ = admin;
+}
+
+#[test]
+fn test_designated_executor_can_execute() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 7);
+    let proposer = Address::generate(&env);
+    let executor = Address::generate(&env);
+
+    client.queue_action(&proposer, &action_id);
+    client.set_executor(&admin, &action_id, &executor);
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS);
+
+    client.execute_action(&executor, &action_id);
+    assert!(client.get_pending_action(&action_id).is_none());
+}

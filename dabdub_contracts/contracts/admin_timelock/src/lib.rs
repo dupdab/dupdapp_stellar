@@ -11,12 +11,14 @@ const MIN_TIMELOCK_SECONDS: u64 = 24 * 60 * 60;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Error {
     TimelockTooShort = 1,
+    NotAuthorizedExecutor = 2,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct TimelockAction {
     pub action_id: BytesN<32>,
+    pub proposer: Address,
     pub queued_at: u64,
     pub execute_after: u64,
 }
@@ -27,6 +29,7 @@ pub enum DataKey {
     Admin,
     MinDelay,
     PendingAction(BytesN<32>),
+    Executor(BytesN<32>, Address),
 }
 
 #[contract]
@@ -75,6 +78,7 @@ impl AdminTimelockContract {
         let delay = Self::get_min_delay(env.clone());
         let action = TimelockAction {
             action_id: action_id.clone(),
+            proposer: caller.clone(),
             queued_at: now,
             execute_after: now.saturating_add(delay),
         };
@@ -86,6 +90,31 @@ impl AdminTimelockContract {
 
     pub fn schedule_change(env: Env, caller: Address, action_id: BytesN<32>) -> TimelockAction {
         Self::queue_action(env, caller, action_id)
+    }
+
+    pub fn set_executor(
+        env: Env,
+        caller: Address,
+        action_id: BytesN<32>,
+        executor: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let key = DataKey::PendingAction(action_id.clone());
+        if !env.storage().persistent().has(&key) {
+            panic!("pending action not found");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Executor(action_id, executor), &true);
+        Ok(())
+    }
+
+    pub fn is_executor(env: Env, action_id: BytesN<32>, executor: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Executor(action_id, executor))
+            .unwrap_or(false)
     }
 
     pub fn cancel_timelock(env: Env, caller: Address, action_id: BytesN<32>) {
@@ -104,13 +133,15 @@ impl AdminTimelockContract {
 
     pub fn execute_action(env: Env, caller: Address, action_id: BytesN<32>) {
         caller.require_auth();
-        Self::require_admin(&env, &caller);
         let key = DataKey::PendingAction(action_id.clone());
         let action: TimelockAction = env
             .storage()
             .persistent()
             .get(&key)
             .expect("pending action not found");
+        if caller != action.proposer && !Self::is_executor(env.clone(), action_id.clone(), caller.clone()) {
+            panic!("Not authorized executor");
+        }
         if env.ledger().timestamp() < action.execute_after {
             panic!("timelock has not elapsed");
         }

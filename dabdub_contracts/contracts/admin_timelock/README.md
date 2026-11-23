@@ -15,7 +15,8 @@ This gives users and other stakeholders a window to react to sensitive changes
 | `Admin` | `Address` | Current admin authorised to schedule/cancel/execute operations. |
 | `Delay` | `u64` | Minimum number of ledgers that must pass between scheduling and execution. |
 | `MinDelay` | `u64` | Governance-configurable minimum allowed delay (defaults to 24 hours). |
-| `Pending` | `Map<Bytes, ScheduledOp>` | Scheduled operations keyed by an operation id, including the earliest executable ledger. |
+| `Pending` | `Map<Bytes, ScheduledOp>` | Scheduled operations keyed by an operation id, including the earliest executable ledger and the proposer. |
+| `Executors` | `Map<Bytes, Address>` | Optional per-operation executor assigned by the admin. |
 
 Storage entries are written on `schedule` and removed on `execute` or `cancel`.
 
@@ -30,6 +31,16 @@ validated against a minimum before it is stored or used:
   when the supplied duration is below the configured minimum.
 - `set_min_delay` itself cannot lower the minimum below the 24-hour floor.
 
+## Execution authorization
+
+A queued operation can only be executed by an authorised caller, preventing an
+attacker from racing to apply an admin operation before the proposer cancels it:
+
+- The **original proposer** (the account that called `schedule`) may always execute.
+- The admin may designate an **executor** for a specific operation via
+  `set_executor(op_id, executor)`; that executor may then execute the operation.
+- Any other caller is rejected with `Error::Unauthorized`.
+
 ## Events
 
 - `scheduled` — emitted when an operation is queued; includes the operation id and the earliest executable ledger.
@@ -39,13 +50,15 @@ validated against a minimum before it is stored or used:
 ## Admin operations
 
 - `initialize(admin, delay)` — set the initial admin and delay. Callable once. Rejects delays below the minimum.
-- `schedule(op_id, op)` — admin-only; queue an operation for later execution.
-- `execute(op_id)` — admin-only; apply a queued operation once the delay has elapsed.
+- `schedule(op_id, op)` — admin-only; queue an operation for later execution. Records the proposer.
+- `set_executor(op_id, executor)` — admin-only; assign an executor allowed to execute the queued operation.
+- `execute(op_id)` — proposer- or executor-only; apply a queued operation once the delay has elapsed.
 - `cancel(op_id)` — admin-only; remove a queued operation before it executes.
 - `set_delay(delay)` — admin-only; update the delay for future schedules. Rejects delays below the minimum.
 - `set_min_delay(min_delay)` — governance-only; update the minimum allowed delay (never below 24 hours).
 
-All mutating entry points require the stored admin's authorisation.
+All mutating entry points require the stored admin's authorisation, except
+`execute`, which requires the proposer or the designated executor.
 
 ## Known limitations
 
