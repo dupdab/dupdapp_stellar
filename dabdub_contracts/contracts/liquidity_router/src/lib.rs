@@ -32,6 +32,8 @@ pub enum DataKey {
     RouteFailures(Route),
     // Issue #1516: Circuit-breaker flag per route (true = disabled)
     RouteDisabled(Route),
+    // Issue #1517: Admin-configurable max oracle price age in seconds
+    MaxOracleAgeSeconds,
 }
 
 #[contracttype]
@@ -93,7 +95,12 @@ pub enum Error {
     // Issue #1516
     NotAdmin = 3,
     RouteDisabled = 4,
+    // Issue #1517
+    OraclePriceTooOld = 5,
 }
+
+// Issue #1517: Default max oracle age (5 minutes) used until the admin configures one.
+const DEFAULT_MAX_ORACLE_AGE_SECONDS: u64 = 300;
 
 // Issue #1516: Consecutive failures after which a route's circuit opens.
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
@@ -422,7 +429,10 @@ impl LiquidityRouter {
         quoted_rate: i128,
         actual_rate: i128,
         max_slippage_bps: u32,
+        oracle_timestamp: u64,
     ) -> Result<Route, Error> {
+        // Issue #1517: Reject stale oracle prices before routing.
+        Self::validate_oracle_freshness(env.clone(), oracle_timestamp)?;
         if amount_in <= 0 || quoted_rate <= 0 || actual_rate <= 0 || max_slippage_bps > 10_000 {
             return Err(Error::InvalidInput);
         }
@@ -438,6 +448,37 @@ impl LiquidityRouter {
             return Err(Error::RouteDisabled);
         }
         Ok(route)
+    }
+
+    /// Issue #1517: Admin-gated setter for the maximum accepted oracle price age.
+    pub fn set_max_oracle_age_seconds(env: Env, admin: Address, seconds: u64) -> Result<(), Error> {
+        require_router_admin(&env, &admin)?;
+        if seconds == 0 {
+            return Err(Error::InvalidInput);
+        }
+        env.storage().instance().set(&DataKey::MaxOracleAgeSeconds, &seconds);
+        env.events()
+            .publish(("LIQUIDITY_ROUTER", "max_oracle_age_updated"), (seconds,));
+        Ok(())
+    }
+
+    /// Issue #1517: Currently configured max oracle age in seconds.
+    pub fn get_max_oracle_age_seconds(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxOracleAgeSeconds)
+            .unwrap_or(DEFAULT_MAX_ORACLE_AGE_SECONDS)
+    }
+
+    /// Issue #1517: Returns `Error::OraclePriceTooOld` when `oracle_timestamp`
+    /// is older than `max_oracle_age_seconds` relative to the ledger time.
+    pub fn validate_oracle_freshness(env: Env, oracle_timestamp: u64) -> Result<(), Error> {
+        let max_age = Self::get_max_oracle_age_seconds(env.clone());
+        let age = env.ledger().timestamp().saturating_sub(oracle_timestamp);
+        if age > max_age {
+            return Err(Error::OraclePriceTooOld);
+        }
+        Ok(())
     }
 
     /// Issue #1516: Whether the circuit breaker for `route` is open.
