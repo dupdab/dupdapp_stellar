@@ -13,6 +13,10 @@ each operation also has a bounded execution window: it must be executed within
 `max_execution_window` ledgers after the timelock delay elapses. Operations that
 are not executed in time expire and are auto-cancelled.
 
+Some admin workflows require several atomically related operations. A single
+timelock entry may therefore hold a *batch* of operations that are executed
+together, all-or-nothing.
+
 ## Storage
 
 | Key | Type | Description |
@@ -40,18 +44,27 @@ executable after its timelock delay elapses (e.g. 48h worth of ledgers).
 
 - `initialize(admin, delay)` — set the initial admin and delay. Callable once.
 - `schedule(op_id, op)` — admin-only; queue an operation for later execution. The execution deadline is computed as `current_ledger + delay + MAX_EXECUTION_WINDOW`.
+- `schedule_batch(op_id, ops)` — admin-only; queue a batch (`Vec`) of operations under a single timelock entry. The batch shares one earliest executable ledger and one execution deadline.
 - `execute(op_id)` — admin-only; apply a queued operation once the delay has elapsed and before the deadline. Returns `Error::OperationExpired` (and auto-cancels the operation) if the deadline has passed.
-- `cancel(op_id)` — admin-only; remove a queued operation before it executes.
+- `execute_batch(op_id)` — admin-only; apply every operation in a queued batch atomically. If any operation fails, the whole batch reverts and nothing is applied.
+- `cancel(op_id)` — admin-only; remove a queued operation (or batch) before it executes.
 - `set_delay(delay)` — admin-only; update the delay for future schedules.
 
 All mutating entry points require the stored admin's authorisation.
 
+## Batching semantics
+
+- A batch is stored as a `Vec` of operations under a single `op_id`.
+- All operations in a batch execute atomically: either every operation is
+  applied or the entire batch reverts and the entry remains pending.
+- A batch shares a single timelock delay and execution window; it cannot be
+  partially executed or partially cancelled.
+
 ## Known limitations
 
 - The delay and execution window are enforced in ledgers, not wall-clock time; actual latency depends on ledger cadence.
-- Only one pending operation per `op_id`; re-scheduling the same id overwrites the previous entry.
+- Only one pending entry per `op_id`; re-scheduling the same id overwrites the previous entry.
 - Changing the delay does not retroactively affect already-scheduled operations.
-- There is no built-in batching: each operation must be scheduled and executed individually.
 
 ## Cross-references
 
