@@ -5,6 +5,7 @@ mod test;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
 
 const DEFAULT_MIN_DELAY_SECONDS: u64 = 48 * 60 * 60;
+const MIN_GOVERNANCE_DELAY_SECONDS: u64 = 24 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -113,6 +114,57 @@ impl AdminTimelockContract {
         env.storage()
             .persistent()
             .get(&DataKey::PendingAction(action_id))
+    }
+
+    /// Queue a governance-gated disable of slippage protection.
+    ///
+    /// The caller must be the configured admin (which is expected to be the
+    /// multisig_admin contract, enforcing quorum off-chain/on-chain), and the
+    /// action is routed through the timelock so it cannot take effect until at
+    /// least `MIN_GOVERNANCE_DELAY_SECONDS` (24h) have elapsed.
+    pub fn queue_disable_slippage_protection(
+        env: Env,
+        caller: Address,
+        action_id: BytesN<32>,
+    ) -> TimelockAction {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let now = env.ledger().timestamp();
+        let delay = Self::get_min_delay(env.clone()).max(MIN_GOVERNANCE_DELAY_SECONDS);
+        let action = TimelockAction {
+            action_id: action_id.clone(),
+            queued_at: now,
+            execute_after: now.saturating_add(delay),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAction(action_id.clone()), &action);
+        action
+    }
+
+    /// Execute a previously queued slippage-protection disable after the
+    /// timelock has elapsed. Emits `SlippageProtectionDisabled`.
+    pub fn execute_disable_slippage_protection(
+        env: Env,
+        caller: Address,
+        action_id: BytesN<32>,
+    ) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let key = DataKey::PendingAction(action_id.clone());
+        let action: TimelockAction = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("pending action not found");
+        if env.ledger().timestamp() < action.execute_after {
+            panic!("timelock has not elapsed");
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("slippage_disabled"),),
+            action_id,
+        );
     }
 
     fn require_admin(env: &Env, caller: &Address) {
