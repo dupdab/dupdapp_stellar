@@ -38,6 +38,7 @@ pub struct PendingRecipientUpdate {
 pub enum Error {
     InvalidRecipient = 1,
     SharesMustSum100Percent = 2,
+    TooManyRecipients = 3,
 }
 
 #[contracttype]
@@ -48,6 +49,7 @@ enum DataKey {
     AllowedCaller,
     PendingRecipients,
     AllowedRecipient(Address),
+    MaxRecipients,
 }
 
 #[contracttype]
@@ -291,6 +293,22 @@ impl FeeDistributorContract {
             .publish(("FEE_DISTRIBUTOR", "admin_updated"), (previous, new_admin));
     }
 
+    /// Set the maximum number of fee recipients (default 10). Admin-only.
+    pub fn set_max_recipients(env: Env, caller: Address, max_recipients: u32) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        assert!(max_recipients > 0, "max recipients must be > 0");
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxRecipients, &max_recipients);
+        env.events()
+            .publish(("FEE_DISTRIBUTOR", "max_recipients_updated"), max_recipients);
+    }
+
+    pub fn get_max_recipients(env: Env) -> u32 {
+        Self::max_recipients(&env)
+    }
+
     pub fn get_recipients(env: Env) -> Vec<FeeRecipient> {
         env.storage()
             .instance()
@@ -310,7 +328,10 @@ impl FeeDistributorContract {
     }
 
     fn validate_recipients(env: &Env, recipients: &Vec<FeeRecipient>) {
-        if recipients.len() == 0 || recipients.len() > MAX_FEE_RECIPIENTS {
+        if recipients.len() > Self::max_recipients(env) {
+            panic_with_error!(env, Error::TooManyRecipients);
+        }
+        if recipients.len() == 0 {
             panic!(
                 "recipient count must be between 1 and {}",
                 MAX_FEE_RECIPIENTS
@@ -333,6 +354,13 @@ impl FeeDistributorContract {
         if total_share != BPS_DENOMINATOR as u32 {
             panic_with_error!(env, Error::SharesMustSum100Percent);
         }
+    }
+
+    fn max_recipients(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxRecipients)
+            .unwrap_or(MAX_FEE_RECIPIENTS)
     }
 
     fn share_amount(amount: i128, share_bps: u32) -> i128 {

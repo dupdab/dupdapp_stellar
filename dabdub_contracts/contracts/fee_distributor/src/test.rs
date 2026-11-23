@@ -415,3 +415,59 @@ fn test_schedule_rejects_shares_not_summing_to_10000_bps() {
     );
     assert!(s.client.get_pending_recipients().is_none());
 }
+
+// ── recipient cap ────────────────────────────────────────────────────────────
+
+fn equal_recipients(env: &Env, count: u32) -> soroban_sdk::Vec<FeeRecipient> {
+    let mut recipients = soroban_sdk::Vec::new(env);
+    for index in 0..count {
+        let base = 10_000 / count;
+        recipients.push_back(FeeRecipient {
+            address: Address::generate(env),
+            share_bps: if index + 1 == count {
+                10_000 - base * (count - 1)
+            } else {
+                base
+            },
+        });
+    }
+    recipients
+}
+
+#[test]
+fn test_ten_recipients_distribute_successfully() {
+    let s = setup(&[1_000; 10]);
+    assert_eq!(s.client.get_max_recipients(), 10);
+    s.client.distribute(&s.caller, &100_000);
+    assert_eq!(s.token.balance(&s.contract_id), 0);
+    assert_eq!(s.token.balance(&s.treasury), 10_000);
+}
+
+#[test]
+fn test_schedule_rejects_more_than_default_cap() {
+    let s = default_setup();
+    let eleven = equal_recipients(&s.env, 11);
+    assert_eq!(
+        s.client.try_schedule_recipients(&s.admin, &eleven),
+        Err(Ok(crate::Error::TooManyRecipients))
+    );
+}
+
+#[test]
+fn test_admin_can_adjust_recipient_cap() {
+    let s = default_setup();
+    s.client.set_max_recipients(&s.admin, &2);
+    assert_eq!(s.client.get_max_recipients(), 2);
+    let three = equal_recipients(&s.env, 3);
+    assert_eq!(
+        s.client.try_schedule_recipients(&s.admin, &three),
+        Err(Ok(crate::Error::TooManyRecipients))
+    );
+    s.client.set_max_recipients(&s.admin, &12);
+    s.client
+        .schedule_recipients(&s.admin, &equal_recipients(&s.env, 11));
+    assert!(s
+        .client
+        .try_set_max_recipients(&Address::generate(&s.env), &5)
+        .is_err());
+}
