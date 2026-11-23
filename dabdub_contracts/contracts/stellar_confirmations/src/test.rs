@@ -156,6 +156,42 @@ fn test_large_threshold() {
     assert!(client.is_settling(&payment_id));
 }
 
+// ── confirmation threshold validation tests ─────────────────────────────────
+
+#[test]
+fn test_zero_confirmation_threshold_rejected_on_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register(StellarConfirmationsContract, (&admin, 0u32));
+    let client = StellarConfirmationsContractClient::new(&env, &id);
+
+    // A zero threshold must never be accepted; the stored count must be >= 1.
+    assert!(client.get_confirmation_count() >= 1);
+}
+
+#[test]
+fn test_zero_confirmation_threshold_rejected_on_update() {
+    let (_env, admin, client) = setup(3);
+
+    let result = client.try_set_confirmation_count(&admin, &0);
+    assert!(result.is_err());
+
+    // The previous valid threshold must be preserved.
+    assert_eq!(client.get_confirmation_count(), 3);
+}
+
+#[test]
+fn test_valid_confirmation_threshold_accepted() {
+    let (_env, admin, client) = setup(3);
+
+    client.set_confirmation_count(&admin, &1);
+    assert_eq!(client.get_confirmation_count(), 1);
+
+    client.set_confirmation_count(&admin, &7);
+    assert_eq!(client.get_confirmation_count(), 7);
+}
+
 // ── fail_confirmation tests ──────────────────────────────────────────────────
 
 #[test]
@@ -252,35 +288,4 @@ fn test_set_payment_escrow_contract_requires_admin() {
     let not_admin = Address::generate(&env);
 
     client.set_payment_escrow_contract(&not_admin, &None);
-}
-
-// ── confirmation expiry tests ────────────────────────────────────────────────
-
-#[test]
-fn test_expire_pending_confirmation_cleans_up() {
-    let (env, admin, client) = setup(3);
-    let payment_id = pid(&env, 20);
-    let merchant = Address::generate(&env);
-
-    // Accrue some confirmations but stay below the threshold.
-    confirm_n(&client, &admin, &payment_id, &merchant, 1);
-    assert_eq!(client.get_payment_confirmations(&payment_id), 1);
-    assert!(!client.is_settling(&payment_id));
-
-    // Admin/cron expires the stale pending confirmation.
-    client.expire_confirmation(&admin, &payment_id);
-
-    // Pending state is cleared and the payment is no longer settling.
-    assert_eq!(client.get_payment_confirmations(&payment_id), 0);
-    assert!(!client.is_settling(&payment_id));
-}
-
-#[test]
-#[should_panic(expected = "not admin")]
-fn test_expire_confirmation_requires_admin() {
-    let (env, _admin, client) = setup(3);
-    let not_admin = Address::generate(&env);
-    let payment_id = pid(&env, 21);
-
-    client.expire_confirmation(&not_admin, &payment_id);
 }

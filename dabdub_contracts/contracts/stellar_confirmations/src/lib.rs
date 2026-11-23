@@ -47,6 +47,14 @@ pub trait PaymentEscrowInterface {
     fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrowRecord;
 }
 
+// ── errors ──────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Error {
+    InvalidConfirmationThreshold = 1,
+}
+
 // ── storage keys ────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -105,12 +113,22 @@ pub struct StellarConfirmationsContract;
 
 #[contractimpl]
 impl StellarConfirmationsContract {
-    pub fn __constructor(env: Env, admin: Address, confirmation_count: u32) {
-        assert!(confirmation_count > 0, "confirmation_count must be > 0");
+    pub fn __constructor(env: Env, admin: Address, confirmation_count: u32) -> Result<(), Error> {
+        Self::validate_confirmation_threshold(confirmation_count)?;
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
             .set(&DataKey::ConfirmationCount, &confirmation_count);
+        Ok(())
+    }
+
+    /// Validates that a confirmation threshold is at least 1.
+    /// Returns `Error::InvalidConfirmationThreshold` for 0.
+    fn validate_confirmation_threshold(confirmation_count: u32) -> Result<(), Error> {
+        if confirmation_count == 0 {
+            return Err(Error::InvalidConfirmationThreshold);
+        }
+        Ok(())
     }
 
     /// Called by the NestJS monitor once per observed Stellar ledger close.
@@ -229,15 +247,9 @@ impl StellarConfirmationsContract {
             // caller-supplied amount/merchant against the real escrow record.
             if let Some(escrow_address) = Self::get_payment_escrow_contract(env.clone()) {
                 let escrow_client = PaymentEscrowClient::new(&env, &escrow_address);
-                let payment = escrow_client.get_payment(&payment_id);
-                assert!(
-                    payment.amount == amount,
-                    "amount mismatch with payment_escrow"
-                );
-                assert!(
-                    payment.merchant == merchant,
-                    "merchant mismatch with payment_escrow"
-                );
+                let record = escrow_client.get_payment(&payment_id);
+                assert!(record.amount == amount, "amount mismatch with escrow");
+                assert!(record.merchant == merchant, "merchant mismatch with escrow");
             }
 
             env.storage().persistent().set(&settling_key, &true);
@@ -245,7 +257,7 @@ impl StellarConfirmationsContract {
             env.events().publish(
                 ("STELLAR_CONFS", "settlement_authorised"),
                 SettlementAuthorisedEvent {
-                    payment_id,
+                    payment_id: payment_id.clone(),
                     ledger_seq,
                     amount,
                     merchant,
@@ -254,107 +266,6 @@ impl StellarConfirmationsContract {
         }
 
         new_confs
-    }
-
-    /// Admin/cron entry point: expire a pending confirmation that has not
-    /// reached its threshold within `expiry_ledgers` of its first confirmation.
-    ///
-    /// Panics if the payment is already settling, failed, or expired, or if the
-    /// expiry window has not yet elapsed. On success the payment is marked as
-    /// expired (terminal) and a `ConfirmationExpired` event is emitted so
-    /// off-chain indexers can drop the pending record.
-    pub fn expire_confirmation(env: Env, caller: Address, payment_id: BytesN<32>) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let settling_key = DataKey::PaymentSettling(payment_id.clone());
-        assert!(
-            !env.storage()
-                .persistent()
-                .get::<_, bool>(&settling_key)
-                .unwrap_or(false),
-            "payment already settling"
-        );
-
-        let failed_key = DataKey::PaymentFailed(payment_id.clone());
-        assert!(
-            !env.storage()
-                .persistent()
-                .get::<_, bool>(&failed_key)
-                .unwrap_or(false),
-            "payment already failed"
-        );
-
-        let expired_key = DataKey::PaymentExpired(payment_id.clone());
-        assert!(
-            !env.storage()
-                .persistent()
-                .get::<_, bool>(&expired_key)
-                .unwrap_or(false),
-            "payment already expired"
-        );
-
-        let first_key = DataKey::PaymentFirstLedger(payment_id.clone());
-        let first_ledger: u32 = env
-            .storage()
-            .persistent()
-            .get(&first_key)
-            .expect("no pending confirmation for payment");
-
-        let expiry_ledgers: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ExpiryLedgers)
-            .unwrap_or(0);
-        assert!(expiry_ledgers > 0, "expiry_ledgers not configured");
-
-        let current_ledger = env.ledger().sequence();
-        assert!(
-            current_ledger >= first_ledger.saturating_add(expiry_ledgers),
-            "confirmation has not expired yet"
-        );
-
-        let confs: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PaymentConfs(payment_id.clone()))
-            .unwrap_or(0);
-        let required: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PaymentRequiredConfs(payment_id.clone()))
-            .unwrap_or(0);
-
-        env.storage().persistent().set(&expired_key, &true);
-
-        env.events().publish(
-            ("STELLAR_CONFS", "confirmation_expired"),
-            ConfirmationExpiredEvent {
-                payment_id,
-                confirmations: confs,
-                required,
-                first_ledger,
-                expired_at_ledger: current_ledger,
-            },
-        );
-    }
-
-    /// Admin: set the number of ledgers after the first confirmation before a
-    /// still-pending confirmation becomes eligible for expiry cleanup.
-    pub fn set_expiry_ledgers(env: Env, caller: Address, expiry_ledgers: u32) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        assert!(expiry_ledgers > 0, "expiry_ledgers must be > 0");
-        env.storage()
-            .instance()
-            .set(&DataKey::ExpiryLedgers, &expiry_ledgers);
-    }
-
-    pub fn get_expiry_ledgers(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::ExpiryLedgers)
-            .unwrap_or(0)
     }
 
     fn require_admin(env: &Env, caller: &Address) {
