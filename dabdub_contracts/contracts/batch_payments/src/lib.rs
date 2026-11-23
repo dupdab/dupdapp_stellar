@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 const MAX_BATCH_SIZE: u32 = 100;
-const DEFAULT_MAX_BATCH_SIZE: u32 = MAX_BATCH_SIZE;
+const DEFAULT_MAX_BATCH_SIZE: u32 = 20;
 
 /// Maximum number of batches a single merchant may create within one ledger.
 const MAX_BATCHES_PER_LEDGER: u32 = 10;
@@ -238,79 +238,5 @@ impl BatchPaymentContract {
             return Err(ContractError::BatchEmpty);
         }
         if count > max_batch_size {
-            panic!("batch exceeds maximum of {} payments", max_batch_size);
+            return Err(ContractError::BatchTooLarge);
         }
-
-        // Phase 1: validate the entire batch before committing any state.
-        // If any item is invalid, return the error and leave storage untouched.
-        for i in 0..count {
-            let payment = payments.get(i).unwrap();
-            if payment.amount < min_amount || payment.amount > max_amount {
-                return Err(ContractError::InvalidAmount);
-            }
-            if payment.memo.len() == 0 {
-                return Err(ContractError::EmptyMemo);
-            }
-        }
-
-        // Phase 2: all items are valid — commit state changes.
-        let mut counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Counter)
-            .unwrap_or(0);
-        let mut ids: Vec<BytesN<32>> = vec![&env];
-
-        for i in 0..count {
-            let payment = payments.get(i).unwrap();
-
-            let mut id_input = Bytes::new(&env);
-            id_input.append(&merchant.clone().to_xdr(&env));
-            id_input.append(&Bytes::from_array(&env, &current_ledger.to_be_bytes()));
-            id_input.append(&Bytes::from_array(&env, &counter.to_be_bytes()));
-            let id: BytesN<32> = env.crypto().sha256(&id_input).into();
-
-            let record = PaymentRecord {
-                id: id.clone(),
-                amount: payment.amount,
-                memo: payment.memo.clone(),
-                merchant: merchant.clone(),
-                customer: payment.customer.clone(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey::Payment(id.clone()), &record);
-
-            env.events().publish(
-                (soroban_sdk::Symbol::new(&env, "PaymentCreated"),),
-                (id.clone(), payment.amount, merchant.clone()),
-            );
-
-            ids.push_back(id);
-            counter += 1;
-        }
-
-        env.storage().instance().set(&DataKey::Counter, &counter);
-        env.storage()
-            .persistent()
-            .set(&batch_count_key, &(current_ledger, batches_in_ledger + 1));
-
-        Ok(ids)
-    }
-
-    /// Fetch a stored payment record by ID.
-    pub fn get_payment(env: Env, id: BytesN<32>) -> Option<PaymentRecord> {
-        env.storage().persistent().get(&DataKey::Payment(id))
-    }
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum ContractError {
-    AlreadyInitialized = 1,
-    InvalidAmount = 2,
-    InvalidLimits = 3,
-    ContractNotInitialized = 4,
-    BatchEmpty = 5,
-    EmptyMemo = 6,
-}

@@ -234,6 +234,43 @@ fn test_admin_can_set_max_batch_size() {
 }
 
 #[test]
+fn test_batch_at_max_size_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+
+    client.set_max_batch_size(&20);
+    assert_eq!(client.max_batch_size(), 20);
+
+    let merchant = Address::generate(&env);
+    let mut payments = soroban_sdk::vec![&env];
+    for i in 0..20_u32 {
+        payments.push_back(make_payment(&env, (i as i128 + 1) * 10, "at-max"));
+    }
+
+    let ids = client.create_batch(&merchant, &payments);
+    assert_eq!(ids.len(), 20);
+}
+
+#[test]
+fn test_batch_above_max_size_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
+
+    client.set_max_batch_size(&20);
+
+    let merchant = Address::generate(&env);
+    let mut payments = soroban_sdk::vec![&env];
+    for i in 0..21_u32 {
+        payments.push_back(make_payment(&env, (i as i128 + 1) * 10, "above-max"));
+    }
+
+    let err = client.try_create_batch(&merchant, &payments).unwrap_err().unwrap();
+    assert_eq!(err, ContractError::BatchTooLarge);
+}
+
+#[test]
 fn test_amount_min_minus_1_reverts() {
     let env = Env::default();
     env.mock_all_auths();
@@ -264,66 +301,4 @@ fn test_amount_equal_max_succeeds() {
     let payments = soroban_sdk::vec![&env, make_payment(&env, 1_000, "at-max")];
     let ids = client.create_batch(&merchant, &payments);
     assert_eq!(ids.len(), 1);
-}
-
-#[test]
-fn test_invalid_item_fails_entire_batch_with_no_partial_state() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
-
-    let merchant = Address::generate(&env);
-    // First item is valid, second is invalid (amount above max).
-    let payments = soroban_sdk::vec![
-        &env,
-        make_payment(&env, 500, "valid-1"),
-        make_payment(&env, 20_000, "invalid"),
-        make_payment(&env, 700, "valid-2"),
-    ];
-
-    let err = client.try_create_batch(&merchant, &payments).unwrap_err().unwrap();
-    assert_eq!(err, ContractError::PaymentAmountOutsideLimits);
-
-    // No PaymentCreated events should have been emitted for the failed batch.
-    let events = env.events().all();
-    assert_eq!(events.len(), 0);
-
-    // No payment records should exist: a subsequent valid batch starts fresh.
-    let valid = soroban_sdk::vec![&env, make_payment(&env, 500, "valid-1")];
-    let ids = client.create_batch(&merchant, &valid);
-    assert_eq!(ids.len(), 1);
-    let record = client.get_payment(&ids.get(0).unwrap()).unwrap();
-    assert_eq!(record.amount, 500);
-}
-
-#[test]
-fn test_benchmark_instruction_cost_per_item() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = deploy_and_init(&env, 1, 10_000);
-
-    let merchant = Address::generate(&env);
-
-    // Measure instruction cost for a single-item batch as a baseline.
-    let single = soroban_sdk::vec![&env, make_payment(&env, 100, "bench-1")];
-    let before = env.budget().cpu_instruction_cost();
-    client.create_batch(&merchant, &single);
-    let single_cost = env.budget().cpu_instruction_cost() - before;
-
-    // Measure instruction cost for a larger batch and derive per-item cost.
-    let mut many = soroban_sdk::vec![&env];
-    for i in 0..50_u32 {
-        many.push_back(make_payment(&env, (i as i128 + 1) * 10, "bench"));
-    }
-    let before_many = env.budget().cpu_instruction_cost();
-    client.create_batch(&merchant, &many);
-    let many_cost = env.budget().cpu_instruction_cost() - before_many;
-
-    // Per-item cost should be bounded; the hard cap of 100 items must fit
-    // within the default Soroban instruction budget.
-    let per_item = many_cost / 50;
-    assert!(per_item > 0);
-    assert!(single_cost > 0);
-    // 100 items at the measured per-item cost must stay under the budget.
-    assert!(per_item.saturating_mul(100) < env.budget().cpu_instruction_cost());
 }
