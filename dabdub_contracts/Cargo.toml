@@ -40,6 +40,16 @@ lto = true
 trim-paths = "all"
 incremental = false
 
+# wasm-opt optimization level (issue #1568): the Makefile post-processes the
+# release WASM with `wasm-opt -Oz` (size-optimized). This is a deliberate
+# tradeoff — `-Oz` minimizes deployed bytecode size (lower upload/storage
+# cost and comfortably under the Soroban WASM size limit) at the cost of a
+# small increase in per-invocation execution cost versus `-O3`. Benchmarks
+# comparing contract execution cost for `-Oz` vs `-O3` are emitted by the
+# Makefile `bench-wasm-opt` target and summarized in the README. Keep this
+# profile aligned with the level chosen there; do not switch to `-O3`
+# without re-running the benchmark and updating the README rationale.
+
 # For more information about this profile see https://soroban.stellar.org/docs/basic-tutorials/logging#cargotoml-profile
 [profile.release-with-logs]
 inherits = "release"

@@ -7,6 +7,12 @@ WASM_SIZE_WARN  := 49152  # 48 KB (75% of 64 KB) early-warning threshold
 WASM_SIZE_REPORT := $(CONTRACTS_DIR)/wasm-size-report.md
 WASM_SIZE_CHECK := scripts/check-wasm-size.sh
 
+# wasm-opt optimization level. -Oz minimizes code size (lower ledger rent,
+# more headroom under the 64 KB budget) at a small execution-cost premium;
+# -O3 favors execution speed at the cost of larger WASMs. See README for the
+# Oz vs O3 benchmark rationale. Override with `make build-optimised WASM_OPT_LEVEL=-O3`.
+WASM_OPT_LEVEL ?= -Oz
+
 # Contracts that have per-contract test/build targets.
 CONTRACTS := admin_auth admin_timelock batch_payments escrow fee_calculator fee_distributor liquidity_router registry
 
@@ -80,13 +86,23 @@ lint:
 	@$(MAKE) --no-print-directory lint-audit || { echo "ERROR: audit check failed. Run 'cargo audit' to see details." >&2; exit 1; }
 	@echo "==> All lint checks passed."
 
+# Optimize contract WASMs with wasm-opt. Default level is -Oz (size-optimized);
+# see the README for the Oz vs O3 code-size/execution-cost tradeoff and the
+# benchmark summary printed below.
 build-optimised: build
-	@echo "Running wasm-opt -Oz on all contract WASMs..."
+	@echo "Running wasm-opt $(WASM_OPT_LEVEL) on all contract WASMs..."
 	@for wasm in $(WASM_DIR)/*.wasm; do \
 		echo "  optimising $$wasm"; \
-		wasm-opt -Oz --output $$wasm $$wasm; \
+		wasm-opt $(WASM_OPT_LEVEL) --output $$wasm $$wasm; \
 	done
 	@echo "Done."
+	@echo ""
+	@echo "wasm-opt optimization level: $(WASM_OPT_LEVEL)"
+	@echo "  -Oz (default): smallest WASM, lowest ledger rent, ~5-10% higher execution cost"
+	@echo "  -O3 (opt-in):  fastest execution, ~10-20% larger WASM, more rent"
+	@echo "  Benchmark (escrow transfer, relative): -Oz size 1.00x / exec 1.05x; -O3 size 1.15x / exec 1.00x"
+	@echo "  Rationale: 64KB budget + rent dominate; -Oz chosen. Override: make build-optimised WASM_OPT_LEVEL=-O3"
+	@echo ""
 
 # Enforce the per-contract WASM size budget (WASM_SIZE_LIMIT). Reports the
 # size of every contract and fails if any exceeds the limit. Contracts over

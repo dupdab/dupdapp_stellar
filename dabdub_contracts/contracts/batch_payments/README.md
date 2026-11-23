@@ -71,6 +71,38 @@ cd dabdub_contracts
 cargo test -p batch-payments benchmark_batch_instruction_cost_per_item -- --nocapture
 ```
 
+## wasm-opt optimization level (Oz vs O3)
+
+Release builds run `wasm-opt` on the compiled contract WASM. The build uses
+`-Oz` (size-optimized) rather than `-O3` (speed-optimized). The tradeoff is
+code size versus execution cost:
+
+- **`-Oz` (chosen).** Produces the smallest WASM, which lowers the on-chain
+  upload/storage cost and keeps the artifact well under the CI WASM size
+  limit. The cost is slightly more CPU instructions per call because the
+  optimizer favors size over inlining and loop unrolling.
+- **`-O3`.** Produces faster-executing WASM (fewer instructions per call) but
+  a larger artifact, increasing upload/storage cost and risking the size
+  limit.
+
+For `batch_payments` the execution-cost difference is small relative to the
+100,000,000-instruction transaction budget: the 100-item benchmark above uses
+about 6.9% of the budget, so the extra instructions from `-Oz` do not
+meaningfully change headroom. Because upload/storage cost is paid once per
+deployment while the instruction savings from `-O3` are marginal here, `-Oz`
+is the better default. If a future change makes per-call cost dominate, switch
+the Makefile to `-O3` and re-run the benchmark below to confirm the tradeoff.
+
+To compare the two levels, build with each and re-run the instruction
+benchmark:
+
+```sh
+cd dabdub_contracts
+# default build uses -Oz
+cargo test -p batch-payments benchmark_batch_instruction_cost_per_item -- --nocapture
+# then rebuild with -O3 (edit the wasm-opt flags in the Makefile) and re-run
+```
+
 ## Known limitations
 
 - **No token transfer.** The contract records payment instructions; settlement
