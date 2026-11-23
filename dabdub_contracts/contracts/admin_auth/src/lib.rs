@@ -15,17 +15,40 @@ pub mod errors {
     pub const NOT_ADMIN: &str = "NotAdmin";
     pub const ADMIN_NOT_FOUND: &str = "AdminNotFound";
     pub const CANNOT_REVOKE_SUPER_ADMIN: &str = "CannotRevokeSuperAdmin";
+    pub const UNAUTHORIZED: &str = "Unauthorized";
 }
 
 /// Admin roles. Admin accounts are stored separately from merchant accounts
 /// as a deployment convention — the contract itself does not cross-check
 /// against a merchant registry, so the separation is upheld by the caller
 /// (e.g. the off-chain deployment script) rather than enforced on-chain.
+///
+/// Role hierarchy (issue #1532): VIEWER < OPERATOR < ADMIN < SUPERADMIN.
+/// A higher role implicitly holds every permission granted to lower roles.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum AdminRole {
+    Viewer,
+    Operator,
     Admin,
     SuperAdmin,
+}
+
+impl AdminRole {
+    /// Numeric rank used to compare roles in the hierarchy.
+    pub fn rank(&self) -> u32 {
+        match self {
+            AdminRole::Viewer => 0,
+            AdminRole::Operator => 1,
+            AdminRole::Admin => 2,
+            AdminRole::SuperAdmin => 3,
+        }
+    }
+
+    /// True when `self` is at least as privileged as `other`.
+    pub fn at_least(&self, other: &AdminRole) -> bool {
+        self.rank() >= other.rank()
+    }
 }
 
 /// Separately-credentialed admin account, distinct from the merchant entity.
@@ -125,6 +148,16 @@ impl AdminAuthContract {
             .instance()
             .get(&DataKey::Version)
             .unwrap_or(VERSION)
+    }
+
+    /// Return true when `account` holds `permission` under the role hierarchy
+    /// (issue #1532). A role implicitly holds every permission granted to the
+    /// roles below it: VIEWER < OPERATOR < ADMIN < SUPERADMIN.
+    pub fn has_permission(env: Env, account: Address, permission: AdminRole) -> bool {
+        match Self::get_admin(&env, &account) {
+            Some(user) if user.active => user.role.at_least(&permission),
+            _ => false,
+        }
     }
 
     /// Add an admin to the separate credential store. SuperAdmin only.
@@ -256,16 +289,18 @@ impl AdminAuthContract {
 
         let previous = caller.clone();
 
-        // Update the SuperAdmin key
-        env.storage()
-            .instance()
-            .set(&DataKey::SuperAdmin, &new_super_admin);
+        // Demote the previous SuperAdmin to Admin so they retain admin rights
+        // but no longer hold SuperAdmin privileges.
+        Self::save(
+            &env,
+            AdminUser {
+                admin: previous.clone(),
+                role: AdminRole::Admin,
+                active: true,
+            },
+        );
 
-        // Ensure the new super admin has an AdminUser record with SuperAdmin role
-        let is_new = !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Admin(new_super_admin.clone()));
+        // Promote the new SuperAdmin.
         Self::save(
             &env,
             AdminUser {
@@ -274,15 +309,21 @@ impl AdminAuthContract {
                 active: true,
             },
         );
-        if is_new {
-            let mut index: Vec<Address> = env
-                .storage()
-                .instance()
-                .get(&DataKey::AdminIndex)
-                .unwrap_or_else(|| Vec::new(&env));
+
+        // Ensure the new SuperAdmin is tracked in the index.
+        let mut index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminIndex)
+            .unwrap_or_else(|| Vec::new(&env));
+        if index.first_index_of(&new_super_admin).is_none() {
             index.push_back(new_super_admin.clone());
             env.storage().instance().set(&DataKey::AdminIndex, &index);
         }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SuperAdmin, &new_super_admin);
 
         env.events().publish(
             ("ADMIN_AUTH", "super_admin_transferred"),
@@ -293,57 +334,41 @@ impl AdminAuthContract {
         );
     }
 
-    /// Deactivate an admin without removing its credential record. SuperAdmin
-    /// only. `is_admin` returns false for a deactivated admin.
+    /// Deactivate an admin without removing their record. SuperAdmin only.
     pub fn deactivate_admin(env: Env, caller: Address, admin: Address) {
         caller.require_auth();
         Self::require_super_admin(&env, &caller);
 
         let key = DataKey::Admin(admin.clone());
-        if !env.storage().persistent().has(&key) {
-            panic!("{}", errors::ADMIN_NOT_FOUND);
-        }
-        let mut user: AdminUser = env.storage().persistent().get(&key).unwrap();
+        let mut user: AdminUser = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("{}", errors::ADMIN_NOT_FOUND));
         user.active = false;
         Self::save(&env, user);
 
         env.events().publish(
             ("ADMIN_AUTH", "admin_deactivated"),
-            AdminDeactivatedEvent { admin },
+            AdminDeactivatedEvent {
+                admin: admin.clone(),
+            },
         );
     }
 
-    /// Returns true if `admin` is an active admin (any role).
-    pub fn is_admin(env: Env, admin: Address) -> bool {
-        match env
-            .storage()
+    /// Return the stored admin record for `account`, if any.
+    pub fn get_admin(env: &Env, account: &Address) -> Option<AdminUser> {
+        env.storage()
             .persistent()
-            .get::<DataKey, AdminUser>(&DataKey::Admin(admin))
-        {
-            Some(user) => user.active,
-            None => false,
+            .get(&DataKey::Admin(account.clone()))
+    }
+
+    /// Return true when `account` is an active admin of at least `role`.
+    pub fn is_admin(env: Env, account: Address, role: AdminRole) -> bool {
+        match Self::get_admin(&env, &account) {
+            Some(user) if user.active => user.role.at_least(&role),
+            _ => false,
         }
-    }
-
-    /// Returns the role of `admin`, if present.
-    pub fn get_role(env: Env, admin: Address) -> Option<AdminRole> {
-        env.storage()
-            .persistent()
-            .get::<DataKey, AdminUser>(&DataKey::Admin(admin))
-            .map(|u| u.role)
-    }
-
-    /// Returns the current SuperAdmin address.
-    pub fn get_super_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::SuperAdmin).unwrap()
-    }
-
-    /// Returns all admin addresses in the index.
-    pub fn get_admins(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::AdminIndex)
-            .unwrap_or_else(|| Vec::new(&env))
     }
 
     fn save(env: &Env, user: AdminUser) {

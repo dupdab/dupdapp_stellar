@@ -13,6 +13,16 @@ Role-based authorization registry used by the other contracts in this workspace 
 
 (Exact storage keys are defined in `src/lib.rs`; this section is a summary, not a normative spec.)
 
+## Role hierarchy
+
+Roles are ordered from least to most privileged:
+
+```
+VIEWER < OPERATOR < ADMIN < SUPERADMIN
+```
+
+A role inherits every permission granted to the roles below it. `has_permission(account, permission)` resolves the account's role and checks the permission against that role **and all lower roles in the hierarchy**, so a `SUPERADMIN` implicitly satisfies `ADMIN`, `OPERATOR`, and `VIEWER` permissions. Conversely, an `ADMIN` does **not** satisfy permissions that are granted only to `SUPERADMIN`.
+
 ## Events
 
 - Admin added — emitted when a new admin address is granted rights.
@@ -25,6 +35,7 @@ Consumers should index these events to keep off-chain views of admin membership 
 - `add_admin` — owner-only; grants admin rights to an address.
 - `remove_admin` — owner-only; revokes admin rights from an address.
 - `is_admin` — read-only check used by dependent contracts.
+- `has_permission` — read-only check that walks the role hierarchy (see above) to decide whether an account holds a given permission.
 
 ## Known limitations
 

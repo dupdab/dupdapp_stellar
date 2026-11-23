@@ -211,3 +211,44 @@ fn test_revoke_admin_emits_role_revoked_event() {
     });
     assert!(found, "RoleRevoked event not emitted");
 }
+
+// Issue #1532 — role hierarchy: VIEWER < OPERATOR < ADMIN < SUPERADMIN.
+// has_permission must check permissions across all roles in the hierarchy up to
+// and including the account's role.
+#[test]
+fn test_has_permission_hierarchy_inherits_lower_roles() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+
+    // ADMIN inherits VIEWER and OPERATOR permissions.
+    assert!(client.has_permission(&admin, &Permission::ViewDashboard));
+    assert!(client.has_permission(&admin, &Permission::ManagePayments));
+    // ADMIN has its own permissions.
+    assert!(client.has_permission(&admin, &Permission::ManageAdmins));
+    // SUPERADMIN inherits everything.
+    assert!(client.has_permission(&super_admin, &Permission::ManageAdmins));
+    assert!(client.has_permission(&super_admin, &Permission::SystemConfig));
+}
+
+// Issue #1532 — ADMIN cannot perform SUPERADMIN-only actions.
+#[test]
+fn test_admin_cannot_perform_super_admin_only_actions() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+
+    assert!(!client.has_permission(&admin, &Permission::SystemConfig));
+    assert!(!client.has_permission(&admin, &Permission::TransferOwnership));
+}
+
+// Issue #1532 — inactive admins have no permissions regardless of role.
+#[test]
+fn test_inactive_admin_has_no_permissions() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+    client.deactivate_admin(&super_admin, &admin);
+
+    assert!(!client.has_permission(&admin, &Permission::ViewDashboard));
+}
