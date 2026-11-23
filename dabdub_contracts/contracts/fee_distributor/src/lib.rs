@@ -37,6 +37,7 @@ pub struct PendingRecipientUpdate {
 #[repr(u32)]
 pub enum Error {
     InvalidRecipient = 1,
+    SharesMustSum100Percent = 2,
 }
 
 #[contracttype]
@@ -77,7 +78,7 @@ impl FeeDistributorContract {
         usdc_token: Address,
         allowed_caller: Address,
     ) {
-        Self::validate_recipients(&recipients);
+        Self::validate_recipients(&env, &recipients);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -179,7 +180,7 @@ impl FeeDistributorContract {
     pub fn schedule_recipients(env: Env, caller: Address, recipients: Vec<FeeRecipient>) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        Self::validate_recipients(&recipients);
+        Self::validate_recipients(&env, &recipients);
         let execute_after = env
             .ledger()
             .sequence()
@@ -308,7 +309,7 @@ impl FeeDistributorContract {
             .unwrap()
     }
 
-    fn validate_recipients(recipients: &Vec<FeeRecipient>) {
+    fn validate_recipients(env: &Env, recipients: &Vec<FeeRecipient>) {
         if recipients.len() == 0 || recipients.len() > MAX_FEE_RECIPIENTS {
             panic!(
                 "recipient count must be between 1 and {}",
@@ -330,7 +331,7 @@ impl FeeDistributorContract {
                 .expect("recipient share total overflow");
         }
         if total_share != BPS_DENOMINATOR as u32 {
-            panic!("recipient shares must total 10000 bps");
+            panic_with_error!(env, Error::SharesMustSum100Percent);
         }
     }
 

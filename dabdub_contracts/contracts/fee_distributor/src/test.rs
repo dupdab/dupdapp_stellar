@@ -128,7 +128,7 @@ fn test_single_recipient_receives_full_amount() {
 // ── constructor validation ───────────────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "recipient shares must total 10000 bps")]
+#[should_panic(expected = "Error(Contract, #2)")]
 fn test_constructor_rejects_invalid_share_total() {
     let env = Env::default();
     let recipients = vec![
@@ -380,4 +380,38 @@ fn test_distribute_emits_fee_distributed_event_per_recipient() {
         .filter(|(contract, topics, _)| *contract == s.contract_id && *topics == topic)
         .count();
     assert_eq!(per_recipient, 2);
+}
+
+// ── share sum validation ─────────────────────────────────────────────────────
+
+#[test]
+fn test_schedule_rejects_shares_not_summing_to_10000_bps() {
+    let s = default_setup();
+    let under = vec![
+        &s.env,
+        FeeRecipient {
+            address: Address::generate(&s.env),
+            share_bps: 9_999,
+        },
+    ];
+    let over = vec![
+        &s.env,
+        FeeRecipient {
+            address: Address::generate(&s.env),
+            share_bps: 6_000,
+        },
+        FeeRecipient {
+            address: Address::generate(&s.env),
+            share_bps: 4_001,
+        },
+    ];
+    assert_eq!(
+        s.client.try_schedule_recipients(&s.admin, &under),
+        Err(Ok(crate::Error::SharesMustSum100Percent))
+    );
+    assert_eq!(
+        s.client.try_schedule_recipients(&s.admin, &over),
+        Err(Ok(crate::Error::SharesMustSum100Percent))
+    );
+    assert!(s.client.get_pending_recipients().is_none());
 }
