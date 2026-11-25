@@ -831,19 +831,30 @@ impl PaymentEscrowContract {
         }
 
         let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        let xlm_token: Address = env.storage().instance().get(&DataKey::XlmToken).unwrap();
         let treasury: Address = env
             .storage()
             .instance()
             .get(&DataKey::EmergencyTreasury)
             .unwrap();
-        let token_client = token::Client::new(&env, &usdc_token);
         let contract_address = env.current_contract_address();
-        let amount = token_client.balance(&contract_address);
-        if amount <= 0 {
+        let usdc_client = token::Client::new(&env, &usdc_token);
+        let xlm_client = token::Client::new(&env, &xlm_token);
+        let usdc_amount = usdc_client.balance(&contract_address);
+        let xlm_amount = xlm_client.balance(&contract_address);
+        if usdc_amount == 0 && xlm_amount == 0 {
             panic!("No escrow funds to drain");
         }
 
-        token_client.transfer(&contract_address, &treasury, &amount);
+        if usdc_amount > 0 {
+            usdc_client.transfer(&contract_address, &treasury.clone(), &usdc_amount);
+        }
+        if xlm_amount > 0 {
+            xlm_client.transfer(&contract_address, &treasury, &xlm_amount);
+        }
+        let amount = usdc_amount
+            .checked_add(xlm_amount)
+            .expect("drained amount overflow");
         env.storage()
             .instance()
             .set(&DataKey::EmergencyLastDrainLedger, &current_ledger);

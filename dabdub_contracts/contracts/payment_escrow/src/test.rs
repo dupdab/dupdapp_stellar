@@ -935,3 +935,126 @@ fn test_max_ttl_storage_limit_rejects_deposit_before_moving_funds() {
         assert_eq!(token::Client::new(&env, &usdc).balance(&customer), balance);
     }
 }
+
+// ── emergency_drain XLM path (#1492) ─────────────────────────────────────────
+
+#[test]
+fn test_emergency_drain_drains_xlm_escrow() {
+    let (
+        env,
+        client,
+        contract_id,
+        _admin,
+        customer,
+        merchant,
+        _usdc,
+        xlm,
+        emergency_signer_one,
+        emergency_signer_two,
+        _emergency_signer_three,
+        emergency_treasury,
+    ) = setup_env();
+
+    token::StellarAssetClient::new(&env, &xlm).mint(&customer, &500_000_000i128);
+
+    let payment_id = make_id(&env, 200);
+    client.deposit(
+        &customer,
+        &payment_id,
+        &merchant,
+        &500_000_000i128,
+        &DEFAULT_PAYMENT_TTL,
+        &AssetType::Xlm,
+    );
+
+    let drained = client.emergency_drain(
+        &emergency_signer_one,
+        &emergency_signer_one,
+        &emergency_signer_two,
+    );
+    assert_eq!(drained, 500_000_000);
+
+    let xlm_client = token::Client::new(&env, &xlm);
+    assert_eq!(xlm_client.balance(&contract_id), 0);
+    assert_eq!(xlm_client.balance(&emergency_treasury), 500_000_000);
+}
+
+#[test]
+fn test_emergency_drain_drains_both_usdc_and_xlm() {
+    let (
+        env,
+        client,
+        contract_id,
+        _admin,
+        customer,
+        merchant,
+        usdc,
+        xlm,
+        emergency_signer_one,
+        emergency_signer_two,
+        _emergency_signer_three,
+        emergency_treasury,
+    ) = setup_env();
+
+    token::StellarAssetClient::new(&env, &xlm).mint(&customer, &300_000_000i128);
+
+    let usdc_id = make_id(&env, 201);
+    client.deposit(
+        &customer,
+        &usdc_id,
+        &merchant,
+        &200_000_000i128,
+        &DEFAULT_PAYMENT_TTL,
+        &AssetType::Usdc,
+    );
+
+    let xlm_id = make_id(&env, 202);
+    client.deposit(
+        &customer,
+        &xlm_id,
+        &merchant,
+        &300_000_000i128,
+        &DEFAULT_PAYMENT_TTL,
+        &AssetType::Xlm,
+    );
+
+    let drained = client.emergency_drain(
+        &emergency_signer_one,
+        &emergency_signer_one,
+        &emergency_signer_two,
+    );
+    assert_eq!(drained, 500_000_000);
+
+    let usdc_client = token::Client::new(&env, &usdc);
+    let xlm_client = token::Client::new(&env, &xlm);
+    assert_eq!(usdc_client.balance(&contract_id), 0);
+    assert_eq!(xlm_client.balance(&contract_id), 0);
+    assert_eq!(usdc_client.balance(&emergency_treasury), 200_000_000);
+    assert_eq!(xlm_client.balance(&emergency_treasury), 300_000_000);
+}
+
+#[test]
+#[should_panic(expected = "No escrow funds to drain")]
+fn test_emergency_drain_xlm_only_panics_when_no_funds() {
+    let (
+        env,
+        client,
+        _contract_id,
+        _admin,
+        _customer,
+        _merchant,
+        _usdc,
+        _xlm,
+        emergency_signer_one,
+        emergency_signer_two,
+        _emergency_signer_three,
+        _emergency_treasury,
+    ) = setup_env();
+    // No deposits — both USDC and XLM balances are 0
+    let _ = env;
+    client.emergency_drain(
+        &emergency_signer_one,
+        &emergency_signer_one,
+        &emergency_signer_two,
+    );
+}
