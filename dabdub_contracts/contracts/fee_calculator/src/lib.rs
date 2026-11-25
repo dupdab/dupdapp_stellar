@@ -4,6 +4,12 @@ mod test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Vec};
 
+/// Hard ceiling for a single-transaction fee amount in stroops.
+/// Prevents an integer overflow in `amount * fee_bps` when both are large.
+/// i128::MAX / BPS_DENOMINATOR(10_000) ≈ 1.7 × 10^34, well above any real
+/// Stellar balance, but we cap earlier to keep math well within safe range.
+const MAX_AMOUNT_FOR_FEE: i128 = i128::MAX / BPS_DENOMINATOR;
+
 const LEDGERS_PER_30_DAYS: u32 = 172_800;
 const BPS_DENOMINATOR: i128 = 10_000;
 
@@ -27,6 +33,8 @@ pub enum DataKey {
     SettlementCaller,
     Admin,
     FeeTiers,
+    /// Upper bound (bps) that calculate_fee will accept; set by admin (issue #1507).
+    MaxFeeBps,
     MerchantVolume(Address),
 }
 
@@ -52,15 +60,31 @@ impl FeeCalculatorContract {
     }
 
     pub fn set_fee_tiers(env: Env, caller: Address, tiers: Vec<FeeTier>) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        Self::validate_tiers(&tiers);
+        env.storage().instance().set(&DataKey::FeeTiers, &tiers);
+    }
+
     pub fn set_settlement_caller(env: Env, caller: Address, settlement_caller: Address) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
         env.storage().instance().set(&DataKey::SettlementCaller, &settlement_caller);
     }
+
+    /// Set the maximum fee rate (bps) that calculate_fee will accept (issue #1507).
+    /// Any tier that produces a rate above this ceiling will be rejected at calculation time.
+    pub fn set_max_fee_bps(env: Env, caller: Address, max_bps: u32) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        Self::validate_tiers(&tiers);
-        env.storage().instance().set(&DataKey::FeeTiers, &tiers);
+        if max_bps > 10_000 {
+            panic!("max_fee_bps must be <= 10000");
+        }
+        env.storage().instance().set(&DataKey::MaxFeeBps, &max_bps);
+    }
+
+    pub fn get_max_fee_bps(env: Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::MaxFeeBps)
     }
 
     pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
@@ -74,9 +98,20 @@ impl FeeCalculatorContract {
         if amount <= 0 {
             panic!("amount must be > 0");
         }
+        // Guard against overflow in amount * fee_bps (issue #1508).
+        if amount > MAX_AMOUNT_FOR_FEE {
+            panic!("amount exceeds maximum allowed for fee computation");
+        }
 
         let volume = Self::update_and_get_volume(&env, &merchant, amount);
         let fee_bps = Self::select_fee_bps(&env, volume);
+
+        // Validate the selected rate against the configured ceiling (issue #1507).
+        if let Some(max_bps) = env.storage().instance().get::<DataKey, u32>(&DataKey::MaxFeeBps) {
+            if fee_bps > max_bps {
+                panic!("selected fee_bps exceeds configured max_fee_bps");
+            }
+        }
 
         let fee = amount
             .checked_mul(fee_bps as i128)
