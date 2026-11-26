@@ -32,6 +32,19 @@ fn args(env: &Env) -> Bytes {
 }
 
 #[test]
+#[should_panic(expected = "DuplicateSigner")]
+fn test_init_rejects_duplicate_signers() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+
+    // signer1 appears twice in the signer list.
+    env.register(MultisigAdminContract, (&signer1, &signer2, &signer1));
+}
+
+#[test]
 fn test_propose_and_approve_by_admin1_and_admin2() {
     let (env, client, admin1, admin2, _admin3) = setup_env();
 
