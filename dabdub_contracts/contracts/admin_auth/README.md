@@ -21,6 +21,16 @@ Admin credentials are **not** stored as raw public keys. When an admin is added,
 - **Comparison:** `is_admin` / privileged operations derive the caller's credential and check it against the set of stored derived credentials. A caller is authorized only if its derived credential matches an active entry.
 - **Rotation:** because credentials are derived deterministically, a new key can be added (its derived credential stored) before the old one is removed. Both keys are valid during the overlap window, so rotation happens without downtime.
 
+## Role hierarchy
+
+Roles are ordered from least to most privileged:
+
+```
+VIEWER < OPERATOR < ADMIN < SUPERADMIN
+```
+
+A role inherits every permission granted to the roles below it. `has_permission(account, permission)` resolves the account's role and checks the permission against that role **and all lower roles in the hierarchy**, so a `SUPERADMIN` implicitly satisfies `ADMIN`, `OPERATOR`, and `VIEWER` permissions. Conversely, an `ADMIN` does **not** satisfy permissions that are granted only to `SUPERADMIN`.
+
 ## Events
 
 - Admin added — emitted when a new admin address is granted rights.
@@ -38,6 +48,7 @@ Because failed admin authentication attempts emit `AdminAuthFailed`, brute-force
 - `add_admin` — owner-only; derives and stores the credential for an address.
 - `remove_admin` — owner-only; revokes admin rights from an address.
 - `is_admin` — read-only check used by dependent contracts; derives the caller's credential and compares against stored derived credentials.
+- `has_permission` — read-only check that walks the role hierarchy (see above) to decide whether an account holds a given permission.
 
 ## Key rotation
 
