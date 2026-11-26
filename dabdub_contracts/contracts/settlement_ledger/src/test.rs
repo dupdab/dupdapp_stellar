@@ -1,9 +1,9 @@
 #![cfg(test)]
 
 use fee_calculator::{FeeCalculatorContract, FeeCalculatorContractClient, FeeTier};
-use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env, String};
+use soroban_sdk::{testutils::{Address as _, Ledger as _}, vec, Address, BytesN, Env, String};
 
-use crate::{SettlementLedgerContract, SettlementLedgerContractClient};
+use crate::{Error, SettlementLedgerContract, SettlementLedgerContractClient};
 
 fn pid(env: &Env, seed: u8) -> BytesN<32> {
     BytesN::from_array(env, &[seed; 32])
@@ -116,15 +116,16 @@ fn test_admin_rotation_allows_new_admin_to_record() {
     assert_eq!(client.settlement_count(&merchant), 1);
 }
 
-// ── immutability: duplicate write must panic ──────────────────────────────────
+// ── idempotency: replaying a payment_id returns the existing entry ───────────
 
 #[test]
-fn test_duplicate_record_panics() {
+fn test_duplicate_record_is_idempotent() {
     let (env, admin, client) = setup();
     let merchant = Address::generate(&env);
     record(&client, &admin, &env, 2, &merchant, 5_000, 100);
 
-    let result = client.try_record_settlement(
+    // Replay with different non-key fields: the original entry is returned.
+    let replayed = client.record_settlement(
         &admin,
         &pid(&env, 2),
         &merchant,
@@ -135,7 +136,148 @@ fn test_duplicate_record_panics() {
         &fiat_ref(&env, "DUP"),
         &currency(&env, "NGN"),
     );
-    assert!(result.is_err());
+    assert_eq!(replayed.timestamp, 1_700_000_000u64);
+    assert_eq!(replayed.fiat_ref, fiat_ref(&env, "REF-001"));
+    assert_eq!(client.settlement_count(&merchant), 1);
+    assert_eq!(client.total_settlement_count(), 1);
+}
+
+// ── archival of old settlements ─────────────────────────────────────────────
+
+#[test]
+fn test_archive_settlements_moves_old_records() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    record(&client, &admin, &env, 80, &merchant, 5_000, 100);
+    env.ledger().with_mut(|l| l.sequence_number += 100);
+    record(&client, &admin, &env, 81, &merchant, 5_000, 100);
+
+    // Only the first settlement is at least 50 ledgers old.
+    assert_eq!(client.archive_settlements(&admin, &50, &10), 1);
+    assert!(client.is_archived(&pid(&env, 80)));
+    assert!(!client.is_archived(&pid(&env, 81)));
+
+    // Still readable and still listed after archival.
+    assert_eq!(client.get_settlement(&pid(&env, 80)).amount, 5_000);
+    assert_eq!(client.list_settlements(&merchant, &0).len(), 2);
+
+    // Nothing left to archive on a second pass.
+    assert_eq!(client.archive_settlements(&admin, &50, &10), 0);
+}
+
+#[test]
+fn test_archive_settlements_respects_limit() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    record(&client, &admin, &env, 82, &merchant, 5_000, 100);
+    record(&client, &admin, &env, 83, &merchant, 5_000, 100);
+    env.ledger().with_mut(|l| l.sequence_number += 100);
+
+    assert_eq!(client.archive_settlements(&admin, &50, &1), 1);
+    assert_eq!(client.archive_settlements(&admin, &50, &1), 1);
+    assert_eq!(client.archive_settlements(&admin, &50, &1), 0);
+}
+
+#[test]
+fn test_archive_settlements_unauthorized_caller_fails() {
+    let (env, _admin, client) = setup();
+    let caller = Address::generate(&env);
+    assert!(client.try_archive_settlements(&caller, &0, &10).is_err());
+}
+
+// ── merchant settlement history (cursor pagination) ─────────────────────────
+
+#[test]
+fn test_get_merchant_settlements_paginates_with_cursor() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    let other = Address::generate(&env);
+    for seed in 100u8..105 {
+        record(&client, &admin, &env, seed, &merchant, 5_000, 100);
+    }
+    record(&client, &admin, &env, 110, &other, 5_000, 100);
+
+    let first = client.get_merchant_settlements(&merchant, &2, &0);
+    assert_eq!(first.settlement_ids.len(), 2);
+    assert_eq!(first.settlement_ids.get(0).unwrap(), pid(&env, 100));
+    assert_eq!(first.settlement_ids.get(1).unwrap(), pid(&env, 101));
+    assert_eq!(first.next_cursor, Some(2));
+
+    let second = client.get_merchant_settlements(&merchant, &2, &first.next_cursor.unwrap());
+    assert_eq!(second.settlement_ids.get(0).unwrap(), pid(&env, 102));
+    assert_eq!(second.next_cursor, Some(4));
+
+    let last = client.get_merchant_settlements(&merchant, &2, &4);
+    assert_eq!(last.settlement_ids.len(), 1);
+    assert_eq!(last.settlement_ids.get(0).unwrap(), pid(&env, 104));
+    assert_eq!(last.next_cursor, None);
+}
+
+#[test]
+fn test_get_merchant_settlements_empty_and_past_end() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+    let empty = client.get_merchant_settlements(&merchant, &10, &0);
+    assert_eq!(empty.settlement_ids.len(), 0);
+    assert_eq!(empty.next_cursor, None);
+
+    record(&client, &admin, &env, 120, &merchant, 5_000, 100);
+    let past = client.get_merchant_settlements(&merchant, &10, &5);
+    assert_eq!(past.settlement_ids.len(), 0);
+    assert_eq!(past.next_cursor, None);
+}
+
+// ── escrow amount validation ────────────────────────────────────────────────
+
+fn record_checked(
+    client: &SettlementLedgerContractClient,
+    admin: &Address,
+    env: &Env,
+    seed: u8,
+    merchant: &Address,
+    escrow_release_amount: i128,
+) -> Result<(), Error> {
+    let result = client.try_record_settlement_checked(
+        admin,
+        &pid(env, seed),
+        merchant,
+        &5_000,
+        &100,
+        &4_900,
+        &1_700_000_000u64,
+        &fiat_ref(env, "REF-ESC"),
+        &currency(env, "NGN"),
+        &escrow_release_amount,
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(Ok(err)) => Err(err),
+        Err(Err(_)) => panic!("unexpected host error"),
+    }
+}
+
+#[test]
+fn test_escrow_check_allows_amount_up_to_release_amount() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+
+    // Boundary: amount == release amount, and amount < release amount.
+    assert!(record_checked(&client, &admin, &env, 130, &merchant, 5_000).is_ok());
+    assert!(record_checked(&client, &admin, &env, 131, &merchant, 6_000).is_ok());
+    assert_eq!(client.get_settlement(&pid(&env, 130)).amount, 5_000);
+}
+
+#[test]
+fn test_escrow_check_rejects_amount_above_release_amount() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+
+    let result = record_checked(&client, &admin, &env, 132, &merchant, 4_999);
+    assert_eq!(result, Err(Error::AmountMismatch));
+    assert_eq!(client.settlement_count(&merchant), 0);
+
+    let zero = record_checked(&client, &admin, &env, 133, &merchant, 0);
+    assert_eq!(zero, Err(Error::AmountMismatch));
 }
 
 #[test]
