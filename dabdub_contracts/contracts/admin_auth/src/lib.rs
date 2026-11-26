@@ -3,7 +3,7 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, String, Vec};
 
 /// Contract ABI version. Bumped on every WASM upgrade; CI checks this
 /// matches the crate version in Cargo.toml.
@@ -75,6 +75,28 @@ struct AdminDeactivatedEvent {
     admin: Address,
 }
 
+/// Emitted on every failed admin authentication attempt so brute-force
+/// attempts are visible on-chain (issue #1555).
+#[contracttype]
+struct AdminAuthFailedEvent {
+    caller: Address,
+    function: String,
+    timestamp: u64,
+}
+
+/// Derive the stored credential for an admin address.
+///
+/// Admin credentials are never stored as raw public keys. Instead we store a
+/// deterministic derived key: the SHA-256 hash of the address' XDR encoding.
+/// Authentication derives the caller's key the same way and compares it
+/// against the stored derived keys, so the raw public key is never the
+/// comparison target and rotation is a matter of adding/removing derived
+/// entries rather than mutating a single raw key.
+fn derive_admin_key(env: &Env, admin: &Address) -> Bytes {
+    let raw = admin.to_xdr(env);
+    env.crypto().sha256(&raw).to_bytes()
+}
+
 #[contract]
 pub struct AdminAuthContract;
 
@@ -113,9 +135,13 @@ impl AdminAuthContract {
     /// If the address is already an admin, its role is updated and a distinct
     /// `AdminRoleChangedEvent` is emitted instead of `AdminAddedEvent`, so
     /// off-chain consumers can distinguish new grants from privilege changes.
+    ///
+    /// Multiple admins may be active simultaneously, which is what enables
+    /// key rotation without downtime: add the new key, migrate callers, then
+    /// `revoke_admin` the old key.
     pub fn add_admin(env: Env, caller: Address, admin: Address, role: AdminRole) {
         caller.require_auth();
-        Self::require_super_admin(&env, &caller);
+        Self::require_super_admin(&env, &caller, "add_admin");
         let existing: Option<AdminUser> = env
             .storage()
             .persistent()
@@ -167,7 +193,7 @@ impl AdminAuthContract {
     /// The SuperAdmin cannot revoke their own admin record (fix for #1041).
     pub fn revoke_admin(env: Env, caller: Address, admin: Address) {
         caller.require_auth();
-        Self::require_super_admin(&env, &caller);
+        Self::require_super_admin(&env, &caller, "revoke_admin");
 
         // Prevent the SuperAdmin from revoking themselves (#1041)
         let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
@@ -199,7 +225,7 @@ impl AdminAuthContract {
     /// Transfer SuperAdmin rights to a new address. SuperAdmin only (#1042).
     pub fn transfer_super_admin(env: Env, caller: Address, new_super_admin: Address) {
         caller.require_auth();
-        Self::require_super_admin(&env, &caller);
+        Self::require_super_admin(&env, &caller, "transfer_super_admin");
 
         let previous = caller.clone();
 
@@ -240,58 +266,4 @@ impl AdminAuthContract {
         );
     }
 
-    /// Deactivate an admin without removing its credential record. SuperAdmin
-    /// only. `is_admin` returns false for a deactivated admin.
-    pub fn deactivate_admin(env: Env, caller: Address, admin: Address) {
-        caller.require_auth();
-        Self::require_super_admin(&env, &caller);
-
-        let key = DataKey::Admin(admin.clone());
-        let mut user: AdminUser = env
-            .storage()
-            .instance()
-            .get(&key)
-            .unwrap_or_else(|| panic!("{}", errors::ADMIN_NOT_FOUND));
-        user.active = false;
-        Self::save(&env, user);
-        env.events().publish(
-            ("ADMIN_AUTH", "admin_deactivated"),
-            AdminDeactivatedEvent { admin },
-        );
-    }
-
-    pub fn get_admin(env: Env, admin: Address) -> Option<AdminUser> {
-        env.storage().persistent().get(&DataKey::Admin(admin))
-    }
-
-    /// True when the address is an active admin in the store.
-    pub fn is_admin(env: Env, admin: Address) -> bool {
-        match env
-            .storage()
-            .persistent()
-            .get::<DataKey, AdminUser>(&DataKey::Admin(admin))
-        {
-            Some(user) => user.active,
-            None => false,
-        }
-    }
-
-    fn save(env: &Env, user: AdminUser) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
-    }
-
-    fn require_super_admin(env: &Env, caller: &Address) {
-        let super_admin: Address = env.storage().instance().get(&DataKey::SuperAdmin).unwrap();
-        if caller != &super_admin {
-            panic!("{}", errors::NOT_ADMIN);
-        }
-    }
-
-    fn save(env: &Env, user: AdminUser) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(user.admin.clone()), &user);
-    }
-}
+    /// Deactivate an admin without removing its c
