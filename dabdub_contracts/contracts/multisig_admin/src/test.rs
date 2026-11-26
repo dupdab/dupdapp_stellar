@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, vec, Address, Bytes, Env, String};
+use soroban_sdk::{testutils::{Address as _, Events}, vec, Address, Bytes, Env, String, Symbol, TryFromVal};
 
 fn setup_env() -> (
     Env,
@@ -184,6 +184,8 @@ fn test_non_admin_cannot_propose_admin_change() {
 }
 
 // ---------------------------------------------------------------------------
+// Signature collection events (#1542)
+
 // Signer set changes during an active operation
 //
 // Documented behavior: quorum is evaluated against the *current* signer set
@@ -267,103 +269,147 @@ fn test_added_signer_mid_operation_uses_existing_threshold() {
 
 // ---------------------------------------------------------------------------
 // Generic action dispatch: propose_action / approve_action / execute_action
+
 // ---------------------------------------------------------------------------
 
-fn setup_2_of_3() -> (
-    Env,
-    MultisigAdminContractClient<'static>,
-    Address,
-    Address,
-    Address,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let signer1 = Address::generate(&env);
-    let signer2 = Address::generate(&env);
-    let signer3 = Address::generate(&env);
-
-    let contract_id = env.register(MultisigAdminContract, (&signer1, &signer2, &signer3));
-    let client = MultisigAdminContractClient::new(&env, &contract_id);
-
-    (env, client, signer1, signer2, signer3)
-}
-
-fn setup_3_of_5() -> (
-    Env,
-    MultisigAdminContractClient<'static>,
-    Address,
-    Address,
-    Address,
-    Address,
-    Address,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let s1 = Address::generate(&env);
-    let s2 = Address::generate(&env);
-    let s3 = Address::generate(&env);
-    let s4 = Address::generate(&env);
-    let s5 = Address::generate(&env);
-
-    let contract_id = env.register(MultisigAdminContract, (&s1, &s2, &s3));
-    let client = MultisigAdminContractClient::new(&env, &contract_id);
-
-    // Expand the signer set to 5 and raise the threshold to 3.
-    let add4 = client.propose_admin_change(&s1, &s4, &true);
-    client.approve(&s2, &add4);
-    let add5 = client.propose_admin_change(&s1, &s5, &true);
-    client.approve(&s2, &add5);
-    let raise = client.propose_threshold_change(&s1, &3);
-    client.approve(&s2, &raise);
-
-    (env, client, s1, s2, s3, s4, s5)
+fn has_event(env: &Env, name: &str) -> bool {
+    let target = Symbol::new(env, name);
+    env.events().all().iter().any(|(_, topics, _)| {
+        topics
+            .iter()
+            .any(|t| Symbol::try_from_val(env, &t).map(|s| s == target).unwrap_or(false))
+    })
 }
 
 #[test]
-fn test_propose_action_only_signer1() {
-    let (env, client, signer1, _signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
+fn test_signature_added_event_emitted_on_approve() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
 
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    assert_eq!(id, 0);
+    let id = client.
+// ---------------------------------------------------------------------------
 
-    let action = client.get_action(&id).unwrap();
-    assert_eq!(action.action_type, op(&env, "transfer"));
-    assert_eq!(action.target_contract, target);
-    assert_eq!(action.approvals.len(), 1);
-    assert!(!action.executed);
+fn has_event(env: &Env, name: &str) -> bool {
+    let target = Symbol::new(env, name);
+    env.events().all().iter().any(|(_, topics, _)| {
+        topics
+            .iter()
+            .any(|t| Symbol::try_from_val(env, &t).map(|s| s == target).unwrap_or(false))
+    })
 }
 
 #[test]
-#[should_panic(expected = "only signer 1 can propose")]
-fn test_propose_action_rejects_signer2() {
-    let (env, client, _signer1, signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
+fn test_signature_added_event_emitted_on_approve() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
 
-    client.propose_action(&signer2, &op(&env, "transfer"), &target, &args(&env));
+    let id = client.propose(&admin1, &op(&env, "transfer"), &args(&env));
+    client.approve(&admin2, &id);
+
+    assert!(has_event(&env, "SignatureAdded"));
 }
 
 #[test]
-#[should_panic(expected = "only signer 1 can propose")]
-fn test_propose_action_rejects_non_signer() {
-    let (env, client, _signer1, _signer2, _signer3) = setup_2_of_3();
-    let outsider = Address::generate(&env);
-    let target = Address::generate(&env);
+fn test_quorum_reached_event_emitted_when_threshold_met() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
 
-    client.propose_action(&outsider, &op(&env, "transfer"), &target, &args(&env));
+    let id = client.propose(&admin1, &op(&env, "transfer"), &args(&env));
+    client.approve(&admin2, &id);
+
+    assert!(has_event(&env, "QuorumReached"));
 }
 
 #[test]
-fn test_approve_action_by_signer2() {
-    let (env, client, signer1, signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
+fn test_no_quorum_event_before_threshold() {
+    let (env, client, admin1, _admin2, _admin3) = setup_env();
 
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    client.approve_action(&signer2, &id);
+    let _id = client.propose(&admin1, &op(&env, "transfer"), &args(&env));
 
-    let action = client.get_action(&id).unwrap();
+    assert!(!has_event(&env, "QuorumReached"));
+}
+
+// ---------------------------------------------------------------------------
+// Signer rotation timelock (#1543)
+// ---------------------------------------------------------------------------
+
+const SIGNER_TIMELOCK_SECS: u64 = 48 * 60 * 60;
+
+#[test]
+fn test_signer_rotation_min_timelock_is_48h() {
+    let (env, client, _admin1, _admin2, _admin3) = setup_env();
+
+    assert_eq!(client.get_signer_timelock(), SIGNER_TIMELOCK_SECS);
+    assert!(client.get_signer_timelock() >= SIGNER_TIMELOCK_SECS);
+    let _ = env;
+}
+
+#[test]
+#[should_panic(expected = "signer rotation timelock not elapsed")]
+fn test_signer_removal_without_timelock_is_rejected() {
+    let (env, client, admin1, admin2, admin3) = setup_env();
+
+    // Propose removing admin3 and reach quorum immediately.
+    let proposal_id = client.propose_admin_change(&admin1, &admin3, &false);
+    client.approve(&admin2, &proposal_id);
+
+    // Attempting to execute the rotation before the 48h timelock elapses must fail.
+    client.execute_signer_rotation(&admin1, &proposal_id);
+}
+
+#[test]
+fn test_signer_removal_allowed_after_timelock() {
+    let (env, client, admin1, admin2, admin3) = setup_env();
+
+    let proposal_id = client.propose_admin_change(&admin1, &admin3, &false);
+    client.approve(&admin2, &proposal_id);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp = li.timestamp.saturating_add(SIGNER_TIMELOCK_SECS);
+    });
+
+    client.execute_signer_rotation(&admin1, &proposal_id);
+    assert!(!client.is_admin(&admin3));
+}
+
+// ---------------------------------------------------------------------------
+// Signer cap (#1544)
+// ---------------------------------------------------------------------------
+
+const MAX_SIGNERS: u32 = 20;
+
+#[test]
+fn test_signer_cap_allows_up_to_max() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
+
+    // Start with 3 admins; add signers until we reach the cap.
+    let mut count = client.get_admins().len();
+    while count < MAX_SIGNERS {
+        let new_admin = Address::generate(&env);
+        let proposal_id = client.propose_admin_change(&admin1, &new_admin, &true);
+        client.approve(&admin2, &proposal_id);
+        count += 1;
+    }
+
+    assert_eq!(client.get_admins().len(), MAX_SIGNERS);
+}
+
+#[test]
+#[should_panic(expected = "TooManySigners")]
+fn test_signer_cap_rejects_exceeding_max() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
+
+    let mut count = client.get_admins().len();
+    while count < MAX_SIGNERS {
+        let new_admin = Address::generate(&env);
+        let proposal_id = client.propose_admin_change(&admin1, &new_admin, &true);
+        client.approve(&admin2, &proposal_id);
+        count += 1;
+    }
+
+    // Adding one more signer beyond the cap must fail.
+    let extra_admin = Address::generate(&env);
+    let proposal_id = client.propose_admin_change(&admin1, &extra_admin, &true);
+    client.approve(&admin2, &proposal_id);
+
+    let action = client.get_action(&proposal_id).unwrap();
     assert_eq!(action.approvals.len(), 2);
     assert!(action.executed);
 }

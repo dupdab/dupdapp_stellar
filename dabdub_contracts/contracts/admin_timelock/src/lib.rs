@@ -5,6 +5,7 @@ mod test;
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec};
 
 const DEFAULT_MIN_DELAY_SECONDS: u64 = 48 * 60 * 60;
+const MIN_SIGNER_ROTATION_DELAY_SECONDS: u64 = 48 * 60 * 60;
 const MIN_GOVERNANCE_DELAY_SECONDS: u64 = 24 * 60 * 60;
 const MAX_EXECUTION_WINDOW_SECONDS: u64 = 48 * 60 * 60;
 const DEFAULT_EXECUTION_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -128,6 +129,28 @@ impl AdminTimelockContract {
         Self::queue_action(env, caller, action_id)
     }
 
+    pub fn queue_signer_rotation(
+        env: Env,
+        caller: Address,
+        action_id: BytesN<32>,
+    ) -> TimelockAction {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let now = env.ledger().timestamp();
+        let delay = Self::get_min_delay(env.clone()).max(MIN_SIGNER_ROTATION_DELAY_SECONDS);
+        let execute_after = now.saturating_add(delay);
+        let action = TimelockAction {
+            action_id: action_id.clone(),
+            queued_at: now,
+            execute_after,
+            execute_by: execute_after.saturating_add(MAX_EXECUTION_WINDOW_SECONDS),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAction(action_id.clone()), &action);
+        action
+    }
+
     pub fn queue_batch(
         env: Env,
         caller: Address,
@@ -154,6 +177,8 @@ impl AdminTimelockContract {
         env.storage()
             .persistent()
             .set(&DataKey::PendingAction(batch_id.clone()), &action);
+        action
+    }
         action
     }
 
