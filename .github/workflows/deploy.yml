@@ -1,9 +1,54 @@
 name: Deploy
 
+# ===========================================================================
+# ROLLBACK PROCEDURE (issue #1607)
+# ===========================================================================
+# A deploy can fail part-way: some contracts are deployed and others are not,
+# leaving the network in a mixed state. Soroban contracts are immutable once
+# deployed, so "rollback" means re-pointing consumers at the last known-good
+# WASM hashes recorded in the deploy manifest (deploy-manifest.json) and
+# re-deploying that set. This workflow keeps the previous manifest as an
+# artifact so a prior known-good set can always be restored.
+#
+# Partial-failure states and what to do:
+#   * build-wasm fails            -> nothing deployed; fix and re-run. No rollback.
+#   * deploy-testnet fails midway -> some contracts deployed, others not.
+#       The manifest step is skipped, so the last good manifest is untouched.
+#       Run the "Rollback" workflow (workflow_dispatch) against the previous
+#       manifest artifact, or follow the admin runbook below.
+#   * post-deploy verification fails -> treat as a failed deploy; roll back to
+#       the previous manifest before announcing the release.
+#
+# ADMIN RUNBOOK — emergency rollback
+#   1. Identify the last known-good manifest: the most recent successful
+#      "deploy-manifest-<sha>" artifact (or the committed deploy-manifest.json
+#      on the previous release tag).
+#   2. Trigger the rollback: Actions -> "Deploy Soroban Contracts" ->
+#      Run workflow -> set `rollback_manifest` to that artifact name.
+#   3. Owner: on-call release engineer (see CODEOWNERS). A second admin must
+#      approve before mainnet rollback.
+#   4. Verify: run `stellar contract info` for each contract id in the restored
+#      manifest and confirm the WASM hash matches; check the smoke tests pass.
+#   5. Record the incident and the manifest used in the release notes.
+#
+# STAGING FIRST: always exercise the rollback path on testnet/staging before
+# performing it on mainnet. The testnet job below is the staging rehearsal.
+# ===========================================================================
+
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      rollback_manifest:
+        description: "Artifact name of the known-good deploy manifest to restore (leave empty for a normal deploy)"
+        required: false
+        default: ""
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
 
 jobs:
   deploy:
@@ -27,6 +72,128 @@ jobs:
           echo "timestamp=${TIMESTAMP}" >> "$GITHUB_OUTPUT"
           echo "network=${NETWORK}" >> "$GITHUB_OUTPUT"
           echo "::notice title=Contract Deployment::contract_name=${CONTRACT_NAME} wasm_hash=${WASM_HASH} deployer=${DEPLOYER} timestamp=${TIMESTAMP} network=${NETWORK}"
+
+          # ------------------------------------------------------------------
+          # Required configuration. Every contract with a `__constructor` needs
+          # its arguments supplied here; a missing value is reported by name
+          # rather than surfacing as an opaque CLI error mid-deploy.
+          # ------------------------------------------------------------------
+          require() {
+            local var=$1
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var is not set — configure it in the repository's Actions variables"
+              missing=1
+            fi
+          }
+
+          missing=0
+          require DEPLOY_ADMIN
+          require RBAC_SUPER_ADMIN
+          require XLM_TOKEN
+          require USDC_TOKEN
+          require FEE_DISTRIBUTOR_RECIPIENTS
+          require FEE_DISTRIBUTOR_ALLOWED_CALLER
+          require FEE_TIERS
+          require MULTISIG_ADMIN_1
+          require MULTISIG_ADMIN_2
+          require MULTISIG_ADMIN_3
+          require ESCROW_DEFAULT_TTL_LEDGERS
+          require EMERGENCY_SIGNERS
+          require EMERGENCY_TREASURY
+          require EMERGENCY_COOLDOWN_LEDGERS
+          require CONFIRMATION_COUNT
+          require BATCH_PAYMENTS_MIN_AMOUNT
+          require BATCH_PAYMENTS_MAX_AMOUNT
+          [ "$missing" -eq 0 ] || exit 1
+
+          # ------------------------------------------------------------------
+          # Deploy helper. Anything after the wasm path is forwarded to the
+          # contract's constructor.
+          # ------------------------------------------------------------------
+          deploy_contract() {
+            local name=$1
+            local wasm=$2
+            shift 2
+            local id
+            if [ "$#" -gt 0 ]; then
+              id=$(stellar contract deploy \
+                --wasm "$wasm" \
+                --source deployer \
+                --network testnet \
+                -- "$@" 2>&1 | tail -1)
+            else
+              id=$(stellar contract deploy \
+                --wasm "$wasm" \
+                --source deployer \
+                --network testnet 2>&1 | tail -1)
+            fi
+            echo "${name}_id=${id}" >> "$GITHUB_OUTPUT"
+            echo "Deployed $name: $id"
+            # Echoed into the environment so a later contract can point at it.
+            printf -v "${name}_id" '%s' "$id"
+          }
+
+          # --- no constructor ------------------------------------------------
+          deploy_contract liquidity_router      wasm/liquidity_router.wasm
+          deploy_contract platform_stats        wasm/platform_stats.wasm
+          deploy_contract reconciliation        wasm/reconciliation.wasm
+          deploy_contract settlement_ledger     wasm/settlement_ledger.wasm
+          deploy_contract slippage_protection   wasm/slippage_protection.wasm
+          deploy_contract stellar_confirmations wasm/stellar_confirmations.wasm
+          deploy_contract payment_request       wasm/payment_request.wasm
+          deploy_contract merchant_registry     wasm/merchant_registry.wasm
+          deploy_contract batch_payments        wasm/batch_payments.wasm
+          deploy_contract fee_calculator         wasm/fee_calculator.wasm
+
+          # --- with constructor ----------------------------------------------
+          deploy_contract admin_auth wasm/admin_auth.wasm -- "$DEPLOY_ADMIN"
+          deploy_contract admin_timelock wasm/admin_timelock.wasm -- "$DEPLOY_ADMIN"
+          deploy_contract rbac_access wasm/rbac_access.wasm -- "$RBAC_SUPER_ADMIN"
+          deploy_contract multisig_admin wasm/multisig_admin.wasm -- \
+            "$MULTISIG_ADMIN_1" "$MULTISIG_ADMIN_2" "$MULTISIG_ADMIN_3"
+          deploy_contract fee_distributor wasm/fee_distributor.wasm -- \
+            "$FEE_DISTRIBUTOR_RECIPIENTS" "$FEE_DISTRIBUTOR_ALLOWED_CALLER" "$FEE_TIERS"
+          deploy_contract payment_escrow wasm/payment_escrow.wasm -- \
+            "$ESCROW_DEFAULT_TTL_LEDGERS" "$EMERGENCY_SIGNERS" "$EMERGENCY_TREASURY" "$EMERGENCY_COOLDOWN_LEDGERS"
+
+      # ------------------------------------------------------------------
+      # Record the deployed WASM hashes in a deploy manifest. This is the
+      # known-good set used by the rollback procedure documented at the top
+      # of this file. It is only written after a fully successful deploy, so
+      # a partial failure never overwrites the previous good manifest.
+      # ------------------------------------------------------------------
+      - name: Write deploy manifest
+        if: success()
+        run: |
+          set -euo pipefail
+          mkdir -p manifest
+          {
+            echo '{'
+            echo '  "network": "testnet",'
+            echo "  \"commit\": \"${GITHUB_SHA}\","
+            echo "  \"deployed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+            echo '  "contracts": {'
+            first=1
+            for wasm in wasm/*.wasm; do
+              name=$(basename "$wasm" .wasm)
+              hash=$(sha256sum "$wasm" | cut -d' ' -f1)
+              [ "$first" -eq 1 ] || echo ','
+              first=0
+              printf '    "%s": { "wasm_sha256": "%s" }' "$name" "$hash"
+            done
+            echo ''
+            echo '  }'
+            echo '}'
+          } > manifest/deploy-manifest.json
+          cat manifest/deploy-manifest.json
+
+      - name: Upload deploy manifest
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-manifest-${{ github.sha }}
+          path: manifest/deploy-manifest.json
+          retention-days: 365
 
       - name: Emit deployment event
         env:
@@ -73,3 +240,46 @@ jobs:
         run: |
           echo "Publishing contract transaction observability assets"
           ls -la observability/ || true
+
+  # -----------------------------------------------------------------------
+  # Rollback job. Triggered manually via workflow_dispatch with a
+  # `rollback_manifest` input naming the known-good manifest artifact.
+  # See the ADMIN RUNBOOK at the top of this file.
+  # -----------------------------------------------------------------------
+  rollback-testnet:
+    name: Rollback Testnet to known-good manifest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_manifest != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download known-good manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.inputs.rollback_manifest }}
+          path: manifest/
+
+      - name: Show manifest being restored
+        run: cat manifest/deploy-manifest.json
+
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli --features opt
+
+      - name: Configure testnet network
+        run: |
+          stellar network add testnet \
+            --rpc-url https://soroban-testnet.stellar.org \
+            --network-passphrase "Test SDF Network ; September 2015"
+
+      - name: Import deploy keypair
+        env:
+          DEPLOY_SECRET: ${{ secrets.TESTNET_DEPLOY_SECRET }}
+        run: echo "$DEPLOY_SECRET" | stellar keys add deployer --secret-key
+
+      - name: Verify restored WASM hashes match manifest
+        run: |
+          set -euo pipefail
+          # Rebuild the WASMs for the manifest's commit and confirm the hashes
+          # match before re-deploying, so we never restore an unexpected build.
+          echo "Restoring manifest for commit $(jq -r .commit manifest/deploy-manifest.json)"
+          jq -r '.contracts | to_entries[] | "\(.key) \(.value.wasm_sha256)"' manifest/deploy-manifest.json

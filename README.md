@@ -16,7 +16,7 @@ API work tracked in this repository is implemented in the backend; see [the back
 All contracts live under [`dabdub_contracts/contracts/`](dabdub_contracts/contracts/):
 
 | Contract | Purpose | Coverage |
-|---|---|
+|---|---|---|
 | `admin_timelock` | Timelocked admin actions | [![admin_timelock](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=admin_timelock)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 | `batch_payments` | Batched payment processing | [![batch_payments](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=batch_payments)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 | `fee_calculator` | Fee computation logic | [![fee_calculator](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=fee_calculator)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
@@ -31,6 +31,48 @@ All contracts live under [`dabdub_contracts/contracts/`](dabdub_contracts/contra
 | `settlement_ledger` | On-chain settlement record-keeping | [![settlement_ledger](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=settlement_ledger)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 | `slippage_protection` | Slippage guards for conversions | [![slippage_protection](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=slippage_protection)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 | `stellar_confirmations` | Confirmation tracking for Stellar transactions | [![stellar_confirmations](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=stellar_confirmations)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
+
+## Local Observability Stack
+
+The [`grafana/`](grafana/) directory holds the local developer observability
+configuration. It is **not** used in production; it exists so contributors can
+run Grafana, Loki, and Promtail on their machine and inspect logs and metrics
+from the settlement services without touching shared infrastructure.
+
+| Path | Purpose |
+|---|---|
+| `grafana/docker-compose.yml` | Compose stack for Grafana + Loki + Promtail |
+| `grafana/loki/loki-config.yml` | Loki single-binary config (local filesystem storage) |
+| `grafana/promtail/promtail-config.yml` | Promtail scrape config that ships local logs to Loki |
+| `grafana/provisioning/datasources/` | Auto-provisioned Loki datasource |
+| `grafana/provisioning/dashboards/` | Preconfigured dashboards (see below) |
+
+### Preconfigured dashboards
+
+- **Payment Volume** — payment throughput over time
+- **Error Rate** — error ratio across settlement services
+- **Contract Invocations** — per-contract invocation counts
+
+### Running locally
+
+One command starts the whole stack:
+
+```sh
+make monitoring
+```
+
+This runs `docker compose -f grafana/docker-compose.yml up -d`. Once the
+containers are healthy:
+
+- Grafana: <http://localhost:3000> (anonymous admin access enabled for local use)
+- Loki API: <http://localhost:3100>
+
+The provisioned dashboards appear under **Dashboards → DupDub** in Grafana.
+Stop the stack with:
+
+```sh
+make monitoring-down
+```
 
 ## Payment escrow lifetime and storage
 
@@ -124,8 +166,7 @@ make build              # debug build of all contracts
 make build-optimised    # release build + wasm-opt -Oz
 make check-wasm-size    # enforce the 64 KB per-contract WASM limit
 make test               # cargo test across the workspace
-make deploy-testnet     # deploy and initialize all contracts on Stellar testnet
-```
+make deploy-testnet     # deploy and ini
 
 ### Manual testnet deployment
 
