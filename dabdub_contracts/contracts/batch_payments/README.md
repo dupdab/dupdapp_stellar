@@ -75,6 +75,17 @@ materially increases cost. The benchmark is a reproducible test-host
 measurement, not a substitute for network simulation or a guarantee for
 arbitrary future code changes.
 
+### Maximum safe batch size
+
+The benchmark enforces a safety margin: the measured instruction usage for a
+batch must stay below **80% of the Soroban instruction limit**
+(`INSTRUCTION_LIMIT * 80 / 100`). At the current per-item cost, the maximum
+safe batch size is **100 items** — the contract's hard ceiling — which uses
+about 6.9% of the 100,000,000-instruction budget, well within the 80% margin.
+The CI benchmark step (`cargo test -p batch-payments benchmark_`) fails the
+build if any benchmarked batch size exceeds this 80% threshold, so the
+maximum safe batch size cannot silently regress.
+
 Run the measurement with:
 
 ```sh

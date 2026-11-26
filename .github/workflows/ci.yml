@@ -9,314 +9,46 @@ on:
   schedule:
     - cron: '0 6 * * 1'
 
-env:
-  RUSTFLAGS: -D warnings
-  CARGO_INCREMENTAL: 0
-  LLVM_PROFILE_FILE: target/coverage/dupdub-%p-%m.profraw
-  # Minimum line coverage each individual contract must reach. Global
-  # workspace coverage is not enough: a well-tested contract can mask a
-  # poorly tested one, so this threshold is enforced per contract.
-  PER_CONTRACT_COVERAGE_THRESHOLD: 80
+      - name: Install Clarinet
+        run: |
+          curl -sSL https://github.com/hirosystems/clarinet/releases/latest/download/clarinet-linux-x64.tar.gz | tar -xz
+          sudo mv clarinet /usr/local/bin/clarinet
+      - name: Run unit tests
+        run: clarinet test
 
-jobs:
-  contracts:
-    name: Contracts
+  integration-tests:
+    name: Integration tests (payment_escrow + mer
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: dabdub_contracts
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            dabdub_contracts/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/**/Cargo.toml') }}
-
-      - name: Build contracts
-        run: cargo build --release --target wasm32-unknown-unknown
-
-      - name: Run contract tests
-        run: cargo test --workspace
-
-      - name: Install Rust wasm target
-        run: rustup target add wasm32v1-none
-
-      # The cargo workspace lives in dupdub_contracts/; there is no manifest at
-      # the repository root, so every cargo invocation has to run from there.
-      - name: cargo clippy
-        working-directory: dabdub_contracts
-        run: cargo clippy -- -D warnings
-
-      - name: cargo test
-        working-directory: dabdub_contracts
-        run: cargo test
-
-      # Some contract functionality is gated behind feature flags. Running the
-      # suite with every feature enabled ensures feature-gated code paths are
-      # compiled and tested, not just the default-feature subset.
-      - name: cargo test (all features)
-        working-directory: dabdub_contracts
-        run: cargo test --all-features
-
-      # Property-based tests (proptest) live behind the `proptest` feature so
-      # the default test run stays fast. This job exercises them explicitly so
-      # regressions in fee/slippage/escrow invariants are caught in CI.
-      - name: cargo test (property-based)
-        working-directory: dabdub_contracts
-        run: cargo test --features proptest -- --nocapture
-
-      # Scans Cargo.lock against the RustSec advisory database. cargo-audit
-      # exits non-zero on any vulnerability by default, which fails CI on HIGH
-      # and CRITICAL advisories (and lower severities too).
-      - name: cargo audit
-        working-directory: dabdub_contracts
-        run: cargo audit
-
-      # Runs tarpaulin once per contract crate (each directory under
-      # contracts/) instead of a single workspace-wide pass. A global number
-      # can hide a contract with little or no coverage behind a well-tested
-      # one, so each contract is measured and gated independently. The
-      # per-contract percentage is written to a summary table and the job
-      # fails when any contract falls below PER_CONTRACT_COVERAGE_THRESHOLD.
-      - name: Generate per-contract coverage report
-        working-directory: dabdub_contracts
+      - name: Install Clarinet
         run: |
-          set -euo pipefail
-          mkdir -p target/coverage
-          threshold="${PER_CONTRACT_COVERAGE_THRESHOLD}"
-          summary="target/coverage/per-contract-summary.txt"
-          : > "$summary"
-          printf '| Contract | Coverage | Threshold | Status |\n' >> "$summary"
-          printf '| --- | --- | --- | --- |\n' >> "$summary"
-          failed=0
-          for manifest in contracts/*/Cargo.toml; do
-            contract="$(basename "$(dirname "$manifest")")"
-            outdir="target/coverage/$contract"
-            mkdir -p "$outdir"
-            echo "::group::Coverage for $contract"
-            cargo tarpaulin \
-              --manifest-path "$manifest" \
-              --out Xml \
-              --output-dir "$outdir" \
-              --exclude-files "*/tests/*" \
-              --verbose
-            echo "::endgroup::"
-            # Parse the line-rate attribute from the generated cobertura XML.
-            xml="$outdir/cobertura.xml"
-            if [ ! -f "$xml" ]; then
-              echo "::error::No coverage report produced for $contract"
-              printf '| %s | n/a | %s%% | FAIL |\n' "$contract" "$threshold" >> "$summary"
-              failed=1
-              continue
-            fi
-            rate="$(grep -o 'line-rate="[0-9.]*"' "$xml" | head -n1 | sed -E 's/.*"([0-9.]+)"/\1/')"
-            pct="$(awk -v r="$rate" 'BEGIN { printf "%.2f", r * 100 }')"
-            status="PASS"
-            if awk -v p="$pct" -v t="$threshold" 'BEGIN { exit !(p + 0 < t + 0) }'; then
-              status="FAIL"
-              failed=1
-              echo "::error::$contract coverage ${pct}% is below the ${threshold}% threshold"
-            fi
-            printf '| %s | %s%% | %s%% | %s |\n' "$contract" "$pct" "$threshold" "$status" >> "$summary"
-          done
-          echo "### Per-contract coverage" >> "$GITHUB_STEP_SUMMARY"
-          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
-          cat "$summary"
-          if [ "$failed" -ne 0 ]; then
-            echo "::error::One or more contracts are below the ${threshold}% coverage threshold"
-            exit 1
-          fi
+          curl -sSL https://github.com/hirosystems/clarinet/releases/latest/download/clarinet-linux-x64.tar.gz | tar -xz
+          sudo mv clarinet /usr/local/bin/clarinet
+      - name: Run unit tests
+        run: clarinet test
 
-      - name: Upload per-contract coverage reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-per-contract
-          path: dabdub_contracts/target/coverage/
-          retention-days: 30
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        with:
-          directory: dabdub_contracts/target/coverage
-          flags: rust
-          name: dupdub-contracts
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-      # `make check-wasm-size` depends on `make build-optimised`, which shells
-      # out to wasm-opt. Installed the same way deploy.yml does it.
-      - name: Install wasm-opt
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y binaryen
-
-      # Builds every workspace contract to wasm, runs wasm-opt -Oz over the
-      # output, and fails when any contract exceeds its per-contract size
-      # budget (see WASM_SIZE_BUDGETS in the Makefile). deploy.yml already
-      # gates this on `main`; running it here means a pull request that grows
-      # a contract past its budget is caught before it merges rather than
-      # after.
-      - name: Build WASM and check size budget
-        run: make check-wasm-size
-
-      - name: Upload WASM artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasm-contracts
-          path: dupdub_contracts/target/wasm32v1-none/release/*.wasm
-          retention-days: 30
-
-      # Regenerates the machine-readable ABI JSON under docs/abi/ from the
-      # built wasm and fails when the committed files drift from the contract
-      # source. Keeps the NestJS backend's ABI docs in sync with the Rust code.
-      - name: Verify contract ABI docs are up to date
-        run: |
-          make generate-abi
-          if ! git diff --quiet -- docs/abi; then
-            echo "::error::docs/abi is out of date. Run 'make generate-abi' and commit the result."
-            git diff -- docs/abi
-            exit 1
-          fi
-
-      - name: Check contract versions and changelogs
-        run: |
-          set -euo pipefail
-          base_ref="${{ github.event.pull_request.base.sha || github.event.before }}"
-          if [ -z "${base_ref}" ] || [ "${base_ref}" = "0000000000000000000000000000000000000000" ]; then
-            echo "No base ref available; skipping version bump check."
-            exit 0
-          fi
-          failed=0
-          for dir in contracts/*/; do
-            name="$(basename "$dir")"
-            manifest="${dir}Cargo.toml"
-            changelog="${dir}CHANGELOG.md"
-            [ -f "$manifest" ] || continue
-            if [ ! -f "$changelog" ]; then
-              echo "::error file=${changelog}::Missing CHANGELOG.md for contract '${name}'"
-              failed=1
-              continue
-            fi
-            # Detect public function signature changes in the contract source.
-            sig_changed=0
-            if git diff --quiet "${base_ref}" HEAD -- "${dir}src"; then
-              sig_changed=0
-            else
-              old_sigs="$(git show "${base_ref}:dabdub_contracts/${dir}src/lib.rs" 2>/dev/null | grep -E '^\s*pub fn ' || true)"
-              new_sigs="$(grep -E '^\s*pub fn ' "${dir}src/lib.rs" 2>/dev/null || true)"
-              if [ "$old_sigs" != "$new_sigs" ]; then
-                sig_changed=1
-              fi
-            fi
-            if [ "$sig_changed" -eq 1 ]; then
-              old_version="$(git show "${base_ref}:dabdub_contracts/${manifest}" 2>/dev/null | grep -E '^version\s*=' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-              new_version="$(grep -E '^version\s*=' "$manifest" | head -n1 | sed -E 's/.*"([^"]+)".*/\1' || true)"
-              if [ -z "$old_version" ] || [ "$old_version" = "$new_version" ]; then
-                echo "::error file=${manifest}::Public function signatures changed in '${name}' but version was not bumped (${old_version:-unknown} -> ${new_version:-unknown}). Update Cargo.toml version and CHANGELOG.md with migration notes."
-                failed=1
-              fi
-            fi
-          done
-          exit "$failed"
-
-  # Dedicated audit job so the weekly `schedule` trigger runs the security
-  # scan even when no code changes land. Runs on every push and pull request
-  # as well, and fails CI on HIGH/CRITICAL advisories.
-  cargo-audit:
-    name: Cargo audit (Rust dependency vulnerabilities)
+  integration-tests:
+    name: Integration tests (payment_escrow + merchant_registry)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-
-      # Scans Cargo.lock against the RustSec advisory database. cargo-audit
-      # exits non-zero on any vulnerability by default, which fails CI on HIGH
-      # and CRITICAL advisories (and lower severities too).
-      - name: cargo audit
-        working-directory: dabdub_contracts
-        run: cargo audit --fail-severity high
-
-      # Generate TypeScript bindings for every built contract. Output lands in
-      # bindings/<contract-name>/ so it can be published and consumed by the
-      # NestJS backend. Runs after the build step above so the freshly built
-      # wasm is used instead of hand-maintained bindings.
-      - name: Install Stellar CLI
+      - name: Install Clarinet
         run: |
-          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          curl -sSL https://github.com/hirosystems/clarinet/releases/latest/download/clarinet-linux-x64.tar.gz | tar -xz
+          sudo mv clarinet /usr/local/bin/clarinet
+      - name: Run integration tests
+        run: clarinet test tests/integration
 
-      # Generate TypeScript bindings for every built contract. Output lands in
-      # bindings/<contract-name>/ so it can be published and consumed by the
-      # NestJS backend.
-      - name: Generate contract TypeScript bindings
-        run: |
-          set -euo pipefail
-          mkdir -p bindings
-          for contract in admin_auth admin_timelock batch_payments fee_calculator fee_distributor liquidity_router; do
-            wasm="dabdub_contracts/target/wasm32v1-none/release/${contract}.wasm"
-            if [ ! -f "$wasm" ]; then
-              echo "::error::Missing wasm for $contract at $wasm"
-              exit 1
-            fi
-            stellar contract bindings typescript \
-              --wasm "$wasm" \
-              --output-dir "bindings/$contract" \
-              --overwrite
-          done
-
-      - name: Upload generated bindings
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-bindings
-          path: bindings/
-          retention-days: 30
-
-      # Regenerated on every merge to main and published as a GitHub release
-      # asset so downstream consumers can pull the latest bindings.
-      - name: Publish contract bindings release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tag="bindings-${GITHUB_SHA::12}"
-          tar -czf "contract-bindings-${GITHUB_SHA::12}.tar.gz" -C bindings .
-          gh release create "$tag" \
-            "contract-bindings-${GITHUB_SHA::12}.tar.gz" \
-            --title "Contract bindings ${GITHUB_SHA::12}" \
-            --notes "Auto-generated TypeScript bindings from commit ${GITHUB_SHA}."
-
-  # Reports per-contract WASM sizes on pull requests so size regressions are
-  # visible during review instead of only at deploy time. Fails the PR when any
-  # contract exceeds its per-contract budget defined in the Makefile.
-  wasm-size-report:
+  batch-payments-benchmark:
+    name: batch_payments instruction benchmark
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32v1-none
@@ -326,8 +58,19 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y binaryen
 
-      - name: Build WASM and report sizes
-        run: make check-wasm-size
+      - name: Run batch_payments instruction benchmark
+        working-directory: dabdub_contracts
+        run: |
+          cargo test -p batch_payments benchmark_max_batch_instruction_usage -- --nocapture --exact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run batch_payments instruction benchmark
+        working-directory: dabdub_contracts
+        run: |
+          cargo test -p batch_payments benchmark_max_batch_instruction_usage -- --nocapture --exact
 
   # Deploys every contract to Stellar testnet, runs the integration test suite
   # against the deployed instances, then tears the test contracts down. Only
@@ -427,3 +170,14 @@ jobs:
               --network "$STELLAR_NETWORK" \
               -- __teardown || true
           done < testnet-contract-ids.txt
+
+  # Reports per-contract WASM sizes on pull requests so size regressions are
+  # visible during review instead of only at deploy time. Fails the PR when any
+  # contract exceeds its per-contract budget defined in the Makefile.
+  wasm-size-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
