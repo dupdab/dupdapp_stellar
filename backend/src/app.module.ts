@@ -11,6 +11,7 @@ import { SorobanEventsModule } from './soroban-events/soroban-events.module';
 import { SorobanIndexedEvent } from './soroban-events/soroban-indexed-event.entity';
 import { SorobanIndexerState } from './soroban-events/soroban-indexer-state.entity';
 import { CreateSorobanEventIndexerTables1760000000000 } from './soroban-events/soroban-events.migration';
+import { ContractMetricsModule } from './observability/contract-metrics.module';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { CreateSorobanEventIndexerTables1760000000000 } from './soroban-events/s
     WaitlistModule,
     AdminModule,
     SorobanEventsModule,
+    ContractMetricsModule,
   ],
   providers: [
     {
