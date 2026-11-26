@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    Address, BytesN, Env,
+    Address, BytesN, Env, Vec,
 };
 
 fn setup_env() -> (Env, Address, AdminTimelockContractClient<'static>) {
@@ -63,4 +63,86 @@ fn test_execute_before_delay_panics() {
     let action_id = make_id(&env, 4);
     client.queue_action(&admin, &action_id);
     client.execute_action(&admin, &action_id);
+}
+
+#[test]
+fn test_execute_within_execution_window_succeeds() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 5);
+    client.queue_action(&admin, &action_id);
+
+    // Advance past the timelock delay but stay within the execution window.
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS + 1);
+    client.execute_action(&admin, &action_id);
+    assert!(client.get_pending_action(&action_id).is_none());
+}
+
+#[test]
+fn test_execute_after_execution_window_expires() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 6);
+    client.queue_action(&admin, &action_id);
+
+    // Advance past the timelock delay plus the full execution window.
+    env.ledger().with_mut(|li| {
+        li.timestamp += DEFAULT_MIN_DELAY_SECONDS + MAX_EXECUTION_WINDOW_SECONDS + 1
+    });
+
+    let result = client.try_execute_action(&admin, &action_id);
+    assert_eq!(result, Err(Ok(Error::OperationExpired)));
+    // Expired operation is auto-cancelled and removed from pending state.
+    assert!(client.get_pending_action(&action_id).is_none());
+}
+
+#[test]
+fn test_queue_and_execute_batch_of_three() {
+    let (env, admin, client) = setup_env();
+    let batch_id = make_id(&env, 7);
+
+    let mut ops: Vec<BytesN<32>> = Vec::new(&env);
+    ops.push_back(make_id(&env, 10));
+    ops.push_back(make_id(&env, 11));
+    ops.push_back(make_id(&env, 12));
+
+    let queued = client.queue_batch(&admin, &batch_id, &ops);
+    assert_eq!(queued.action_id, batch_id);
+    assert_eq!(queued.operations.len(), 3);
+    assert!(client.get_pending_action(&batch_id).is_some());
+
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS + 1);
+    client.execute_batch(&admin, &batch_id);
+
+    // All operations in the batch executed atomically and the entry is cleared.
+    assert!(client.get_pending_action(&batch_id).is_none());
+    assert!(client.is_operation_executed(&make_id(&env, 10)));
+    assert!(client.is_operation_executed(&make_id(&env, 11)));
+    assert!(client.is_operation_executed(&make_id(&env, 12)));
+}
+
+#[test]
+fn test_batch_execution_is_atomic_all_or_nothing() {
+    let (env, admin, client) = setup_env();
+    let batch_id = make_id(&env, 8);
+
+    let mut ops: Vec<BytesN<32>> = Vec::new(&env);
+    ops.push_back(make_id(&env, 20));
+    ops.push_back(make_id(&env, 21));
+    ops.push_back(make_id(&env, 22));
+
+    client.queue_batch(&admin, &batch_id, &ops);
+
+    // Attempting to execute before the delay elapses must fail and leave the
+    // batch (and every operation in it) unexecuted.
+    assert!(client.try_execute_batch(&admin, &batch_id).is_err());
+    assert!(client.get_pending_action(&batch_id).is_some());
+    assert!(!client.is_operation_executed(&make_id(&env, 20)));
+    assert!(!client.is_operation_executed(&make_id(&env, 21)));
+    assert!(!client.is_operation_executed(&make_id(&env, 22)));
+
+    // Once the delay elapses the whole batch executes together.
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS + 1);
+    client.execute_batch(&admin, &batch_id);
+    assert!(client.is_operation_executed(&make_id(&env, 20)));
+    assert!(client.is_operation_executed(&make_id(&env, 21)));
+    assert!(client.is_operation_executed(&make_id(&env, 22)));
 }
