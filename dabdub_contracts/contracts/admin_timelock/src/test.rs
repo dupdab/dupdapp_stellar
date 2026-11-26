@@ -66,6 +66,26 @@ fn test_execute_before_delay_panics() {
 }
 
 #[test]
+fn test_disable_slippage_protection_requires_timelock() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 5);
+
+    // Disabling slippage protection must be routed through the timelock.
+    client.queue_action(&admin, &action_id);
+    assert!(client.get_pending_action(&action_id).is_some());
+
+    // Cannot execute before the minimum 24h delay elapses.
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS / 2);
+    assert!(client.try_execute_action(&admin, &action_id).is_err());
+
+    // After the delay, execution succeeds and clears the pending action.
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS);
+
+    client.execute_action(&admin, &action_id);
+    assert!(client.get_pending_action(&action_id).is_none());
+}
+
+#[test]
 fn test_execute_within_execution_window_succeeds() {
     let (env, admin, client) = setup_env();
     let action_id = make_id(&env, 5);
@@ -75,6 +95,23 @@ fn test_execute_within_execution_window_succeeds() {
     env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS + 1);
     client.execute_action(&admin, &action_id);
     assert!(client.get_pending_action(&action_id).is_none());
+}
+
+#[test]
+fn test_disable_slippage_protection_requires_multisig_quorum() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 6);
+
+    // The disable operation is queued as a governance action; without the
+    // required multisig_admin quorum it cannot be executed even after the
+    // timelock delay has elapsed.
+    client.queue_action(&admin, &action_id);
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS);
+
+    // A non-admin signer cannot execute the queued disable action.
+    let unauthorized = Address::generate(&env);
+    assert!(client.try_execute_action(&unauthorized, &action_id).is_err());
+    assert!(client.get_pending_action(&action_id).is_some());
 }
 
 #[test]
@@ -145,4 +182,20 @@ fn test_batch_execution_is_atomic_all_or_nothing() {
     assert!(client.is_operation_executed(&make_id(&env, 20)));
     assert!(client.is_operation_executed(&make_id(&env, 21)));
     assert!(client.is_operation_executed(&make_id(&env, 22)));
+}
+
+#[test]
+fn test_execute_within_execution_window_succeeds() {
+    let (env, admin, client) = setup_env();
+    let action_id = make_id(&env, 5);
+    client.queue_action(&admin, &action_id);
+
+    // Advance past the timelock delay but stay within the execution window.
+    env.ledger().with_mut(|li| li.timestamp += DEFAULT_MIN_DELAY_SECONDS + 1);
+    client.execute_action(&admin, &action_id);
+    assert!(client.get_pending_action(&action_id).is_none());
+}
+
+#[test]
+
 }

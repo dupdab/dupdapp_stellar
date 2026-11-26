@@ -232,6 +232,9 @@ Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.
 <!-- handsoff-issue-1215 -->
 - #1215: [P1] merchant_registry: add merchant metadata fields (website, contact, country)
 
+<!-- handsoff-issue-1547 -->
+- #1547: slippage_protection: no event when slippage limit exceeded — silent failure
+
 <!-- handsoff-issue-1561 -->
 - #1561: testing: slippage_protection not tested with real AMM price calculations
 
