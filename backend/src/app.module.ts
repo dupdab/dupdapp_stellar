@@ -11,6 +11,8 @@ import { SorobanEventsModule } from './soroban-events/soroban-events.module';
 import { SorobanIndexedEvent } from './soroban-events/soroban-indexed-event.entity';
 import { SorobanIndexerState } from './soroban-events/soroban-indexer-state.entity';
 import { CreateSorobanEventIndexerTables1760000000000 } from './soroban-events/soroban-events.migration';
+import { MetricsModule } from './metrics/metrics.module';
+import { SorobanIndexerLagAlertService } from './soroban-events/soroban-indexer-lag-alert.service';
 import { ContractMetricsModule } from './observability/contract-metrics.module';
 
 @Module({
@@ -33,6 +35,7 @@ import { ContractMetricsModule } from './observability/contract-metrics.module';
     WaitlistModule,
     AdminModule,
     SorobanEventsModule,
+    MetricsModule,
     ContractMetricsModule,
   ],
   providers: [
@@ -40,6 +43,7 @@ import { ContractMetricsModule } from './observability/contract-metrics.module';
       provide: APP_PIPE,
       useValue: new ValidationPipe({ whitelist: true, transform: true }),
     },
+    SorobanIndexerLagAlertService,
   ],
 })
 export class AppModule {}
