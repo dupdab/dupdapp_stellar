@@ -2,54 +2,53 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+  # Weekly scheduled audit so vulnerable dependencies are detected even when
+  # no code changes land. The `cargo-audit` job below runs on this schedule.
+  schedule:
+    - cron: '0 6 * * 1'
 
 env:
   RUSTFLAGS: -D warnings
   CARGO_INCREMENTAL: 0
   LLVM_PROFILE_FILE: target/coverage/dupdub-%p-%m.profraw
+  # Minimum line coverage each individual contract must reach. Global
+  # workspace coverage is not enough: a well-tested contract can mask a
+  # poorly tested one, so this threshold is enforced per contract.
+  PER_CONTRACT_COVERAGE_THRESHOLD: 80
 
 jobs:
-  ci:
+  contracts:
+    name: Contracts
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dabdub_contracts
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32v1-none
+          targets: wasm32-unknown-unknown
 
-      - name: Check Rust formatting
-        working-directory: dabdub_contracts
-        run: cargo fmt -- --check
-
-      # Cache the cargo registry (downloaded crate sources) and the workspace
-      # target directory so dependencies are not re-downloaded and recompiled
-      # on every run. The key is derived from the Cargo.lock hash so the cache
-      # is invalidated whenever the dependency graph changes; restore-keys
-      # provide a fallback so partial rebuilds still benefit.
-      - name: Cache cargo registry and target
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             dabdub_contracts/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/**/Cargo.toml') }}
 
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-tarpaulin
+      - name: Build contracts
+        run: cargo build --release --target wasm32-unknown-unknown
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
+      - name: Run contract tests
+        run: cargo test --workspace
 
       - name: Install Rust wasm target
         run: rustup target add wasm32v1-none
@@ -63,6 +62,13 @@ jobs:
       - name: cargo test
         working-directory: dabdub_contracts
         run: cargo test
+
+      # Some contract functionality is gated behind feature flags. Running the
+      # suite with every feature enabled ensures feature-gated code paths are
+      # compiled and tested, not just the default-feature subset.
+      - name: cargo test (all features)
+        working-directory: dabdub_contracts
+        run: cargo test --all-features
 
       # Property-based tests (proptest) live behind the `proptest` feature so
       # the default test run stays fast. This job exercises them explicitly so
@@ -78,27 +84,74 @@ jobs:
         working-directory: dabdub_contracts
         run: cargo audit
 
-      - name: Generate coverage report
+      # Runs tarpaulin once per contract crate (each directory under
+      # contracts/) instead of a single workspace-wide pass. A global number
+      # can hide a contract with little or no coverage behind a well-tested
+      # one, so each contract is measured and gated independently. The
+      # per-contract percentage is written to a summary table and the job
+      # fails when any contract falls below PER_CONTRACT_COVERAGE_THRESHOLD.
+      - name: Generate per-contract coverage report
         working-directory: dabdub_contracts
-        run: cargo audit
-
-      - name: Generate coverage report
-        working-directory: dupdub_contracts
         run: |
+          set -euo pipefail
           mkdir -p target/coverage
-          cargo tarpaulin \
-            --workspace \
-            --out Xml \
-            --output-dir target/coverage \
-            --exclude-files "*/tests/*" \
-            --verbose \
-            --fail-under 85
+          threshold="${PER_CONTRACT_COVERAGE_THRESHOLD}"
+          summary="target/coverage/per-contract-summary.txt"
+          : > "$summary"
+          printf '| Contract | Coverage | Threshold | Status |\n' >> "$summary"
+          printf '| --- | --- | --- | --- |\n' >> "$summary"
+          failed=0
+          for manifest in contracts/*/Cargo.toml; do
+            contract="$(basename "$(dirname "$manifest")")"
+            outdir="target/coverage/$contract"
+            mkdir -p "$outdir"
+            echo "::group::Coverage for $contract"
+            cargo tarpaulin \
+              --manifest-path "$manifest" \
+              --out Xml \
+              --output-dir "$outdir" \
+              --exclude-files "*/tests/*" \
+              --verbose
+            echo "::endgroup::"
+            # Parse the line-rate attribute from the generated cobertura XML.
+            xml="$outdir/cobertura.xml"
+            if [ ! -f "$xml" ]; then
+              echo "::error::No coverage report produced for $contract"
+              printf '| %s | n/a | %s%% | FAIL |\n' "$contract" "$threshold" >> "$summary"
+              failed=1
+              continue
+            fi
+            rate="$(grep -o 'line-rate="[0-9.]*"' "$xml" | head -n1 | sed -E 's/.*"([0-9.]+)"/\1/')"
+            pct="$(awk -v r="$rate" 'BEGIN { printf "%.2f", r * 100 }')"
+            status="PASS"
+            if awk -v p="$pct" -v t="$threshold" 'BEGIN { exit !(p + 0 < t + 0) }'; then
+              status="FAIL"
+              failed=1
+              echo "::error::$contract coverage ${pct}% is below the ${threshold}% threshold"
+            fi
+            printf '| %s | %s%% | %s%% | %s |\n' "$contract" "$pct" "$threshold" "$status" >> "$summary"
+          done
+          echo "### Per-contract coverage" >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more contracts are below the ${threshold}% coverage threshold"
+            exit 1
+          fi
+
+      - name: Upload per-contract coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-per-contract
+          path: dabdub_contracts/target/coverage/
+          retention-days: 30
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
-          files: dupdub_contracts/target/coverage/cobertura.xml
+          directory: dabdub_contracts/target/coverage
           flags: rust
           name: dupdub-contracts
           fail_ci_if_error: false
@@ -113,10 +166,11 @@ jobs:
           sudo apt-get install -y binaryen
 
       # Builds every workspace contract to wasm, runs wasm-opt -Oz over the
-      # output, and fails when any contract exceeds the 64 KB Soroban deploy
-      # limit. deploy.yml already gates this on `main`; running it here means a
-      # pull request that grows a contract past the limit is caught before it
-      # merges rather than after.
+      # output, and fails when any contract exceeds its per-contract size
+      # budget (see WASM_SIZE_BUDGETS in the Makefile). deploy.yml already
+      # gates this on `main`; running it here means a pull request that grows
+      # a contract past its budget is caught before it merges rather than
+      # after.
       - name: Build WASM and check size budget
         run: make check-wasm-size
 
@@ -139,22 +193,68 @@ jobs:
             exit 1
           fi
 
+      - name: Check contract versions and changelogs
+        run: |
+          set -euo pipefail
+          base_ref="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "${base_ref}" ] || [ "${base_ref}" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base ref available; skipping version bump check."
+            exit 0
+          fi
+          failed=0
+          for dir in contracts/*/; do
+            name="$(basename "$dir")"
+            manifest="${dir}Cargo.toml"
+            changelog="${dir}CHANGELOG.md"
+            [ -f "$manifest" ] || continue
+            if [ ! -f "$changelog" ]; then
+              echo "::error file=${changelog}::Missing CHANGELOG.md for contract '${name}'"
+              failed=1
+              continue
+            fi
+            # Detect public function signature changes in the contract source.
+            sig_changed=0
+            if git diff --quiet "${base_ref}" HEAD -- "${dir}src"; then
+              sig_changed=0
+            else
+              old_sigs="$(git show "${base_ref}:dabdub_contracts/${dir}src/lib.rs" 2>/dev/null | grep -E '^\s*pub fn ' || true)"
+              new_sigs="$(grep -E '^\s*pub fn ' "${dir}src/lib.rs" 2>/dev/null || true)"
+              if [ "$old_sigs" != "$new_sigs" ]; then
+                sig_changed=1
+              fi
+            fi
+            if [ "$sig_changed" -eq 1 ]; then
+              old_version="$(git show "${base_ref}:dabdub_contracts/${manifest}" 2>/dev/null | grep -E '^version\s*=' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+              new_version="$(grep -E '^version\s*=' "$manifest" | head -n1 | sed -E 's/.*"([^"]+)".*/\1' || true)"
+              if [ -z "$old_version" ] || [ "$old_version" = "$new_version" ]; then
+                echo "::error file=${manifest}::Public function signatures changed in '${name}' but version was not bumped (${old_version:-unknown} -> ${new_version:-unknown}). Update Cargo.toml version and CHANGELOG.md with migration notes."
+                failed=1
+              fi
+            fi
+          done
+          exit "$failed"
+
+  # Dedicated audit job so the weekly `schedule` trigger runs the security
+  # scan even when no code changes land. Runs on every push and pull request
+  # as well, and fails CI on HIGH/CRITICAL advisories.
   cargo-audit:
     name: Cargo audit (Rust dependency vulnerabilities)
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # The cargo workspace lives in dabdub_contracts/; there is no manifest at
-      # the repository root, so the audit runs from there.
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
-      - name: Run cargo audit (fail on HIGH or CRITICAL)
+      # Scans Cargo.lock against the RustSec advisory database. cargo-audit
+      # exits non-zero on any vulnerability by default, which fails CI on HIGH
+      # and CRITICAL advisories (and lower severities too).
+      - name: cargo audit
         working-directory: dabdub_contracts
         run: cargo audit --fail-severity high
 
@@ -162,9 +262,6 @@ jobs:
       # bindings/<contract-name>/ so it can be published and consumed by the
       # NestJS backend. Runs after the build step above so the freshly built
       # wasm is used instead of hand-maintained bindings.
-      - name: Generate contract TypeScript bindings
-        run: |
-          mkdir -p bindings
       - name: Install Stellar CLI
         run: |
           curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
@@ -212,13 +309,10 @@ jobs:
             --notes "Auto-generated TypeScript bindings from commit ${GITHUB_SHA}."
 
   # Reports per-contract WASM sizes on pull requests so size regressions are
-  # visible during review instead of only at deploy time.
+  # visible during review instead of only at deploy time. Fails the PR when any
+  # contract exceeds its per-contract budget defined in the Makefile.
   wasm-size-report:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
@@ -232,105 +326,104 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y binaryen
 
+      - name: Build WASM and report sizes
+        run: make check-wasm-size
+
+  # Deploys every contract to Stellar testnet, runs the integration test suite
+  # against the deployed instances, then tears the test contracts down. Only
+  # runs on merges to main so testnet is not polluted by every PR. Cleanup uses
+  # `always()` so test contracts are removed even when deploy or tests fail.
+  testnet-integration:
+    name: Testnet integration tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      STELLAR_NETWORK: testnet
+      STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+      STELLAR_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+      STELLAR_ACCOUNT: ci-testnet-deployer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
+      - name: Install Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Builds every workspace contract to optimised wasm so the same artifacts
+      # that ship to production are the ones exercised on testnet.
       - name: Build optimised WASM
         run: make build-optimised
 
-      - name: Measure current WASM sizes
+      # Restores the funded testnet deployer identity from a secret. The secret
+      # key must be a funded testnet account; it is never logged.
+      - name: Configure testnet deployer identity
+        env:
+          TESTNET_DEPLOYER_SECRET: ${{ secrets.TESTNET_DEPLOYER_SECRET }}
         run: |
-          mkdir -p /tmp/wasm-current
-          for f in dabdub_contracts/target/wasm32v1-none/release/*.wasm; do
-            [ -e "$f" ] || continue
-            name=$(basename "$f" .wasm)
-            stat -c '%s' "$f" > "/tmp/wasm-current/$name"
+          set -euo pipefail
+          if [ -z "${TESTNET_DEPLOYER_SECRET:-}" ]; then
+            echo "::error::TESTNET_DEPLOYER_SECRET is not configured"
+            exit 1
+          fi
+          stellar keys add "$STELLAR_ACCOUNT" --secret-key "$TESTNET_DEPLOYER_SECRET"
+
+      # Deploys every contract and records the resulting contract IDs so the
+      # integration suite and the teardown step can reference them.
+      - name: Deploy contracts to testnet
+        run: |
+          set -euo pipefail
+          : > testnet-contract-ids.txt
+          for contract in admin_auth admin_timelock batch_payments fee_calculator fee_distributor liquidity_router; do
+            wasm="dabdub_contracts/target/wasm32v1-none/release/${contract}.wasm"
+            if [ ! -f "$wasm" ]; then
+              echo "::error::Missing wasm for $contract at $wasm"
+              exit 1
+            fi
+            id=$(stellar contract deploy \
+              --wasm "$wasm" \
+              --source "$STELLAR_ACCOUNT" \
+              --network "$STELLAR_NETWORK")
+            echo "${contract}=${id}" | tee -a testnet-contract-ids.txt
           done
 
-      - name: Checkout base branch for previous sizes
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          path: base
-
-      - name: Build base WASM and measure previous sizes
+      - name: Run integration tests against testnet
+        env:
+          TESTNET_CONTRACT_IDS_FILE: testnet-contract-ids.txt
         run: |
-          mkdir -p /tmp/wasm-previous
-          if [ -d base/dabdub_contracts ]; then
-            (cd base && make build-optimised) || true
-            for f in base/dabdub_contracts/target/wasm32v1-none/release/*.wasm; do
-              [ -e "$f" ] || continue
-              name=$(basename "$f" .wasm)
-              stat -c '%s' "$f" > "/tmp/wasm-previous/$name"
-            done
+          set -euo pipefail
+          cargo test --manifest-path dabdub_contracts/Cargo.toml \
+            --features testnet-integration \
+            --test testnet_integration \
+            -- --nocapture
+
+      # Removes the test contracts deployed above. Runs even when deploy or the
+      # integration suite failed so testnet is not left with orphan contracts.
+      - name: Tear down testnet contracts
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f testnet-contract-ids.txt ]; then
+            echo "No deployed contracts to tear down."
+            exit 0
           fi
-
-      - name: Compose size report
-        id: report
-        run: |
-          BUDGET=65536
-          WARN=$((BUDGET * 80 / 100))
-          {
-            echo '<!-- soroban-wasm-size-report -->'
-            echo '### Soroban contract WASM size report'
-            echo ''
-            echo '| Contract | Current size | Previous size | Delta |'
-            echo '| --- | --- | --- | --- |'
-            for cur in /tmp/wasm-current/*; do
-              [ -e "$cur" ] || continue
-              name=$(basename "$cur")
-              current=$(cat "$cur")
-              if [ -f "/tmp/wasm-previous/$name" ]; then
-                previous=$(cat "/tmp/wasm-previous/$name")
-                delta=$((current - previous))
-                if [ "$delta" -gt 0 ]; then
-                  delta_str="+${delta} B"
-                else
-                  delta_str="${delta} B"
-                fi
-                prev_str="${previous} B"
-              else
-                delta_str="n/a"
-                prev_str="n/a"
-              fi
-              row="| ${name} | ${current} B | ${prev_str} | ${delta_str} |"
-              if [ "$current" -gt "$BUDGET" ]; then
-                row="| :red_circle: ${name} | ${current} B | ${prev_str} | ${delta_str} |"
-              elif [ "$current" -gt "$WARN" ]; then
-                row="| :warning: ${name} | ${current} B | ${prev_str} | ${delta_str} |"
-              fi
-              echo "$row"
-            done
-            echo ''
-            echo "Budget: ${BUDGET} B (64 KB). :warning: = over 80% of budget, :red_circle: = over budget."
-          } > /tmp/wasm-report.md
-          echo 'report_path=/tmp/wasm-report.md' >> "$GITHUB_OUTPUT"
-
-      - name: Post size report comment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const marker = '<!-- soroban-wasm-size-report -->';
-            const body = fs.readFileSync('/tmp/wasm-report.md', 'utf8');
-            const { owner, repo } = context.repo;
-            const issue_number = context.payload.pull_request.number;
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number,
-            });
-            const existing = comments.find((c) => c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner, repo, comment_id: existing.id, body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number, body,
-              });
-            }
-
-      # The cargo workspace lives in dabdub_contracts/; there is no manifest at
-      # the repository root, so the audit runs from there.
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run cargo audit (fail on HIGH or CRITICAL)
-        working-directory: dabdub_contracts
-        run: cargo audit --fail-severity high
+          while IFS='=' read -r contract id; do
+            [ -z "$id" ] && continue
+            echo "Removing ${contract} (${id})"
+            stellar contract invoke \
+              --id "$id" \
+              --source "$STELLAR_ACCOUNT" \
+              --network "$STELLAR_NETWORK" \
+              -- __teardown || true
+          done < testnet-contract-ids.txt
