@@ -123,6 +123,8 @@ pub enum DataKey {
     LargeReleaseThreshold,
     Payment(BytesN<32>),
     Version,
+    /// Per-asset-type maximum single-payment amount in stroops (issue #1498).
+    MaxPaymentAmount(AssetType),
     /// Reentrancy guard flag (issue #1494). Set to `true` while a guarded
     /// function is executing; any reentrant call will panic.
     Reentrancy,
@@ -536,6 +538,26 @@ impl PaymentEscrowContract {
         env.storage().instance().get(&DataKey::RegistryContract)
     }
 
+    /// Set or clear the maximum payment amount for an asset type (issue #1498). Admin-only.
+    pub fn set_max_payment_amount(env: Env, caller: Address, asset_type: AssetType, max_amount: Option<i128>) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let key = DataKey::MaxPaymentAmount(asset_type);
+        match max_amount {
+            Some(limit) => {
+                if limit <= 0 {
+                    panic!("Max payment amount must be > 0");
+                }
+                env.storage().instance().set(&key, &limit);
+            }
+            None => { env.storage().instance().remove(&key); }
+        }
+    }
+
+    pub fn get_max_payment_amount(env: Env, asset_type: AssetType) -> Option<i128> {
+        env.storage().instance().get(&DataKey::MaxPaymentAmount(asset_type))
+    }
+
     pub fn deposit(
         env: Env,
         customer: Address,
@@ -553,6 +575,12 @@ impl PaymentEscrowContract {
 
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
+        }
+        // Enforce per-asset maximum payment amount (issue #1498).
+        if let Some(max) = env.storage().instance().get::<DataKey, i128>(&DataKey::MaxPaymentAmount(asset_type.clone())) {
+            if amount > max {
+                panic!("Amount exceeds maximum allowed payment amount");
+            }
         }
         if ttl_ledgers == 0 {
             return Err(ContractError::InvalidTtl);
@@ -1020,6 +1048,38 @@ impl PaymentEscrowContract {
                 },
             );
         }
+    }
+
+    /// Allow the merchant to cancel a Pending escrow and return funds to the
+    /// customer before release (issue #1500).  Only callable on a `Pending`
+    /// payment that has not yet expired; the full remaining balance is
+    /// transferred back to the customer.
+    pub fn cancel(env: Env, caller: Address, payment_id: BytesN<32>) {
+        caller.require_auth();
+
+        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
+        if caller != payment.merchant {
+            panic!("Only the merchant can cancel");
+        }
+        if payment.status != PaymentStatus::Pending {
+            panic!("Payment is not pending");
+        }
+
+        let remaining = Self::remaining_amount(&payment);
+        if remaining > 0 {
+            Self::transfer_from_contract(&env, &payment.customer, remaining, &payment.asset_type);
+        }
+
+        payment.released_amount = payment.amount;
+        payment.status = PaymentStatus::Expired;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
+
+        env.events().publish(
+            ("ESCROW", "cancel"),
+            EscrowStateEvent { payment_id, amount: remaining },
+        );
     }
 
     pub fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrow {
