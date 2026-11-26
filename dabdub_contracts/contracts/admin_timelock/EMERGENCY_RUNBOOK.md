@@ -3,6 +3,22 @@
 ## Overview
 The `admin_timelock` contract gates all privileged parameter changes across the Stellar platform.
 
+## Mainnet Admin Key Ceremony
+
+The mainnet admin keys used by `admin_timelock` and `multisig_admin` MUST be generated and
+stored according to the key ceremony procedure documented in
+[`docs/security/KEY_CEREMONY.md`](../../../docs/security/KEY_CEREMONY.md). That document is the
+source of truth for:
+
+- Offline, airgapped key generation on dedicated hardware
+- Multi-party computation (MPC) key generation or HSM-backed key custody
+- Key storage, backup, and access controls
+- Disaster recovery for lost or compromised admin keys
+
+Do not generate, import, or rotate mainnet admin keys outside that procedure. If the ceremony
+document is unavailable during an incident, escalate to the security lead before touching any
+admin key material.
+
 ## Contract Upgrade Sequence (all 14 contracts)
 
 Upgrades must follow the dependency graph below. A contract may only be upgraded after every
@@ -81,6 +97,58 @@ key, but still go through the timelock.
 
 Roll back in reverse dependency order (14 → 1) to avoid dependents pointing at a reverted
 dependency.
+
+## Emergency Rollback Runbook (failed deploy)
+
+Use this when a deploy workflow fails mid-way and leaves some contracts on the new WASM and
+others on the previous WASM. The deploy manifest (`.deploy/deploy-manifest.json`, written by
+`.github/workflows/deploy.yml`) records the previous known-good WASM hash for every contract
+so a prior set can be restored.
+
+### Ownership
+
+| Role | Responsibility |
+|------|----------------|
+| On-call deployer | Detects the failed workflow, freezes further deploys, opens the incident. |
+| Release owner | Decides rollback vs. forward-fix; owns the manifest and rollback execution. |
+| Security lead | Approves rollback of `admin_timelock`, `escrow`, `escrow_dispute`, `escrow_arbitration`, `payment_fee`, `governance`, `governance_voting` (2-of-3 multisig). |
+
+### Steps
+
+1. **Freeze deploys** — disable the deploy workflow (`gh workflow disable deploy.yml`) so no
+   further partial state is introduced.
+
+2. **Read the manifest** — identify which contracts were updated and their previous hashes:
+```bash
+jq '.contracts | to_entries[] | {contract: .key, previous: .value.previous_wasm_hash, current: .value.wasm_hash}' \
+  .deploy/deploy-manifest.json
+```
+
+3. **Determine the rollback set** — every contract whose `wasm_hash` differs from
+   `previous_wasm_hash` must be reverted. Roll back in reverse dependency order (14 → 1) so
+   dependents never point at a reverted dependency.
+
+4. **Revert each contract** — schedule the previous WASM through the timelock (or multisig for
+   `admin_timelock`), wait `execute_after`, execute, then verify the on-chain WASM hash matches
+   `previous_wasm_hash` from the manifest before moving to the next contract.
+
+5. **Verify** — confirm every contract's on-chain WASM hash equals the manifest's
+   `previous_wasm_hash`, and run the smoke-test invocation for each reverted contract.
+
+6. **Close out** — re-enable the deploy workflow, record the incident, and file a follow-up for
+   the root cause of the failed deploy.
+
+### Testing the rollback in staging before mainnet
+
+Never exercise a rollback procedure for the first time on mainnet. Before any mainnet deploy:
+
+1. Run the deploy workflow against the staging network and let it complete.
+2. Trigger a deliberate mid-way failure (e.g. deploy a subset of contracts) to reproduce a
+   partial-failure state.
+3. Execute the rollback steps above against staging and confirm every contract returns to the
+   manifest's `previous_wasm_hash`.
+4. Record the staging rollback run (date, operator, result) in the release checklist before
+   approving the mainnet deploy.
 
 ## Incident: Malicious/Erroneous Scheduled Change
 

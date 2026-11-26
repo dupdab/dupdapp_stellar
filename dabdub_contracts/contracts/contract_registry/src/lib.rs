@@ -23,6 +23,8 @@ impl ContractRegistry {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.events()
+            .publish(("CONTRACT_REGISTRY", "initialized"), (admin,));
     }
 
     /// Return the current admin.
@@ -60,9 +62,7 @@ impl ContractRegistry {
 
     /// Returns true if an address is registered for the given name.
     pub fn has_address(env: Env, name: Symbol) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Address(name))
+        env.storage().persistent().has(&DataKey::Address(name))
     }
 }
 

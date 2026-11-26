@@ -25,6 +25,11 @@ fn test_payment_lifecycle_success() {
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.status, PaymentStatus::Pending);
     assert_eq!(payment.amount, amount);
+    assert_eq!(payment.id, payment_id);
+    assert_eq!(payment.merchant, merchant);
+    assert_eq!(payment.asset, asset);
+    assert_eq!(payment.created_at, 0);
+    assert_eq!(payment.expiry, expiry);
 
     // 2. Confirm Payment
     client.confirm(&payment_id, &merchant);
@@ -96,6 +101,79 @@ fn test_payment_expiry() {
 
     client.expire(&payment_id, &merchant);
     assert_eq!(client.get_payment(&payment_id).status, PaymentStatus::Expired);
+}
+
+#[test]
+fn test_duplicate_payment_id_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PaymentRequestContract);
+    let client = PaymentRequestContractClient::new(&env, &contract_id);
+
+    let merchant = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let payment_id = String::from_str(&env, "duplicate");
+
+    client.create_payment(&payment_id, &merchant, &100, &asset, &1000);
+    let result = client.try_create_payment(&payment_id, &merchant, &200, &asset, &1000);
+
+    assert!(result.is_err());
+    assert_eq!(client.get_payment(&payment_id).amount, 100);
+}
+
+#[test]
+fn test_expired_payment_cannot_be_confirmed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PaymentRequestContract);
+    let client = PaymentRequestContractClient::new(&env, &contract_id);
+
+    let merchant = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let payment_id = String::from_str(&env, "expired");
+    env.ledger().set_timestamp(10);
+    client.create_payment(&payment_id, &merchant, &100, &asset, &20);
+
+    env.ledger().set_timestamp(21);
+    let result = client.try_confirm(&payment_id);
+
+    assert!(result.is_err());
+    assert_eq!(client.get_payment(&payment_id).status, PaymentStatus::Pending);
+}
+
+#[test]
+fn test_cancelled_payment_cannot_be_confirmed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PaymentRequestContract);
+    let client = PaymentRequestContractClient::new(&env, &contract_id);
+
+    let merchant = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let payment_id = String::from_str(&env, "cancelled");
+    client.create_payment(&payment_id, &merchant, &100, &asset, &1000);
+    client.cancel(&payment_id, &merchant);
+
+    assert_eq!(client.get_payment(&payment_id).status, PaymentStatus::Cancelled);
+    assert!(client.try_confirm(&payment_id).is_err());
+    assert!(client.try_fail(&payment_id).is_err());
+}
+
+#[test]
+fn test_only_merchant_can_cancel_payment_request() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PaymentRequestContract);
+    let client = PaymentRequestContractClient::new(&env, &contract_id);
+
+    let merchant = Address::generate(&env);
+    let another_address = Address::generate(&env);
+    let asset = Address::generate(&env);
+    let payment_id = String::from_str(&env, "merchant-cancel");
+    client.create_payment(&payment_id, &merchant, &100, &asset, &1000);
+
+    assert!(client.try_cancel(&payment_id, &another_address).is_err());
+    assert_eq!(client.get_payment(&payment_id).status, PaymentStatus::Pending);
 }
 
 #[test]

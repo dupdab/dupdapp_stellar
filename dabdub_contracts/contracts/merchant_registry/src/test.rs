@@ -33,7 +33,7 @@ fn test_register_merchant_happy_path() {
 
     client.register_merchant(&admin, &merchant, &sample_name(&env));
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.merchant, merchant);
     assert_eq!(record.status, MerchantStatus::Active);
 }
@@ -70,7 +70,7 @@ fn test_suspend_merchant() {
     client.register_merchant(&admin, &merchant, &sample_name(&env));
     client.suspend_merchant(&admin, &merchant);
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.status, MerchantStatus::Suspended);
 }
 
@@ -83,7 +83,7 @@ fn test_reactivate_merchant() {
     client.suspend_merchant(&admin, &merchant);
     client.reactivate_merchant(&admin, &merchant);
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.status, MerchantStatus::Active);
 }
 
@@ -144,7 +144,7 @@ fn test_terminate_merchant_from_active() {
     client.register_merchant(&admin, &merchant, &sample_name(&env));
     client.terminate_merchant(&admin, &merchant);
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.status, MerchantStatus::Terminated);
 }
 
@@ -157,7 +157,7 @@ fn test_terminate_merchant_from_suspended() {
     client.suspend_merchant(&admin, &merchant);
     client.terminate_merchant(&admin, &merchant);
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.status, MerchantStatus::Terminated);
 }
 
@@ -244,7 +244,7 @@ fn test_merchants_listing_still_includes_terminated_merchants() {
     // Terminate the middle merchant; it must remain in the index for now.
     client.terminate_merchant(&admin, &merchant_b);
     assert_eq!(
-        client.get_merchant(&merchant_b).status,
+        client.get_merchant(&merchant_b).unwrap().status,
         MerchantStatus::Terminated
     );
 
@@ -266,23 +266,6 @@ fn test_merchants_listing_still_includes_terminated_merchants() {
 
 // ---------------------------------------------------------------------------
 // transfer_admin (two-step: propose_admin + accept_admin)
-
-#[test]
-fn test_propose_admin_does_not_take_effect_until_accepted() {
-    let (env, client, admin) = setup();
-    let new_admin = Address::generate(&env);
-
-    client.propose_admin(&admin, &new_admin);
-
-    // Current admin remains in control until the pending admin accepts.
-    assert_eq!(client.get_admin(), admin);
-}
-
-#[test]
-fn test_accept_admin_completes_transfer() {
-    let (env, client, admin) = setup();
-    l
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_propose_admin_does_not_take_effect_until_accepted() {
@@ -330,7 +313,7 @@ fn test_transfer_admin_updates_merchant_ops() {
     client.accept_admin(&new_admin);
     client.register_merchant(&new_admin, &merchant, &sample_name(&env));
 
-    let record = client.get_merchant(&merchant);
+    let record = client.get_merchant(&merchant).unwrap();
     assert_eq!(record.merchant, merchant);
     assert_eq!(record.status, MerchantStatus::Active);
 }
@@ -363,4 +346,75 @@ fn test_accept_admin_wrong_caller_fails() {
 
     client.propose_admin(&admin, &new_admin);
     client.accept_admin(&attacker);
+}
+
+// ── merchant_count and list_merchants (#1241) ─────────────────────────────────
+
+#[test]
+fn test_merchant_count_starts_at_zero() {
+    let (_env, client, _admin) = setup();
+    assert_eq!(client.merchant_count(), 0);
+}
+
+#[test]
+fn test_merchant_count_increments_on_register() {
+    let (env, client, admin) = setup();
+
+    assert_eq!(client.merchant_count(), 0);
+
+    let m1 = Address::generate(&env);
+    client.register_merchant(&admin, &m1, &sample_name(&env));
+    assert_eq!(client.merchant_count(), 1);
+
+    let m2 = Address::generate(&env);
+    client.register_merchant(&admin, &m2, &sample_name(&env));
+    assert_eq!(client.merchant_count(), 2);
+}
+
+#[test]
+fn test_list_merchants_returns_all_records() {
+    let (env, client, admin) = setup();
+
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let m3 = Address::generate(&env);
+    client.register_merchant(&admin, &m1, &sample_name(&env));
+    client.register_merchant(&admin, &m2, &sample_name(&env));
+    client.register_merchant(&admin, &m3, &sample_name(&env));
+
+    let page = client.list_merchants(&0, &10);
+    assert_eq!(page.len(), 3);
+}
+
+#[test]
+fn test_list_merchants_pagination() {
+    let (env, client, admin) = setup();
+
+    for _ in 0..5u32 {
+        let m = Address::generate(&env);
+        client.register_merchant(&admin, &m, &sample_name(&env));
+    }
+
+    let page0 = client.list_merchants(&0, &3);
+    assert_eq!(page0.len(), 3);
+
+    let page1 = client.list_merchants(&1, &3);
+    assert_eq!(page1.len(), 2);
+
+    let page2 = client.list_merchants(&2, &3);
+    assert_eq!(page2.len(), 0);
+}
+
+#[test]
+fn test_list_merchants_empty_when_none_registered() {
+    let (_env, client, _admin) = setup();
+    let page = client.list_merchants(&0, &10);
+    assert_eq!(page.len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "page size must be > 0")]
+fn test_list_merchants_zero_page_size_panics() {
+    let (_env, client, _admin) = setup();
+    client.list_merchants(&0, &0);
 }

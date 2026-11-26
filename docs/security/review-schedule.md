@@ -2,7 +2,7 @@
 
 ## Review cadence
 
-This schedule defines recurring annual security reviews for PCI and access controls, plus quarterly smart contract security reviews.
+This schedule defines recurring annual security reviews for PCI and access controls, plus quarterly smart contract security reviews. Use the [contract audit checklist](contract-audit-checklist.md) to track each Soroban contract's review status and findings; all entries remain pending until evidence is recorded.
 
 | Review activity | Frequency | Responsible party | Notes |
 |---|---|---|---|
@@ -63,3 +63,4 @@ Run this checklist for each deployed contract during the quarterly review:
 - Define audit scope (contracts, commit hash, and threat model) before engaging the auditor.
 - Track audit findings as GitHub Issues and confirm remediation before the next review cycle.
 - Retain audit reports alongside the quarterly review records.
+- The [contract audit checklist](contract-audit-checklist.md) contains the current external-audit placeholder; no report is represented as completed until a report is available and linked there.

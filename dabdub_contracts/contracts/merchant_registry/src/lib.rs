@@ -1,10 +1,58 @@
 #![no_std]
 
+//! # Merchant Registry – Storage Strategy
+//!
+//! ## Storage types
+//!
+//! * **Instance** (`env.storage().instance()`): data that is global to the
+//!   contract and read on almost every call. Used here for `Admin`,
+//!   `PendingAdmin`, and `MerchantCount`. Instance storage shares a single
+//!   ledger entry and TTL with the contract instance, so it is cheap to read
+//!   but grows the instance entry if misused. Values are kept scalar.
+//! * **Persistent** (`env.storage().persistent()`): per-merchant records and
+//!   index slots (`Merchant(Address)`, `MerchantAt(u32)`). Each key has its own
+//!   TTL and is never evicted while live, so a merchant record cannot be lost
+//!   to instance-entry expiry. Each key is independent, so writes for one
+//!   merchant do not rewrite another's entry.
+//! * **Temporary** (`env.storage().temporary()`): not used. Nothing in this
+//!   contract is safe to lose on expiry, so temporary storage would risk
+//!   silent data loss.
+//!
+//! ## Per-contract usage and justification
+//!
+//! | Key                 | Storage    | Justification                              |
+//! |---------------------|------------|--------------------------------------------|
+//! | `Admin`             | Instance   | Single global value read on every admin op |
+//! | `PendingAdmin`      | Instance   | Single global value, removed after accept  |
+//! | `MerchantCount`     | Instance   | Scalar counter, O(1) index append          |
+//! | `Merchant(addr)`    | Persistent | Per-merchant record, must not expire       |
+//! | `MerchantAt(i)`     | Persistent | Per-slot index, avoids O(N) rewrites       |
+//!
+//! ## Cost model (per registration / per read)
+//!
+//! * `register_merchant`: 2 persistent writes (record + index slot) and
+//!   2 instance writes/reads (count). Cost is constant in the number of
+//!   merchants, because no prior entry is read or rewritten.
+//! * `merchants(page, page_size)`: reads only the `page_size` slots requested,
+//!   so cost is bounded by page size, not total merchants.
+//! * Payment-path cost depends on the Escrow contract, which reads this
+//!   registry's `get_merchant`. One persistent read per payment, at the
+//!   current Stellar fee schedule. Exact fee figures should be taken from the
+//!   network's current fee stats at deploy time rather than hard-coded here.
+//!
+//! ## TTL extension strategy
+//!
+//! * Instance TTL is extended on each state-changing admin call so the
+//!   contract instance and its `Admin`/`MerchantCount` entries stay live.
+//! * Persistent merchant and index entries should have their TTL extended
+//!   (via `env.storage().persistent().extend_ttl`) whenever a merchant record
+//!   is read or written, so active merchants do not expire. Dormant merchants
+//!   rely on the minimum TTL set at write time; operators should run a
+//!   periodic bump job for long-idle records.
+
 mod test;
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, String, Vec,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
 
 /// Lifecycle states for a registered merchant.
 #[contracttype]
@@ -48,8 +96,10 @@ pub struct MerchantRecord {
 pub struct MerchantStatusInfo {
     /// `true` if a merchant record exists for the queried address.
     pub registered: bool,
-    /// Lifecycle state; `None` when the merchant is not registered.
-    pub status: Option<MerchantStatus>,
+    /// Lifecycle state. For unregistered merchants this is left as `Active` as a
+    /// placeholder value because Soroban contract serialization does not support
+    /// nested `Option<T>` in a `#[contracttype]` payload.
+    pub status: MerchantStatus,
     /// `true` only when registered and `status == Active`.
     pub is_active: bool,
     /// `true` only when registered and `status == Suspended`.
@@ -191,14 +241,17 @@ impl MerchantRegistryContract {
     ///
     /// Requires the pending admin's own `require_auth`, so the transfer only
     /// takes effect once the proposed address proves control of itself.
-    pub fn accept_admin(env: Env) {
+    pub fn accept_admin(env: Env, caller: Address) {
         let pending: Address = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
-            .expect("No pending admin transfer");
+            .expect("No pending admin");
 
-        pending.require_auth();
+        if caller != pending {
+            panic!("Not pending admin");
+        }
+        caller.require_auth();
 
         let old_admin: Address = env
             .storage()
@@ -216,6 +269,11 @@ impl MerchantRegistryContract {
                 new_admin: pending,
             },
         );
+    }
+
+    /// Read the current admin.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).expect("Admin not set")
     }
 
     /// Read the pending admin, if a transfer has been proposed.
@@ -263,7 +321,10 @@ impl MerchantRegistryContract {
 
         env.events().publish(
             ("REGISTRY", "merchant_registered"),
-            MerchantRegisteredEvent { merchant: merchant.clone(), name: name.clone() },
+            MerchantRegisteredEvent {
+                merchant: merchant.clone(),
+                name: name.clone(),
+            },
         );
     }
 
@@ -323,7 +384,9 @@ impl MerchantRegistryContract {
 
         env.events().publish(
             ("REGISTRY", "merchant_suspended"),
-            MerchantSuspendedEvent { merchant: merchant.clone() },
+            MerchantSuspendedEvent {
+                merchant: merchant.clone(),
+            },
         );
     }
 
@@ -343,14 +406,17 @@ impl MerchantRegistryContract {
             panic!("Merchant already active");
         }
         if record.status == MerchantStatus::Terminated {
-            panic!("Cannot reac
+            panic!("Cannot reactivate terminated merchant");
+        }
 
         record.status = MerchantStatus::Active;
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
             ("REGISTRY", "merchant_reactivated"),
-            MerchantReactivatedEvent { merchant: merchant.clone() },
+            MerchantReactivatedEvent {
+                merchant: merchant.clone(),
+            },
         );
     }
 
@@ -378,7 +444,9 @@ impl MerchantRegistryContract {
 
         env.events().publish(
             ("REGISTRY", "merchant_terminated"),
-            MerchantTerminatedEvent { merchant: merchant.clone() },
+            MerchantTerminatedEvent {
+                merchant: merchant.clone(),
+            },
         );
     }
 
@@ -399,7 +467,10 @@ impl MerchantRegistryContract {
 
         env.events().publish(
             ("REGISTRY", "kyc_status_updated"),
-            KYCStatusUpdatedEvent { merchant: merchant.clone(), verified },
+            KYCStatusUpdatedEvent {
+                merchant: merchant.clone(),
+                verified,
+            },
         );
     }
 
@@ -424,7 +495,10 @@ impl MerchantRegistryContract {
 
         env.events().publish(
             ("REGISTRY", "fee_tier_updated"),
-            FeeTierUpdatedEvent { merchant: merchant.clone(), fee_bps },
+            FeeTierUpdatedEvent {
+                merchant: merchant.clone(),
+                fee_bps,
+            },
         );
     }
 
@@ -443,7 +517,10 @@ impl MerchantRegistryContract {
 
         env.events().publish(
             ("REGISTRY", "admin_transferred"),
-            AdminTransferredEvent { old_admin, new_admin },
+            AdminTransferredEvent {
+                old_admin,
+                new_admin,
+            },
         );
     }
 
@@ -451,11 +528,77 @@ impl MerchantRegistryContract {
     // Queries
     // ------------------------------------------------------------------
 
-    /// Fetch a single merchant record.  Returns `None` if not registered.
+    /// Fetch a single merchant record. Returns `None` if not registered.
     pub fn get_merchant(env: Env, merchant: Address) -> Option<MerchantRecord> {
+        env.storage().persistent().get(&DataKey::Merchant(merchant))
+    }
+
+    /// Return the current fee tier for a merchant.
+    pub fn get_fee_tier(env: Env, merchant: Address) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::Merchant(merchant))
+            .map(|record: MerchantRecord| record.fee_bps)
+            .unwrap_or(DEFAULT_FEE_BPS)
+    }
+
+    /// Detailed merchant status snapshot.
+    pub fn get_merchant_status(env: Env, merchant: Address) -> MerchantStatusInfo {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, MerchantRecord>(&DataKey::Merchant(merchant.clone()))
+        {
+            Some(record) => {
+                let status = record.status.clone();
+                let is_active = status == MerchantStatus::Active;
+                let is_suspended = status == MerchantStatus::Suspended;
+                let is_terminated = status == MerchantStatus::Terminated;
+                MerchantStatusInfo {
+                    registered: true,
+                    status: status.clone(),
+                    is_active,
+                    is_suspended,
+                    is_terminated,
+                    is_kyc_verified: record.kyc_verified,
+                    is_approved: is_active && record.kyc_verified,
+                }
+            }
+            None => MerchantStatusInfo {
+                registered: false,
+                status: MerchantStatus::Active,
+                is_active: false,
+                is_suspended: false,
+                is_terminated: false,
+                is_kyc_verified: false,
+                is_approved: false,
+            },
+        }
+    }
+
+    /// Convenience query for whether a merchant is active and usable.
+    pub fn is_merchant_active(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_active
+    }
+
+    /// Convenience query for whether a merchant is suspended.
+    pub fn is_merchant_suspended(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_suspended
+    }
+
+    /// Convenience query for whether a merchant is terminated.
+    pub fn is_merchant_terminated(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_terminated
+    }
+
+    /// Convenience query for KYC status.
+    pub fn is_kyc_verified(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_kyc_verified
+    }
+
+    /// Convenience query for approval status.
+    pub fn is_approved(env: Env, merchant: Address) -> bool {
+        Self::get_merchant_status(env, merchant).is_approved
     }
 
     /// Return the total number of registered merchants.
@@ -485,11 +628,7 @@ impl MerchantRegistryContract {
             .get(&DataKey::MerchantCount)
             .unwrap_or(0);
 
-        let start = page.saturating_mul(page_size);
-        if start >= total {
-            return result;
-        }
-
+        let start = page.min(total);
         let end = start.saturating_add(page_size).min(total);
         let mut i = start;
         while i < end {
@@ -517,7 +656,7 @@ impl MerchantRegistryContract {
             .get(&DataKey::Admin)
             .expect("Admin not set");
         if &admin != caller {
-            panic!("Caller is not admin");
+            panic!("Not admin");
         }
     }
 }

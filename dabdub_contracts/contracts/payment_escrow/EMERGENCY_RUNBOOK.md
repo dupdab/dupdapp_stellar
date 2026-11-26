@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Use `emergency_drain` only during a confirmed critical security incident that risks escrowed USDC.
+Use `emergency_drain` only during a confirmed critical security incident that risks escrowed USDC or XLM.
 
 ## Preconditions
 
@@ -13,7 +13,7 @@ Use `emergency_drain` only during a confirmed critical security incident that ri
 
 ## Execution Steps
 
-1. Confirm current escrow contract USDC balance is non-zero.
+1. Confirm at least one USDC or XLM escrow balance is non-zero.
 2. Prepare a transaction calling:
    - `emergency_drain(caller, signer_one, signer_two)`
 3. Ensure both `signer_one` and `signer_two` provide signatures.
@@ -25,15 +25,16 @@ Use `emergency_drain` only during a confirmed critical security incident that ri
   - signer_one and signer_two are distinct
   - both are members of the configured emergency signer set
   - cooldown is not active
-- Entire USDC balance held by the escrow contract is transferred atomically to treasury.
+- Entire USDC and XLM balances held by the escrow contract are transferred atomically to treasury.
+- The return value is the sum of the drained USDC and XLM balances.
 - `EmergencyDrain` event (`ESCROW`, `emergency_drain`) is emitted with:
   - `amount`
   - `caller`
 
 ## Post-Execution Checks
 
-- Escrow contract USDC balance is `0`.
-- Treasury USDC balance increased by the drained amount.
+- Escrow contract USDC and XLM balances are `0`.
+- Treasury balances increased by their respective drained amounts.
 - Event stream contains the emergency drain event for audit trail.
 
 ## Cooldown and Repeat Protection

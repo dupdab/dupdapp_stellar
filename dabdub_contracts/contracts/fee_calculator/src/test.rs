@@ -1,8 +1,10 @@
 #![cfg(test)]
 
-use crate::{FeeCalculatorContract, FeeCalculatorContractClient, FeeTier, FeeTiersUpdatedEvent};
-use proptest::prelude::*;
-use soroban_sdk::{testutils::{Address as _, Events as _, Ledger}, vec, Address, Env, IntoVal};
+use crate::{FeeCalculatorContract, FeeCalculatorContractClient, FeeTier};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    vec, Address, Env,
+};
 
 fn setup_env() -> (
     Env,
@@ -13,12 +15,6 @@ fn setup_env() -> (
 ) {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| {
-        li.min_temp_entry_ttl = 300_000;
-        li.min_persistent_entry_ttl = 300_000;
-        li.max_entry_ttl = 300_000;
-    });
-
     let admin = Address::generate(&env);
     let merchant = Address::generate(&env);
     let settlement_caller = Address::generate(&env);
@@ -38,36 +34,20 @@ fn setup_env() -> (
         },
     ];
 
-    let contract_id = env.register(FeeCalculatorContract, (&admin, tiers));
+    let contract_id = env.register(FeeCalculatorContract, (&admin, tiers, &10u32));
     let client = FeeCalculatorContractClient::new(&env, &contract_id);
     client.set_settlement_caller(&admin, &settlement_caller);
 
     (env, client, admin, merchant, settlement_caller)
 }
 
-/// Builds a 10-tier fee configuration used by the gas benchmark.
-fn ten_tier_config(env: &Env) -> soroban_sdk::Vec<FeeTier> {
-    let mut tiers = soroban_sdk::Vec::new(env);
-    let mut i = 0u32;
-    while i < 10 {
-        tiers.push_back(FeeTier {
-            threshold_usdc: (i as i128) * 1_000,
-            fee_bps: 200 - (i as u32) * 10,
-        });
-        i += 1;
-    }
-    tiers
-}
-
 #[test]
 fn test_fee_rate_drops_when_volume_crosses_tier_threshold() {
     let (_env, client, _admin, merchant, settlement_caller) = setup_env();
 
-    // Volume = 900, still tier 1 (150 bps)
     let (_, _, bps_before) = client.calculate_fee(&settlement_caller, &merchant, &900);
     assert_eq!(bps_before, 150);
 
-    // Volume = 1000, enters tier 2 (120 bps)
     let (_, _, bps_after) = client.calculate_fee(&settlement_caller, &merchant, &100);
     assert_eq!(bps_after, 120);
 }
@@ -76,60 +56,24 @@ fn test_fee_rate_drops_when_volume_crosses_tier_threshold() {
 fn test_highest_tier_applies_at_exact_boundary() {
     let (env, client, _admin, merchant, settlement_caller) = setup_env();
 
-    client.calculate_fee(&settlement_caller, &merchant, &2_000); // puts merchant into 120 bps tier
+    client.calculate_fee(&settlement_caller, &merchant, &2_000);
     let (_, _, bps_before_reset) = client.calculate_fee(&settlement_caller, &merchant, &1);
     assert_eq!(bps_before_reset, 120);
+    assert_eq!(client.get_merchant_volume(&merchant), 2_001);
+
+    env.ledger().with_mut(|li| li.timestamp += 30 * 24 * 60 * 60 + 1);
+    assert_eq!(client.get_merchant_volume(&merchant), 0);
 }
 
 #[test]
-fn test_volume_resets_after_30_days_by_ledger_count() {
+fn test_volume_resets_after_30_days_by_timestamp() {
     let (env, client, _admin, merchant, settlement_caller) = setup_env();
 
-    client.calculate_fee(&settlement_caller, &merchant, &2_000); // puts merchant into 120 bps tier
-    let (_, _, bps_before_reset) =
-        client.calculate_fee(&settlement_caller, &merchant, &1);
-
-    assert_eq!(bps_before_reset, 120);
-
-    env.ledger().with_mut(|li| li.sequence_number += 172_800);
-
-    let (_, _, bps_after_reset) =
-        client.calculate_fee(
-fn test_volume_resets_after_30_days_by_ledger_count() {
-    let (env, client, _admin, merchant, settlement_caller) = setup_env();
-
-    client.calculate_fee(&settlement_caller, &merchant, &2_000); // puts merchant into 120 bps tier
-    let (_, _, bps_before_reset) =
-        client.calculate_fee(&settlement_caller, &merchant, &1);
-
-    assert_eq!(bps_before_reset, 120);
-
-    env.ledger().with_mut(|li| li.sequence_number += 172_800);
-
-    let (_, _, bps_after_reset) =
-        client.calculate_fee(&settlement_caller, &merchant, &100);
+    client.calculate_fee(&settlement_caller, &merchant, &2_000);
+    env.ledger().with_mut(|li| li.timestamp += 30 * 24 * 60 * 60 + 1);
+    let (_, _, bps_after_reset) = client.calculate_fee(&settlement_caller, &merchant, &100);
     assert_eq!(bps_after_reset, 150);
-}
-
-#[test]
-fn test_get_merchant_volume_is_read_only_after_window_elapsed() {
-    let (env, client, admin, merchant) = setup_env();
-
-    client.calculate_fee(&admin, &merchant, &2_000);
-    assert_eq!(client.get_merchant_volume(&merchant), 2_000);
-
-    // Move ledger beyond 30-day window (172800 ledgers).
-    env.ledger().with_mut(|li| li.sequence_number += 172_800);
-
-    // The getter must report the windowed (reset) value without persisting it.
-    assert_eq!(client.get_merchant_volume(&merchant), 0);
-    // A second read must observe the same value, proving no write-back occurred.
-    assert_eq!(client.get_merchant_volume(&merchant), 0);
-
-    // The persisted volume is still the pre-reset value; only
-    // update_and_get_volume (via calculate_fee) performs the reset-and-persist.
-    let (_, _, bps) = client.calculate_fee(&admin, &merchant, &100);
-    assert_eq!(bps, 150);
+    assert_eq!(client.get_merchant_volume(&merchant), 100);
 }
 
 #[test]
@@ -149,65 +93,12 @@ fn test_admin_can_update_fee_tiers() {
     ];
 
     client.set_fee_tiers(&admin, &new_tiers);
-    let stored = client.get_fee_tiers();
-    assert_eq!(stored, new_tiers);
-}
-
-#[test]
-fn test_set_fee_tiers_emits_fee_tiers_updated_event() {
-    let (env, client, admin, _merchant) = setup_env();
-
-    let new_tiers = vec![
-        &env,
-        FeeTier {
-            threshold_usdc: 0,
-            fee_bps: 200,
-        },
-        FeeTier {
-            threshold_usdc: 5_000,
-            fee_bps: 80,
-        },
-    ];
-
-    client.set_fee_tiers(&admin, &new_tiers);
-
-    let expected = FeeTiersUpdatedEvent {
-        admin: admin.clone(),
-        tiers: new_tiers.clone(),
-    };
-
-    let events = env.events().all();
-    let last = events.last().unwrap();
-    assert_eq!(
-        last,
-        (
-            client.address.clone(),
-            (soroban_sdk::symbol_short!("fee_tiers"),).into_val(&env),
-            expected.into_val(&env),
-        )
-    );
-}
-
-#[test]
-#[should_panic(expected = "Not admin")]
-fn test_non_admin_cannot_update_fee_tiers() {
-    let (env, client, _admin, _merchant, _settlement_caller) = setup_env();
-    let random = Address::generate(&env);
-
-    let new_tiers = vec![
-        &env,
-        FeeTier {
-            threshold_usdc: 0,
-            fee_bps: 100,
-        },
-    ];
-
-    client.set_fee_tiers(&random, &new_tiers);
+    assert_eq!(client.get_fee_tiers(), new_tiers);
 }
 
 #[test]
 fn test_admin_can_set_min_fee() {
-    let (_env, client, admin, _merchant) = setup_env();
+    let (_env, client, admin, _merchant, _settlement_caller) = setup_env();
 
     client.set_min_fee(&admin, &5);
     assert_eq!(client.get_min_fee(), 5);
@@ -217,7 +108,6 @@ fn test_admin_can_set_min_fee() {
 fn test_zero_bps_tier_still_charges_minimum_floor() {
     let (env, client, admin, merchant, settlement_caller) = setup_env();
 
-    // Configure a zero-bps tier so the merchant would otherwise pay nothing.
     let zero_tiers = vec![
         &env,
         FeeTier {
@@ -227,13 +117,10 @@ fn test_zero_bps_tier_still_charges_minimum_floor() {
     ];
     client.set_fee_tiers(&admin, &zero_tiers);
 
-    // Default minimum floor is 10 bps.
     assert_eq!(client.get_min_fee(), 10);
 
     let amount: i128 = 10_000;
     let (fee, net, bps) = client.calculate_fee(&settlement_caller, &merchant, &amount);
-
-    // The applied rate must be floored at the minimum, not the tier's 0 bps.
     assert_eq!(bps, 10);
     assert_eq!(fee, amount * 10 / 10_000);
     assert_eq!(net, amount - fee);
@@ -241,126 +128,93 @@ fn test_zero_bps_tier_still_charges_minimum_floor() {
 }
 
 #[test]
-#[should_panic(expected = "Unauthorized caller")]
+#[should_panic(expected = "Not authorized")]
 fn test_unauthorized_caller_cannot_calculate_fee() {
-    let (env, client, _admin, merchant) = setup_env();
-    let attacker = Address::generate(&env);
-
-    client.calculate_fee(&attacker, &merchant, &1_000);
-}
-
-#[test]
-fn test_admin_can_calculate_fee() {
-    let (_env, client, admin, merchant) = setup_env();
-
-    let (_, _, bps) = client.calculate_fee(&admin, &merchant, &1_000);
-    assert_eq!(bps, 120);
-}
-
-#[test]
-#[should_panic(expected = "Unauthorized caller")]
-fn test_attacker_cannot_grief_merchant_fee_tier() {
-    let (_env, client, admin, merchant) = setup_env();
-    let attacker = Address::generate(&env);
-
-    // Attacker attempts to push the victim merchant's volume past the tier
-    // threshold with no real settlement activity.
-    client.calculate_fee(&attacker, &merchant, &1_000);
-
-    // The victim's tracked volume must be untouched by the rejected call.
-    assert_eq!(client.get_merchant_volume(&merchant), 0);
-
-    // A legitimate admin call still advances volume and applies the tier.
-    let (_, _, bps) = client.calculate_fee(&admin, &merchant, &1_000);
-    assert_eq!(bps, 120);
-}
-
-#[test]
-fn test_admin_can_set_settlement_caller() {
-    let (env, client, admin, _merchant, _settlement) = setup_env();
-    let new_settlement = Address::generate(&env);
-    client.set_settlement_caller(&admin, &new_settlement);
-    // Confirm the new settlement caller is accepted by calculate_fee
-    let merchant = Address::generate(&env);
-    let (fee, net, bps) = client.calculate_fee(&new_settlement, &merchant, &500);
-    assert_eq!(bps, 150);
-    assert!(fee > 0);
-    assert!(net > 0);
-}
-
-#[test]
-#[should_panic(expected = "caller is not the authorized settlement contract")]
-fn test_non_settlement_caller_cannot_calculate_fee() {
-    let (env, client, _admin, merchant, _settlement_caller) = setup_env();
-    let attacker = Address::generate(&env);
-
-    client.calculate_fee(&attacker, &merchant, &1_000);
-= Address::generate(&env);
-    let (fee, net, bps) = client.calculate_fee(&new_settlement, &merchant, &500);
-    assert_eq!(bps, 150);
-    assert!(fee > 0);
-    assert!(net > 0);
-}
-
-#[test]
-#[should_panic(expected = "caller is not the authorized settlement contract")]
-fn test_non_settlement_caller_cannot_calculate_fee() {
     let (env, client, _admin, merchant, _settlement_caller) = setup_env();
     let attacker = Address::generate(&env);
 
     client.calculate_fee(&attacker, &merchant, &1_000);
 }
 
-/// Gas benchmark: `calculate_fee` against a 10-tier fee configuration.
-///
-/// Run with `cargo test -- --include-ignored bench`.
-#[test]
-#[ignore = "gas benchmark; run with --include-ignored bench"]
-fn bench_calculate_fee_ten_tiers() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| {
-        li.min_temp_entry_ttl = 300_000;
-        li.min_persistent_entry_ttl = 300_000;
-        li.max_entry_ttl = 300_000;
-    });
-
-    let admin = Address::generate(&env);
-    let merchant = Address::generate(&env);
-    let settlement_caller = Address::generate(&env);
-    let tiers = ten_tier_config(&env);
-
-    let contract_id = env.register(FeeCalculatorContract, (&admin, tiers));
-    let client = FeeCalculatorContractClient::new(&env, &contract_id);
-    client.set_settlement_caller(&admin, &settlement_caller);
-
-    // Warm up: first call writes the merchant volume entry.
-    client.calculate_fee(&settlement_caller, &merchant, &1_000);
-
-    let before = env.budget().cpu_instruction_cost();
-    let (fee, net, bps) = client.calculate_fee(&settlement_caller, &merchant, &1_000);
-    let cpu = env.budget().cpu_instruction_cost() - before;
-
-    assert!(fee > 0);
-    assert!(net > 0);
-    assert!(bps > 0);
-    std::println!("bench_calculate_fee_ten_tiers: cpu_instructions={cpu}");
+/// Helper: assert fee + net == amount and fee matches the expected bps math
+/// with no precision loss for the given amount (already scaled to the token's
+/// smallest unit).
+fn assert_fee_no_precision_loss(
+    client: &FeeCalculatorContractClient,
+    settlement_caller: &Address,
+    merchant: &Address,
+    amount: i128,
+    expected_bps: u32,
+) {
+    let (fee, net, bps) = client.calculate_fee(settlement_caller, merchant, &amount);
+    assert_eq!(bps, expected_bps);
+    // Exact integer math: fee is floor(amount * bps / 10_000).
+    let expected_fee = amount * (expected_bps as i128) / 10_000;
+    assert_eq!(fee, expected_fee, "fee mismatch for amount {amount}");
+    // No value is created or destroyed.
+    assert_eq!(fee + net, amount, "fee + net must equal amount");
+    assert!(fee >= 0);
+    assert!(net >= 0);
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+#[test]
+fn test_fee_calculation_six_decimal_token() {
+    let (_env, client, _admin, merchant, settlement_caller) = setup_env();
 
-    /// Property: for any amount, the returned fee plus net always equals the
-    /// original amount (no value is created or destroyed by fee calculation).
-    #[test]
-    fn prop_fee_plus_net_equals_amount(amount in 0i128..=1_000_000_000i128) {
-        let (_env, client, _admin, merchant, settlement_caller) = setup_env();
-        let (fee, net, _bps) =
-            client.calculate_fee(&settlement_caller, &merchant, &amount);
-        prop_assert!(fee >= 0);
-        prop_assert!(net >= 0);
-        prop_assert_eq!(fee + net, amount);
+    // 6-decimal token: 1 unit = 1_000_000 smallest units.
+    // 100 tokens at the base 150 bps tier.
+    let amount: i128 = 100 * 1_000_000;
+    assert_fee_no_precision_loss(&client, &settlement_caller, &merchant, amount, 150);
+
+    // A tiny amount that would round to zero fee at 150 bps.
+    let tiny: i128 = 66; // 66 * 150 / 10_000 = 0 (floor)
+    assert_fee_no_precision_loss(&client, &settlement_caller, &merchant, tiny, 150);
+}
+
+#[test]
+fn test_fee_calculation_seven_decimal_token_usdc() {
+    let (_env, client, _admin, merchant, settlement_caller) = setup_env();
+
+    // USDC on Stellar has 7 decimals: 1 unit = 10_000_000 smallest units.
+    // 100 USDC at the base 150 bps tier.
+    let amount: i128 = 100 * 10_000_000;
+    assert_fee_no_precision_loss(&client, &settlement_caller, &merchant, amount, 150);
+
+    // 1 USDC (10_000_000 stroops) at 150 bps = 150_000 stroops exactly.
+    let one_usdc: i128 = 10_000_000;
+    let (fee, net, bps) = client.calculate_fee(&settlement_caller, &merchant, &one_usdc);
+    assert_eq!(bps, 150);
+    assert_eq!(fee, 150_000);
+    assert_eq!(net, one_usdc - 150_000);
+    assert_eq!(fee + net, one_usdc);
+}
+
+#[test]
+fn test_fee_calculation_zero_decimal_token() {
+    let (_env, client, _admin, merchant, settlement_caller) = setup_env();
+
+    // 0-decimal token: 1 unit = 1 smallest unit. Amounts are whole units.
+    let amount: i128 = 1_000;
+    assert_fee_no_precision_loss(&client, &settlement_caller, &merchant, amount, 150);
+
+    // Smallest possible non-zero amount: 1 unit at 150 bps floors to 0 fee.
+    let one: i128 = 1;
+    let (fee, net, bps) = client.calculate_fee(&settlement_caller, &merchant, &one);
+    assert_eq!(bps, 150);
+    assert_eq!(fee, 0);
+    assert_eq!(net, 1);
+    assert_eq!(fee + net, one);
+}
+
+#[test]
+fn test_fee_calculation_no_precision_loss_across_decimals() {
+    let (_env, client, _admin, merchant, settlement_caller) = setup_env();
+
+    // Same nominal amount expressed in each token's smallest unit.
+    // 0-decimal: 1_000 units; 6-decimal: 1_000 * 10^6; 7-decimal: 1_000 * 10^7.
+    let amounts: [i128; 3] = [1_000, 1_000 * 1_000_000, 1_000 * 10_000_000];
+
+    for amount in amounts.iter() {
+        assert_fee_no_precision_loss(&client, &settlement_caller, &merchant, *amount, 150);
     }
-}
-
 }

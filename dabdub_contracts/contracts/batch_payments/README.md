@@ -2,67 +2,141 @@
 
 ## Purpose
 
-`batch_payments` lets a caller submit a single transaction that pays many
-recipients at once. Instead of N separate transfers (N ledger entries, N auth
-checks, N events), the caller supplies a batch of `(recipient, amount)` pairs
-and the contract executes them atomically: either every payment in the batch
-succeeds or the whole call reverts.
+`batch_payments` lets an authorized merchant create multiple payment records
+in one invocation. The merchant supplies a batch of payment inputs and the
+contract validates all entries before storing any, so an invalid item reverts
+the entire call.
 
-This is intended for payroll, airdrops, affiliate payouts, and any flow where a
-single operator distributes funds to a known list of addresses.
+This supports upstream payroll, airdrop, and affiliate-payout flows where the
+payment records are created in batches and settled downstream.
 
 ## Storage
 
 | Key | Type | Description |
 | --- | --- | --- |
 | `Admin` | `Address` | Address allowed to configure the contract (see Admin operations). |
-| `Token` | `Address` | The token contract used for all payments in a batch. |
-| `BatchCount` | `u32` | Monotonic counter used to derive unique batch ids. |
-| `Batch(id)` | `BatchRecord` | Per-batch record: payer, total amount, recipient count, ledger sequence. |
+| `MinAmount` / `MaxAmount` | `i128` | Inclusive allowed amount range for each payment. |
+| `MaxBatchSize` | `u32` | Admin-configurable upper bound; defaults to 20 and is capped at 100. |
+| `Counter` | `u64` | Monotonic counter used when deriving payment ids. |
+| `Version` | `u32` | Contract ABI version. |
+| `RegistryContract` | `Address` | Optional merchant registry used to gate batch creation. |
+| `Payment(id)` | `PaymentRecord` | Persistent payment record containing the merchant, amount, memo, and optional customer. |
 
-Storage is instance-scoped; entries are written only when a batch is executed
-and are never mutated afterwards.
+Configuration is instance-scoped. Each payment record is stored persistently
+when a batch is created and is not mutated afterwards.
 
 ## Events
 
 | Event | Topics | Data | Emitted when |
 | --- | --- | --- | --- |
-| `batch_executed` | `(symbol_short!("batch"), payer)` | `(batch_id, recipient_count, total_amount)` | A batch completes successfully. |
-| `batch_failed` | `(symbol_short!("batch_fail"), payer)` | `(batch_id, reason_code)` | A batch is rejected before any transfer is attempted. |
+| `PaymentCreated` | `("PaymentCreated",)` | `(payment_id, merchant, amount, memo, customer)` | Each payment record is created. |
 
-Events are emitted once per batch, not once per recipient, to keep the event
-stream compact for large batches.
+One event is emitted per payment record.
 
 ## Admin operations
 
-- `initialize(admin, token)` — one-time setup; sets `Admin` and `Token`.
-- `set_token(new_token)` — admin-only; rotates the payment token. Existing
-  batch records are unaffected.
-- `pause()` / `unpause()` — admin-only; while paused, `execute_batch` reverts
-  with a paused error and no transfers occur.
+- `init(admin, min_amount, max_amount)` — one-time setup of the administrator
+  and per-payment amount limits. `MaxBatchSize` is initialized to the default
+  of 20.
+- `set_limits(min_amount, max_amount)` — admin-only amount-limit update.
+- `set_max_batch_size(new_max)` — admin-only limit update, capped at 100.
+- `set_registry(registry)` — admin-only; configure or clear the optional
+  merchant registry.
 
 All admin entry points require `admin.require_auth()`.
 
+## Batch size enforcement
+
+Every batch is checked against the configured `MaxBatchSize` before any
+validation or storage work. A batch larger than the configured limit is
+rejected with `Error::BatchTooLarge` and the entire call reverts, so no
+partial state is written.
+
+The default limit is 20 items. The admin can raise or lower it via
+`set_max_batch_size`, but the value is capped at a hard maximum of 100 items.
+
+## Batch size and instruction benchmark
+
+The default batch size is 20 items and the hard maximum is 100 items. The
+admin can lower the configured limit but cannot raise it above this ceiling.
+The limit is based on the Soroban test-host CPU instruction benchmark in
+`src/test.rs::benchmark_batch_instruction_cost_per_item`, which measures the
+contract call separately from setup at 20 and 100 items. In the current test
+host run, 20 items used 849,890 instructions (42,494 per item), and 100 items
+used 6,853,384 (68,533 per item). The 100-item test also asserts that the call
+remains below the 100,000,000-instruction transaction budget; this run used
+about 6.9% of that budget.
+
+The loop writes one persistent payment record and emits one event per payment.
+Keeping the hard limit at 100 leaves transaction resources for authorization,
+input encoding, and surrounding transaction work; callers should still
+simulate against the target network and split batches if future contract logic
+materially increases cost. The benchmark is a reproducible test-host
+measurement, not a substitute for network simulation or a guarantee for
+arbitrary future code changes.
+
+### Maximum safe batch size
+
+The benchmark enforces a safety margin: the measured instruction usage for a
+batch must stay below **80% of the Soroban instruction limit**
+(`INSTRUCTION_LIMIT * 80 / 100`). At the current per-item cost, the maximum
+safe batch size is **100 items** — the contract's hard ceiling — which uses
+about 6.9% of the 100,000,000-instruction budget, well within the 80% margin.
+The CI benchmark step (`cargo test -p batch-payments benchmark_`) fails the
+build if any benchmarked batch size exceeds this 80% threshold, so the
+maximum safe batch size cannot silently regress.
+
+Run the measurement with:
+
+```sh
+cd dabdub_contracts
+cargo test -p batch-payments benchmark_batch_instruction_cost_per_item -- --nocapture
+```
+
+## wasm-opt optimization level (Oz vs O3)
+
+Release builds run `wasm-opt` on the compiled contract WASM. The build uses
+`-Oz` (size-optimized) rather than `-O3` (speed-optimized). The tradeoff is
+code size versus execution cost:
+
+- **`-Oz` (chosen).** Produces the smallest WASM, which lowers the on-chain
+  upload/storage cost and keeps the artifact well under the CI WASM size
+  limit. The cost is slightly more CPU instructions per call because the
+  optimizer favors size over inlining and loop unrolling.
+- **`-O3`.** Produces faster-executing WASM (fewer instructions per call) but
+  a larger artifact, increasing upload/storage cost and risking the size
+  limit.
+
+For `batch_payments` the execution-cost difference is small relative to the
+100,000,000-instruction transaction budget: the 100-item benchmark above uses
+about 6.9% of the budget, so the extra instructions from `-Oz` do not
+meaningfully change headroom. Because upload/storage cost is paid once per
+deployment while the instruction savings from `-O3` are marginal here, `-Oz`
+is the better default. If a future change makes per-call cost dominate, switch
+the Makefile to `-O3` and re-run the benchmark below to confirm the tradeoff.
+
+To compare the two levels, build with each and re-run the instruction
+benchmark:
+
+```sh
+cd dabdub_contracts
+# default build uses -Oz
+cargo test -p batch-payments benchmark_batch_instruction_cost_per_item -- --nocapture
+# then rebuild with -O3 (edit the wasm-opt flags in the Makefile) and re-run
+```
+
 ## Known limitations
 
-- **Single token per batch.** A batch cannot mix assets; callers needing
-  multiple tokens must submit one batch per token.
-- **No partial success.** A single failing recipient (e.g. insufficient balance
-  or a rejecting token) reverts the entire batch. Callers should pre-validate
-  balances off-chain or split large batches.
-- **Batch size is bounded** by the Soroban per-transaction resource limits;
-  very large recipient lists must be chunked across multiple transactions.
-- **No refund path.** Once a batch executes, funds are transferred; there is no
-  admin clawback. Recovery of misdirected funds depends on the recipient.
-- **Pause is global.** Pausing blocks all payers, not a single caller.
+- **No token transfer.** The contract records payment instructions; settlement
+  is handled by the downstream payment flow.
+- **No partial success.** A single invalid item reverts the entire batch.
+- **Batch size is bounded** by the configured `MaxBatchSize` (default 20, hard
+  ceiling 100); larger payment lists must be chunked across multiple
+  transactions.
+- **No batch deletion.** Created payment records are immutable and have no
+  admin clawback or refund path.
 
 ## Cross-references
 
-- [`admin_auth`](../admin_auth/README.md) — shared admin/role primitives used
-  by the pause and token-rotation entry points.
-- [`admin_timelock`](../admin_timelock/README.md) — if admin actions on this
-  contract are routed through the timelock, see that contract for the delay
-  and cancellation semantics.
-- The configured `Token` contract (external SEP-41 token) — all transfers are
-  delegated to it; its own pause/allowlist rules apply on top of this
-  contract's pause flag.
+- [`merchant_registry`](../merchant_registry/README.md) — optional merchant
+  approval gate.

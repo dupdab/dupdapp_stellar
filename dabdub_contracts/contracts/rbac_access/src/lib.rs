@@ -2,9 +2,13 @@
 
 mod test;
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env,
-};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, Env, Vec};
+
+#[contracttype]
+enum DataKey {
+    Role(Address),
+    SuperAdminCount,
+}
 
 // ── Role ────────────────────────────────────────────────────────────────────
 
@@ -17,11 +21,7 @@ pub enum Role {
     SuperAdmin,
 }
 
-#[contracttype]
-enum DataKey {
-    Role(Address),
-    SuperAdminCount,
-}
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, Env, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +37,10 @@ pub struct RoleRevokedEvent {
     pub account: Address,
     pub revoked_by: Address,
 }
+
+/// Maximum number of roles that may be assigned to a single account.
+/// Issue #1534: cap roles per account to prevent unbounded storage growth.
+pub const MAX_ROLES_PER_ACCOUNT: u32 = 10;
 
 #[contract]
 pub struct RbacAccessContract;
@@ -56,6 +60,16 @@ impl RbacAccessContract {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::SuperAdmin);
 
+        // Issue #1534: enforce a maximum number of roles per account.
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoleCount(account.clone()))
+            .unwrap_or(0);
+        if current_count >= MAX_ROLES_PER_ACCOUNT {
+            panic!("too many roles");
+        }
+
         let is_new_super_admin = role == Role::SuperAdmin
             && !env
                 .storage()
@@ -65,6 +79,9 @@ impl RbacAccessContract {
         env.storage()
             .persistent()
             .set(&DataKey::Role(account.clone()), &role);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleCount(account.clone()), &(current_count + 1));
 
         if is_new_super_admin {
             let count: u32 = env
@@ -117,15 +134,25 @@ impl RbacAccessContract {
             if count <= 1 {
                 panic!("cannot revoke last super admin");
             }
-            env.storage()
-                .persistent()
-                .set(
-                    &DataKey::SuperAdminCount,
-                    &count.checked_sub(1).expect("SuperAdminCount underflow"),
-                );
+            env.storage().persistent().set(
+                &DataKey::SuperAdminCount,
+                &count.checked_sub(1).expect("SuperAdminCount underflow"),
+            );
         }
 
         env.storage().persistent().remove(&key);
+
+        // Issue #1534: decrement the per-account role count on revoke.
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoleCount(account.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::RoleCount(account.clone()),
+            &current_count.saturating_sub(1),
+        );
+
         env.events().publish(
             ("RBAC", "role_revoked"),
             RoleRevokedEvent {

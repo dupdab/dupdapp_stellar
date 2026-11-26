@@ -1,9 +1,17 @@
 # Deployment configuration
 
-`.github/workflows/deploy.yml` deploys all 14 workspace contracts to testnet on
-every merge to `main`, and to mainnet on a `v*` tag. Ten of those contracts take
-`__constructor` arguments, so the workflow reads them from GitHub Actions
-**variables** (Settings → Secrets and variables → Actions → Variables).
+`.github/workflows/deploy.yml` runs automated deployments on merges to `main`
+and `v*` tags. The manual `make deploy-testnet` command independently builds
+and deploys all 17 current contracts to testnet. Constructor and initialization
+arguments for that command are supplied as environment variables; the
+automated workflow reads its own values from GitHub Actions **variables**
+(Settings → Secrets and variables → Actions → Variables).
+
+For local manual deployments, `make deploy-testnet` uses the same public
+configuration values under the unprefixed names shown below. It also requires
+the CLI's `SOROBAN_SOURCE_ACCOUNT` (default `deployer`) to be the
+`DEPLOY_ADMIN` address, and writes IDs incrementally to
+`deployments/testnet.json`.
 
 Values are per-network, prefixed `TESTNET_` or `MAINNET_`. The deploy step
 checks every required variable up front and fails naming the missing one, rather
@@ -24,13 +32,17 @@ than letting an opaque CLI error surface halfway through a partial deploy.
 | `…_TREASURY` | `fee_distributor` | `GA…` |
 | `…_LP_ADDRESS` | `fee_distributor` | `GA…` |
 | `…_LP_SHARE_BPS` | `fee_distributor` | `2000` |
+| `…_FEE_DISTRIBUTOR_ALLOWED_CALLER` | `fee_distributor` | `C…` |
 | `…_FEE_TIERS` | `fee_calculator` | JSON array, see below |
+| `…_MIN_FEE_BPS` | `fee_calculator` | `0` |
 | `…_MULTISIG_ADMIN_1/2/3` | `multisig_admin` | `GA…` |
 | `…_ESCROW_DEFAULT_TTL_LEDGERS` | `payment_escrow` | `518400` |
 | `…_EMERGENCY_SIGNERS` | `payment_escrow` | JSON array, see below |
 | `…_EMERGENCY_TREASURY` | `payment_escrow` | `GA…` |
-| `…_EMERGENCY_COOLDOWN_LEDGERS` | `payment_escrow` | `17280` |
+| `…_EMERGENCY_COOLDOWN_LEDGERS` | `payment_escrow` | `50` |
 | `…_CONFIRMATION_COUNT` | `stellar_confirmations` | `3` |
+| `…_BATCH_PAYMENTS_MIN_AMOUNT` | `batch_payments` | `1` |
+| `…_BATCH_PAYMENTS_MAX_AMOUNT` | `batch_payments` | `1000000000` |
 
 ### Optional
 
@@ -48,26 +60,49 @@ Two constructors take container types, which the Stellar CLI expects as JSON.
 ["GA…", "GB…", "GC…"]
 ```
 
+`…_FEE_DISTRIBUTOR_RECIPIENTS` — `Vec<FeeRecipient>`. Shares must total exactly
+10,000 basis points, addresses must be unique, and at most 10 recipients are
+accepted:
+
+```json
+[
+  { "address": "G…", "share_bps": 7000 },
+  { "address": "G…", "share_bps": 2000 },
+  { "address": "G…", "share_bps": 1000 }
+]
+```
+
+`fee_distributor` recipient changes require a 17,280-ledger (~24 hour)
+timelock. The admin schedules a complete replacement list; once the deadline is
+reached, the admin applies it. The fee distributor and its existing deployments
+must be redeployed to adopt this constructor and storage schema.
+
 `…_FEE_TIERS` — `Vec<FeeTier>`. Field names must match the struct in
 `dabdub_contracts/contracts/fee_calculator/src/lib.rs`:
 
 ```json
 [
-  { "min_amount": "0",         "max_amount": "10000000",  "fee_bps": 100 },
-  { "min_amount": "10000001",  "max_amount": "100000000", "fee_bps": 50  }
+  { "threshold_usdc": 0,    "fee_bps": 150 },
+  { "threshold_usdc": 1000, "fee_bps": 120 }
 ]
 ```
 
-## Contracts with no constructor
+`…_REGISTRY_ADDRESS` is optional. `…_FEE_DISTRIBUTOR_ALLOWED_CALLER` should be
+the public contract or account that is authorized to distribute calculated
+fees. `…_MIN_FEE_BPS` configures the minimum rate used by `fee_calculator`.
 
-`batch_payments`, `liquidity_router` and `payment_request` take no constructor
-arguments and need no configuration.
+## Contracts without constructor arguments
+
+`contract_registry`, `batch_payments`, `liquidity_router` and `payment_request`
+do not take Soroban constructor arguments. Deployment initializes them with
+follow-up calls; `batch_payments` additionally requires its amount limits.
 
 ## Deploy order
 
-The workflow deploys constructor-free contracts first, then admin-only ones,
-then the multi-argument ones. `merchant_registry` is deployed before
-`payment_escrow` so the registry address is available to it.
+The workflow/manual command deploys constructor-free contracts first, then
+admin-only ones, then multi-argument ones. `merchant_registry` is deployed
+before `payment_escrow` so the registry address is available to it. The manual
+command also registers the IDs in `contract_registry`.
 
 Contract IDs for every deployed contract are written to the job summary and
 exposed as job outputs named `<contract>_id`.

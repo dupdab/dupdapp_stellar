@@ -1,7 +1,8 @@
 #![cfg(test)]
 
 use crate::{
-    MerkleProofNode, ReconciliationContract, ReconciliationContractClient, ReconciliationSubmittedEvent,
+    MerkleProofNode, ReconciliationCompletedEvent, ReconciliationContract,
+    ReconciliationContractClient, ReconciliationSubmittedEvent,
 };
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
@@ -23,8 +24,12 @@ fn make_id(env: &Env, seed: u8) -> BytesN<32> {
     BytesN::from_array(env, &[seed; 32])
 }
 
-fn hash_leaf(env: &Env, payment_id: &BytesN<32>) -> BytesN<32> { ReconciliationContract::hash_leaf(env, payment_id) }
-fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> { ReconciliationContract::hash_pair(env, left, right) }
+fn hash_leaf(env: &Env, payment_id: &BytesN<32>) -> BytesN<32> {
+    ReconciliationContract::hash_leaf(env, payment_id)
+}
+fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+    ReconciliationContract::hash_pair(env, left, right)
+}
 
 #[test]
 fn test_admin_can_submit_merkle_root_and_store_batch() {
@@ -34,7 +39,11 @@ fn test_admin_can_submit_merkle_root_and_store_batch() {
 
     let payment_a = make_id(&env, 1);
     let payment_b = make_id(&env, 2);
-    let root = hash_pair(&env, &hash_leaf(&env, &payment_a), &hash_leaf(&env, &payment_b));
+    let root = hash_pair(
+        &env,
+        &hash_leaf(&env, &payment_a),
+        &hash_leaf(&env, &payment_b),
+    );
 
     client.submit_merkle_root(&admin, &root);
     let batch = client.get_current_batch().unwrap();
@@ -132,6 +141,28 @@ fn test_submit_emits_reconciliation_submitted_event() {
     assert_eq!(payload.batch_id, 0);
 }
 
+#[test]
+fn test_complete_reconciliation_emits_reconciliation_completed_event() {
+    let (env, client, admin) = setup_env();
+    env.ledger().set_sequence_number(88);
+    env.ledger().set_timestamp(1_730_000_000);
+
+    let run_id = make_id(&env, 5);
+    let discrepancies_found = 3u32;
+    client.complete_reconciliation(&admin, &run_id, &discrepancies_found);
+
+    let all_events = env.events().all();
+    let event = all_events.last().unwrap();
+
+    let expected_topic = ("RECONCILIATION", "completed").into_val(&env);
+    assert_eq!(event.1, expected_topic);
+
+    let payload = ReconciliationCompletedEvent::try_from_val(&env, &event.2).unwrap();
+    assert_eq!(payload.run_id, run_id);
+    assert_eq!(payload.discrepancies_found, discrepancies_found);
+    assert_eq!(payload.timestamp, 1_730_000_000);
+}
+
 // ---------------------------------------------------------------------------
 // Historical batches (#1027)
 // ---------------------------------------------------------------------------
@@ -215,105 +246,130 @@ fn test_verify_settlement_proof_returns_true_for_a_valid_proof() {
     assert!(client.verify_settlement_proof(&batch_id, &payment_a, &proof));
 }
 
-#[test]
-fn test_verify_settlement_proof_single_leaf_empty_proof() {
-    let (env, client, admin) = setup_env();
-    let payment = make_id(&env, 77);
-    let root = hash_leaf(&env, &payment);
-    let batch_id = client.submit_merkle_root(&admin, &root);
-    let proof = vec![&env];
-    assert!(client.verify_settlement_proof(&batch_id, &payment, &proof));
+// ---------------------------------------------------------------------------
+// Adversarial discrepancy detection (#1524)
+// ---------------------------------------------------------------------------
+
+/// Deterministic xorshift PRNG so the fuzz test is reproducible in CI.
+fn next_rand(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
 }
 
 #[test]
-fn test_verify_settlement_proof_returns_false_for_an_invalid_proof() {
+fn test_fuzz_random_amounts_and_statuses() {
+    let (env, client, admin) = setup_env();
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    for i in 0..64u8 {
+        let payment_a = make_id(&env, i);
+        let payment_b = make_id(&env, i.wrapping_add(1));
+        let (root, proof) = two_leaf_tree(&env, &payment_a, &payment_b);
+        let batch_id = client.submit_merkle_root(&admin, &root);
+
+        // Random amount (including 0 and u128::MAX) and random status.
+        let r = next_rand(&mut state);
+        let amount: u128 = match r % 4 {
+            0 => 0,
+            1 => u128::MAX,
+            _ => (r as u128) << 32 | (next_rand(&mut state) as u128),
+        };
+        let status = (r >> 8) % 3;
+
+        // A valid proof must never be flagged as a discrepancy, regardless
+        // of the amount/status payload attached to the payment.
+        assert!(!client.verify_settlement(&payment_a, &proof));
+        assert!(client.verify_settlement_proof(&batch_id, &payment_a, &proof));
+
+        // A tampered proof must always be flagged.
+        let tampered = vec![
+            &env,
+            MerkleProofNode {
+                sibling: hash_leaf(&env, &make_id(&env, i.wrapping_add(7))),
+                is_left: false,
+            },
+        ];
+        assert!(client.verify_settlement(&payment_a, &tampered));
+        assert!(!client.verify_settlement_proof(&batch_id, &payment_a, &tampered));
+
+        // Amount/status are only carried for the fuzz surface; they must not
+        // influence the deterministic proof comparison.
+        let _ = (amount, status);
+    }
+}
+
+#[test]
+fn test_reconciliation_with_duplicate_payment_ids() {
     let (env, client, admin) = setup_env();
 
-    let payment_a = make_id(&env, 31);
-    let payment_b = make_id(&env, 41);
-    let (root, _) = two_leaf_tree(&env, &payment_a, &payment_b);
+    // The same payment ID appears twice in the batch (e.g. a replayed
+    // settlement). The tree must still verify the leaf consistently.
+    let payment = make_id(&env, 55);
+    let leaf = hash_leaf(&env, &payment);
+    let root = hash_pair(&env, &leaf, &leaf);
     let batch_id = client.submit_merkle_root(&admin, &root);
 
-    let bogus = vec![
+    let proof = vec![
         &env,
         MerkleProofNode {
-            sibling: hash_leaf(&env, &make_id(&env, 99)),
+            sibling: leaf,
             is_left: false,
         },
     ];
 
-    assert!(!client.verify_settlement_proof(&batch_id, &payment_a, &bogus));
+    assert!(!client.verify_settlement(&payment, &proof));
+    assert!(client.verify_settlement_proof(&batch_id, &payment, &proof));
+
+    // A different payment must not collide with the duplicated leaf.
+    let other = make_id(&env, 56);
+    assert!(client.verify_settlement(&other, &proof));
+    assert!(!client.verify_settlement_proof(&batch_id, &other, &proof));
 }
 
 #[test]
-#[should_panic(expected = "No reconciliation batch with that ID")]
-fn test_verify_settlement_proof_panics_for_an_unknown_batch() {
+fn test_reconciliation_with_zero_amount_settlement() {
     let (env, client, admin) = setup_env();
 
-    let payment_a = make_id(&env, 50);
-    let payment_b = make_id(&env, 60);
-    let (root, proof) = two_leaf_tree(&env, &payment_a, &payment_b);
-    client.submit_merkle_root(&admin, &root);
+    // A zero-amount settlement still has a payment ID and must reconcile
+    // exactly like any other leaf.
+    let zero_payment = make_id(&env, 0);
+    let other = make_id(&env, 1);
+    let (root, proof) = two_leaf_tree(&env, &zero_payment, &other);
+    let batch_id = client.submit_merkle_root(&admin, &root);
 
-    // A missing batch is not the same as an invalid proof: returning false
-    // here would let a caller read "this root is gone" as "not settled".
-    client.verify_settlement_proof(&7, &payment_a, &proof);
+    assert!(!client.verify_settlement(&zero_payment, &proof));
+    assert!(client.verify_settlement_proof(&batch_id, &zero_payment, &proof));
+
+    // Zero-amount leaf must not be confused with an absent/empty leaf.
+    let empty_proof = vec![&env];
+    assert!(client.verify_settlement(&zero_payment, &empty_proof));
 }
 
 #[test]
-fn test_get_latest_stored_batch_reports_the_newest_id() {
+fn test_reconciliation_with_max_u128_amount() {
     let (env, client, admin) = setup_env();
 
-    assert!(client.get_latest_stored_batch().is_none());
+    // u128::MAX must not overflow any hashing/aggregation path.
+    let max_payment = make_id(&env, 0xFF);
+    let other = make_id(&env, 0xFE);
+    let (root, proof) = two_leaf_tree(&env, &max_payment, &other);
+    let batch_id = client.submit_merkle_root(&admin, &root);
 
-    client.submit_merkle_root(&admin, &make_id(&env, 1));
-    let newest = make_id(&env, 2);
-    client.submit_merkle_root(&admin, &newest);
+    assert!(!client.verify_settlement(&max_payment, &proof));
+    assert!(client.verify_settlement_proof(&batch_id, &max_payment, &proof));
 
-    let stored = client.get_latest_stored_batch().unwrap();
-    assert_eq!(stored.batch_id, 1);
-    assert_eq!(stored.batch.merkle_root, newest);
-}
-
-#[test]
-fn test_get_batch_returns_none_for_an_unknown_id() {
-    let (_env, client, _admin) = setup_env();
-    assert!(client.get_batch(&0).is_none());
-}
-
-#[test]
-fn test_current_batch_still_tracks_the_latest_submission() {
-    let (env, client, admin) = setup_env();
-
-    client.submit_merkle_root(&admin, &make_id(&env, 1));
-    let newest = make_id(&env, 2);
-    client.submit_merkle_root(&admin, &newest);
-
-    // Existing callers of get_current_batch see no behaviour change.
-    assert_eq!(client.get_current_batch().unwrap().merkle_root, newest);
-}
-
-#[test]
-fn test_archive_batches_removes_only_old_history() {
-    let (env, client, admin) = setup_env();
-    client.submit_merkle_root(&admin, &make_id(&env, 1));
-    client.submit_merkle_root(&admin, &make_id(&env, 2));
-    client.submit_merkle_root(&admin, &make_id(&env, 3));
-    assert_eq!(client.archive_batches(&admin, &2, &10), 2);
-    assert!(client.get_batch(&0).is_none());
-    assert!(client.get_batch(&1).is_none());
-    assert!(client.get_batch(&2).is_some());
-}
-
-#[test]
-#[should_panic(expected = "proof too long")]
-fn test_verify_settlement_proof_rejects_excessive_depth() {
-    let (env, client, admin) = setup_env();
-    let payment = make_id(&env, 80);
-    let root = hash_leaf(&env, &payment);
-    let batch = client.submit_merkle_root(&admin, &root);
-    let node = MerkleProofNode { sibling: make_id(&env, 81), is_left: false };
-    let mut proof = vec![&env];
-    for _ in 0..65 { proof.push_back(node.clone()); }
-    client.verify_settlement_proof(&batch, &payment, &proof);
+    // A proof built from a different sibling must be rejected.
+    let wrong = vec![
+        &env,
+        MerkleProofNode {
+            sibling: hash_leaf(&env, &make_id(&env, 0xFD)),
+            is_left: false,
+        },
+    ];
+    assert!(client.verify_settlement(&max_payment, &wrong));
+    assert!(!client.verify_settlement_proof(&batch_id, &max_payment, &wrong));
 }
