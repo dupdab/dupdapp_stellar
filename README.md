@@ -1,19 +1,16 @@
-# DupDub Stellar Contracts
+# dabdub
 
-> Soroban smart contracts powering the DupDub crypto-to-fiat settlement platform on Stellar.
+A decentralized application platform with smart contracts written in Rust (Soroban).
 
-## Overview
+## Repository layout
 
-This repository contains the Soroban (Stellar smart contract platform) contracts that back DupDub's on-chain settlement flow — payment escrow, merchant registry, fee handling, and related infrastructure. It does **not** contain the backend API or frontend application; those live in their own repositories:
-
-- **Backend (Settlement API)** — `dupdap-backend`
-- **Frontend (Merchant & Customer Portal)** — `dupdap-frontend`
-
-API work tracked in this repository is implemented in the backend; see [the backend API implementation note](docs/backend-api-implementation.md).
+- `dabdub_contracts/` — Soroban smart contracts (Rust workspace)
+- `frontend/` — web application
+- `backend/` — API services
 
 ## Contracts
 
-All contracts live under [`dabdub_contracts/contracts/`](dabdub_contracts/contracts/):
+All contract crates live under `dabdub_contracts/` and are built with Cargo.
 
 | Contract | Purpose | Coverage |
 |---|---|---|
@@ -32,52 +29,31 @@ All contracts live under [`dabdub_contracts/contracts/`](dabdub_contracts/contra
 | `slippage_protection` | Slippage guards for conversions | [![slippage_protection](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=slippage_protection)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 | `stellar_confirmations` | Confirmation tracking for Stellar transactions | [![stellar_confirmations](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=stellar_confirmations)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 
-## Payment escrow lifetime and storage
+### Reproducible builds and `Cargo.lock`
 
-`DEFAULT_MAX_TTL_LEDGERS` is 518,400 ledgers: approximately 30 days at an
-assumed five seconds per ledger. It is a default upper bound on a deposit's
-requested lifetime, balancing a settlement window against locked capital and
-operational exposure. It is not a regulatory retention requirement or an exact
-wall-clock deadline. Choose shorter payment TTLs where the business permits;
-compliance and settlement policies must be defined separately.
+`dabdub_contracts/Cargo.lock` **is committed** to this repository. This pins every
+transitive dependency to an exact version so that `cargo build` and `cargo test`
+resolve the same dependency graph on every machine and in CI.
 
-A deposit at ledger `L` with TTL `T` records `expiry = L + T`. Release is allowed
-through that ledger; refund/expire becomes available only when the sequence is
-strictly greater than expiry. Time passing alone does not transfer tokens or
-change `Pending` status: someone must invoke settlement. An open dispute blocks
-normal expiry/refund and requires admin resolution, so TTL is not a guarantee
-that all funds leave escrow within 30 days.
+CI builds and tests the contracts with the `--locked` flag, which fails the build
+if `Cargo.lock` is missing or out of date with `Cargo.toml`. Do not delete or
+gitignore the lock file.
 
-**Admin configuration already exists:** `get_max_ttl_ledgers` reads the default
-or override, and admin-authorized `set_max_ttl_ledgers(caller, value)` changes the
-cap for future deposits and emits a `CONFIG/max_ttl` event. Existing payments keep
-their original expiry. Keeping this configurable allows business-specific
-settlement periods, but a compromised admin can lengthen future capital lockup;
-operators should restrict and monitor admin access and review cap changes against
-their policies. This change introduces no additional admin authority.
+### Updating the lock file
 
-**Soroban storage TTL is separate from payment expiry.** Deposit extends the
-payment's persistent entry and the escrow instance/code through `expiry + 1`,
-including the first refundable ledger. A shorter subsequent deposit cannot
-shorten those lifetimes. A requested TTL must leave that extra ledger within
-`env.storage().max_ttl()`; deposits exceeding network retention capacity (or
-integer capacity) fail before transferring funds, even if the admin cap is larger.
-Network TTL limits can change, so clients should simulate deposits.
-
-After the retained lifetime, unpaid or disputed records can be archived. Operators
-must extend TTLs or restore archived payment, escrow instance/code, and any token
-entries before settlement; archival does not refund or erase entitlement. Token
-contracts have independent storage maintenance. Existing payments deposited before
-this change need TTL extension/restoration too: updating the WASM does not rewrite
-their stored entries. This retention policy is not an audit-history retention SLA.
-
-Run the lifetime regressions with:
+When you intentionally change a dependency (add/remove/upgrade a crate in any
+`Cargo.toml` under `dabdub_contracts/`), regenerate the lock file and commit it
+in the same change:
 
 ```sh
 cd dabdub_contracts
-cargo build --target wasm32v1-none --release -p payment-escrow
-cargo test -p payment-escrow test_max_ttl
+cargo update            # or: cargo update -p <crate> --precise <version>
+cargo build --locked    # verify the lock file is consistent
+cargo test --locked
 ```
+
+Commit the updated `Cargo.lock` together with the `Cargo.toml` change. PRs that
+modify dependencies without updating `Cargo.lock` will fail CI.
 
 ## Fee accuracy
 

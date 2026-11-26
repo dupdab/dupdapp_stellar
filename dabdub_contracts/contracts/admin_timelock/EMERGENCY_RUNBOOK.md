@@ -3,6 +3,22 @@
 ## Overview
 The `admin_timelock` contract gates all privileged parameter changes across the Stellar platform.
 
+## Mainnet Admin Key Ceremony
+
+The mainnet admin keys used by `admin_timelock` and `multisig_admin` MUST be generated and
+stored according to the key ceremony procedure documented in
+[`docs/security/KEY_CEREMONY.md`](../../../docs/security/KEY_CEREMONY.md). That document is the
+source of truth for:
+
+- Offline, airgapped key generation on dedicated hardware
+- Multi-party computation (MPC) key generation or HSM-backed key custody
+- Key storage, backup, and access controls
+- Disaster recovery for lost or compromised admin keys
+
+Do not generate, import, or rotate mainnet admin keys outside that procedure. If the ceremony
+document is unavailable during an incident, escalate to the security lead before touching any
+admin key material.
+
 ## Contract Upgrade Sequence (all 14 contracts)
 
 Upgrades must follow the dependency graph below. A contract may only be upgraded after every
