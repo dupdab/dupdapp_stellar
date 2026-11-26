@@ -156,6 +156,36 @@ jobs:
           deploy_contract payment_escrow wasm/payment_escrow.wasm -- \
             "$ESCROW_DEFAULT_TTL_LEDGERS" "$EMERGENCY_SIGNERS" "$EMERGENCY_TREASURY" "$EMERGENCY_COOLDOWN_LEDGERS"
 
+          # ------------------------------------------------------------------
+          # Persist deployed contract IDs so the integration-test job can
+          # consume them and the teardown step can clean them up.
+          # ------------------------------------------------------------------
+          {
+            echo "admin_auth_id=$admin_auth_id"
+            echo "admin_timelock_id=$admin_timelock_id"
+            echo "batch_payments_id=$batch_payments_id"
+            echo "fee_calculator_id=$fee_calculator_id"
+            echo "fee_distributor_id=$fee_distributor_id"
+            echo "liquidity_router_id=$liquidity_router_id"
+            echo "merchant_registry_id=$merchant_registry_id"
+            echo "multisig_admin_id=$multisig_admin_id"
+            echo "payment_escrow_id=$payment_escrow_id"
+            echo "payment_request_id=$payment_request_id"
+            echo "platform_stats_id=$platform_stats_id"
+            echo "rbac_access_id=$rbac_access_id"
+            echo "reconciliation_id=$reconciliation_id"
+            echo "settlement_ledger_id=$settlement_ledger_id"
+            echo "slippage_protection_id=$slippage_protection_id"
+            echo "stellar_confirmations_id=$stellar_confirmations_id"
+          } > deployed-contracts.env
+
+      - name: Upload deployed contract IDs
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-contracts-${{ github.sha }}
+          path: deployed-contracts.env
+          retention-days: 1
+
       # ------------------------------------------------------------------
       # Record the deployed WASM hashes in a deploy manifest. This is the
       # known-good set used by the rollback procedure documented at the top
@@ -242,6 +272,37 @@ jobs:
           ls -la observability/ || true
 
   # -----------------------------------------------------------------------
+  # Run the integration test suite against the freshly deployed testnet
+  # contracts. Only runs on merge to main (same gate as deploy-testnet).
+  # -----------------------------------------------------------------------
+  testnet-integration:
+    name: Testnet Integration Tests
+    needs: deploy-testnet
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dabdub_contracts
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download deployed contract IDs
+        uses: actions/download-artifact@v4
+        with:
+          name: deployed-contracts-${{ github.sha }}
+          path: dabdub_contracts/
+
+      - name: Install Stellar CLI
+        run: |
+          cargo install --locked stellar-cli --features opt
+
+      - name: Configure testnet network
+        run: |
+
+  # -----------------------------------------------------------------------
   # Rollback job. Triggered manually via workflow_dispatch with a
   # `rollback_manifest` input naming the known-good manifest artifact.
   # See the ADMIN RUNBOOK at the top of this file.
@@ -275,6 +336,80 @@ jobs:
         env:
           DEPLOY_SECRET: ${{ secrets.TESTNET_DEPLOY_SECRET }}
         run: echo "$DEPLOY_SECRET" | stellar keys add deployer --secret-key
+
+      - name: Run integration tests against testnet
+        env:
+          STELLAR_NETWORK: testnet
+          STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+          STELLAR_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          STELLAR_SOURCE_ACCOUNT: deployer
+          CONTRACT_IDS_FILE: deployed-contracts.env
+        run: |
+          set -euo pipefail
+          # Export every deployed contract ID as an env var so the test
+          # harness can resolve them by name.
+          set -a
+          # shellcheck disable=SC1091
+          source "$CONTRACT_IDS_FILE"
+          set +a
+          cargo test --test testnet_integration -- --nocapture
+
+  # -----------------------------------------------------------------------
+  # Tear down the test contracts deployed for this run. Runs even when the
+  # integration tests fail so testnet state does not accumulate.
+  # -----------------------------------------------------------------------
+  teardown-testnet:
+    name: Tear Down Testnet Contracts
+    needs: [deploy-testnet, testnet-integration]
+    if: always() && github.ref == 'refs/heads/main' && needs.deploy-testnet.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download deployed contract IDs
+        uses: actions/download-artifact@v4
+        with:
+          name: deployed-contracts-${{ github.sha }}
+          path: .
+
+      - name: Install Stellar CLI
+        run: |
+          cargo install --locked stellar-cli --features opt
+
+      - name: Configure testnet network
+        run: |
+          stellar network add testnet \
+            --rpc-url https://soroban-testnet.stellar.org \
+            --network-passphrase "Test SDF Network ; September 2015"
+
+      - name: Import deploy keypair
+        env:
+          DEPLOY_SECRET: ${{ secrets.TESTNET_DEPLOY_SECRET }}
+        run: echo "$DEPLOY_SECRET" | stellar keys add deployer --secret-key
+
+      - name: Remove deployed test contracts
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC1091
+          source deployed-contracts.env
+          failed=0
+          for var in $(grep -oE '^[a-z_]+_id=' deployed-contracts.env | sed 's/=$//'); do
+            id="${!var:-}"
+            if [ -z "$id" ]; then
+              continue
+            fi
+            echo "Removing $var ($id)"
+            if ! stellar contract invoke \
+              --id "$id" \
+              --source deployer \
+              --network testnet \
+              -- __teardown 2>/dev/null; then
+              # Contracts without a teardown entrypoint are simply left in
+              # place; testnet is ephemeral and this is best-effort cleanup.
+              echo "::warning::No teardown entrypoint for $var ($id); skipping"
+            fi
+          done
+          exit "$failed"
 
       - name: Verify restored WASM hashes match manifest
         run: |

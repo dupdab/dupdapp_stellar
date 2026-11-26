@@ -7,10 +7,15 @@ WASM_SIZE_WARN  := 52428  # 80% of 64 KB
 WASM_SIZE_REPORT := $(CONTRACTS_DIR)/wasm-size-report.md
 WASM_SIZE_CHECK := scripts/check-wasm-size.sh
 
+# Per-contract coverage threshold (percent). CI fails if any contract falls below.
+COVERAGE_THRESHOLD ?= 80
+COVERAGE_REPORT := $(CONTRACTS_DIR)/coverage-report.md
+
 # Contracts that have per-contract test/build targets.
 CONTRACTS := admin_auth admin_timelock batch_payments escrow fee_calculator fee_distributor liquidity_router registry
 
 .PHONY: all build build-optimised check-wasm-size wasm-size-report test integration-test verify-deployment lint lint-clippy lint-fmt lint-audit \
+        coverage coverage-report \
         $(addprefix build-,$(CONTRACTS)) $(addprefix test-,$(CONTRACTS)) \
         deploy-testnet local-testnet-start local-testnet-stop local-testnet-deploy \
         monitoring monitoring-stop
@@ -23,6 +28,7 @@ help:
 	@echo "  make test               Run all contract tests"
 	@echo "  make clean              Remove all build artifacts"
 	@echo "  make check-wasm-size    Enforce 64KB WASM size budget on all contracts"
+	@echo "  make coverage           Run per-contract coverage and enforce threshold"
 	@echo "  make help               Show this help message"
 	@echo "  make deploy-testnet     Build and deploy all contracts to Stellar testnet"
 	@echo ""
@@ -58,6 +64,47 @@ $(addprefix build-,$(CONTRACTS)): build-%:
 
 $(addprefix test-,$(CONTRACTS)): test-%:
 	cargo test -p $*
+
+# Run tarpaulin per contract (not workspace-wide) so a well-tested contract
+# cannot mask a poorly tested one. Fails if any contract is below
+# COVERAGE_THRESHOLD. Writes a per-contract breakdown to COVERAGE_REPORT.
+coverage:
+	@echo "Running per-contract coverage (threshold: $(COVERAGE_THRESHOLD)%)"
+	@printf '| Contract | Coverage | Status |\n' > $(COVERAGE_REPORT); \
+	printf '| --- | --- | --- |\n' >> $(COVERAGE_REPORT); \
+	failed=0; \
+	for contract in $(CONTRACTS); do \
+		echo "==> coverage: $$contract"; \
+		out=$$(cargo tarpaulin -p $$contract --out Stdout 2>&1) || { \
+			echo "ERROR: tarpaulin failed for $$contract" >&2; \
+			echo "$$out" >&2; \
+			printf '| %s | n/a | <span style="color:red">error</span> |\n' "$$contract" >> $(COVERAGE_REPORT); \
+			failed=1; continue; \
+		}; \
+		pct=$$(printf '%s\n' "$$out" | grep -oE '[0-9]+(\.[0-9]+)?%' | tail -n1 | tr -d '%'); \
+		if [ -z "$$pct" ]; then \
+			echo "ERROR: could not parse coverage for $$contract" >&2; \
+			printf '| %s | n/a | <span style="color:red">unknown</span> |\n' "$$contract" >> $(COVERAGE_REPORT); \
+			failed=1; continue; \
+		fi; \
+		if awk "BEGIN { exit !($$pct < $(COVERAGE_THRESHOLD)) }"; then \
+			echo "FAIL: $$contract coverage $$pct% < $(COVERAGE_THRESHOLD)%" >&2; \
+			printf '| %s | %s%% | <span style="color:red">below threshold</span> |\n' "$$contract" "$$pct" >> $(COVERAGE_REPORT); \
+			failed=1; \
+		else \
+			echo "OK: $$contract coverage $$pct%" ; \
+			printf '| %s | %s%% | <span style="color:green">ok</span> |\n' "$$contract" "$$pct" >> $(COVERAGE_REPORT); \
+		fi; \
+	done; \
+	cat $(COVERAGE_REPORT); \
+	if [ $$failed -ne 0 ]; then \
+		echo "ERROR: one or more contracts are below the $(COVERAGE_THRESHOLD)% coverage threshold." >&2; \
+		exit 1; \
+	fi; \
+	echo "All contracts meet the $(COVERAGE_THRESHOLD)% coverage threshold."
+
+coverage-report: coverage
+	@echo "Coverage report written to $(COVERAGE_REPORT)"
 
 local-testnet-start:
 	docker compose up -d

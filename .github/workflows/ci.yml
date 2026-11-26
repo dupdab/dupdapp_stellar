@@ -4,6 +4,19 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly scheduled audit so vulnerable dependencies are detected even when
+  # no code changes land. The `cargo-audit` job below runs on this schedule.
+  schedule:
+    - cron: '0 6 * * 1'
+
+env:
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: 0
+  LLVM_PROFILE_FILE: target/coverage/dupdub-%p-%m.profraw
+  # Minimum line coverage each individual contract must reach. Global
+  # workspace coverage is not enough: a well-tested contract can mask a
+  # poorly tested one, so this threshold is enforced per contract.
+  PER_CONTRACT_COVERAGE_THRESHOLD: 80
 
 jobs:
   contracts:
@@ -36,6 +49,148 @@ jobs:
 
       - name: Run contract tests
         run: cargo test --workspace
+
+      - name: Install Rust wasm target
+        run: rustup target add wasm32v1-none
+
+      # The cargo workspace lives in dupdub_contracts/; there is no manifest at
+      # the repository root, so every cargo invocation has to run from there.
+      - name: cargo clippy
+        working-directory: dabdub_contracts
+        run: cargo clippy -- -D warnings
+
+      - name: cargo test
+        working-directory: dabdub_contracts
+        run: cargo test
+
+      # Some contract functionality is gated behind feature flags. Running the
+      # suite with every feature enabled ensures feature-gated code paths are
+      # compiled and tested, not just the default-feature subset.
+      - name: cargo test (all features)
+        working-directory: dabdub_contracts
+        run: cargo test --all-features
+
+      # Property-based tests (proptest) live behind the `proptest` feature so
+      # the default test run stays fast. This job exercises them explicitly so
+      # regressions in fee/slippage/escrow invariants are caught in CI.
+      - name: cargo test (property-based)
+        working-directory: dabdub_contracts
+        run: cargo test --features proptest -- --nocapture
+
+      # Scans Cargo.lock against the RustSec advisory database. cargo-audit
+      # exits non-zero on any vulnerability by default, which fails CI on HIGH
+      # and CRITICAL advisories (and lower severities too).
+      - name: cargo audit
+        working-directory: dabdub_contracts
+        run: cargo audit
+
+      # Runs tarpaulin once per contract crate (each directory under
+      # contracts/) instead of a single workspace-wide pass. A global number
+      # can hide a contract with little or no coverage behind a well-tested
+      # one, so each contract is measured and gated independently. The
+      # per-contract percentage is written to a summary table and the job
+      # fails when any contract falls below PER_CONTRACT_COVERAGE_THRESHOLD.
+      - name: Generate per-contract coverage report
+        working-directory: dabdub_contracts
+        run: |
+          set -euo pipefail
+          mkdir -p target/coverage
+          threshold="${PER_CONTRACT_COVERAGE_THRESHOLD}"
+          summary="target/coverage/per-contract-summary.txt"
+          : > "$summary"
+          printf '| Contract | Coverage | Threshold | Status |\n' >> "$summary"
+          printf '| --- | --- | --- | --- |\n' >> "$summary"
+          failed=0
+          for manifest in contracts/*/Cargo.toml; do
+            contract="$(basename "$(dirname "$manifest")")"
+            outdir="target/coverage/$contract"
+            mkdir -p "$outdir"
+            echo "::group::Coverage for $contract"
+            cargo tarpaulin \
+              --manifest-path "$manifest" \
+              --out Xml \
+              --output-dir "$outdir" \
+              --exclude-files "*/tests/*" \
+              --verbose
+            echo "::endgroup::"
+            # Parse the line-rate attribute from the generated cobertura XML.
+            xml="$outdir/cobertura.xml"
+            if [ ! -f "$xml" ]; then
+              echo "::error::No coverage report produced for $contract"
+              printf '| %s | n/a | %s%% | FAIL |\n' "$contract" "$threshold" >> "$summary"
+              failed=1
+              continue
+            fi
+            rate="$(grep -o 'line-rate="[0-9.]*"' "$xml" | head -n1 | sed -E 's/.*"([0-9.]+)"/\1/')"
+            pct="$(awk -v r="$rate" 'BEGIN { printf "%.2f", r * 100 }')"
+            status="PASS"
+            if awk -v p="$pct" -v t="$threshold" 'BEGIN { exit !(p + 0 < t + 0) }'; then
+              status="FAIL"
+              failed=1
+              echo "::error::$contract coverage ${pct}% is below the ${threshold}% threshold"
+            fi
+            printf '| %s | %s%% | %s%% | %s |\n' "$contract" "$pct" "$threshold" "$status" >> "$summary"
+          done
+          echo "### Per-contract coverage" >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more contracts are below the ${threshold}% coverage threshold"
+            exit 1
+          fi
+
+      - name: Upload per-contract coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-per-contract
+          path: dabdub_contracts/target/coverage/
+          retention-days: 30
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          directory: dabdub_contracts/target/coverage
+          flags: rust
+          name: dupdub-contracts
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      # `make check-wasm-size` depends on `make build-optimised`, which shells
+      # out to wasm-opt. Installed the same way deploy.yml does it.
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
+      # Builds every workspace contract to wasm, runs wasm-opt -Oz over the
+      # output, and fails when any contract exceeds the 64 KB Soroban deploy
+      # limit. deploy.yml already gates this on `main`; running it here means a
+      # pull request that grows a contract past the limit is caught before it
+      # merges rather than after.
+      - name: Build WASM and check size budget
+        run: make check-wasm-size
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-contracts
+          path: dupdub_contracts/target/wasm32v1-none/release/*.wasm
+          retention-days: 30
+
+      # Regenerates the machine-readable ABI JSON under docs/abi/ from the
+      # built wasm and fails when the committed files drift from the contract
+      # source. Keeps the NestJS backend's ABI docs in sync with the Rust code.
+      - name: Verify contract ABI docs are up to date
+        run: |
+          make generate-abi
+          if ! git diff --quiet -- docs/abi; then
+            echo "::error::docs/abi is out of date. Run 'make generate-abi' and commit the result."
+            git diff -- docs/abi
+            exit 1
+          fi
 
       - name: Check contract versions and changelogs
         run: |
@@ -77,3 +232,27 @@ jobs:
             fi
           done
           exit "$failed"
+
+  # Dedicated audit job so the weekly `schedule` trigger runs the security
+  # scan even when no code changes land. Runs on every push and pull request
+  # as well, and fails CI on HIGH/CRITICAL advisories.
+  cargo-audit:
+    name: Cargo audit (Rust dependency vulnerabilities)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Scans Cargo.lock against the RustSec advisory database. cargo-audit
+      # exits non-zero on any vulnerability by default, which fails CI on HIGH
+      # and CRITICAL advisories (and lower severities too).
+      - name: cargo audit
+        working-directory: dabdub_contracts
+        run: cargo audit

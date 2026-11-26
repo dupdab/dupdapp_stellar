@@ -32,6 +32,26 @@ All contracts live under [`dabdub_contracts/contracts/`](dabdub_contracts/contra
 | `slippage_protection` | Slippage guards for conversions | [![slippage_protection](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=slippage_protection)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 | `stellar_confirmations` | Confirmation tracking for Stellar transactions | [![stellar_confirmations](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=stellar_confirmations)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 
+## Feature flags
+
+Some contract functionality is gated behind Cargo feature flags. CI runs the
+test suite both with default features and with all features enabled, so
+feature-gated code is exercised on every change.
+
+- **Default features** — the standard build used for deployment. Run with
+  `cargo test` (or `make test`).
+- **All features** — enables every optional feature flag across the workspace.
+  Run with `cargo test --all-features`.
+
+When adding a new feature flag, make sure the gated code compiles and its tests
+pass under both configurations:
+
+```sh
+cd dabdub_contracts
+cargo test                 # default features
+cargo test --all-features  # all feature combinations
+```
+
 ## Local Observability Stack
 
 The [`grafana/`](grafana/) directory holds the local developer observability
@@ -72,6 +92,7 @@ Stop the stack with:
 
 ```sh
 make monitoring-down
+```
 ```
 
 ## Payment escrow lifetime and storage
@@ -167,7 +188,6 @@ make build-optimised    # release build + wasm-opt -Oz
 make check-wasm-size    # enforce the 64 KB per-contract WASM limit
 make test               # cargo test across the workspace
 make deploy-testnet     # deploy and ini
-
 ### Manual testnet deployment
 
 `make deploy-testnet` builds all contract WASMs and deploys all 17 contracts to
