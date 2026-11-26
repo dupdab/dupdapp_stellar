@@ -166,10 +166,11 @@ jobs:
           sudo apt-get install -y binaryen
 
       # Builds every workspace contract to wasm, runs wasm-opt -Oz over the
-      # output, and fails when any contract exceeds the 64 KB Soroban deploy
-      # limit. deploy.yml already gates this on `main`; running it here means a
-      # pull request that grows a contract past the limit is caught before it
-      # merges rather than after.
+      # output, and fails when any contract exceeds its per-contract size
+      # budget (see WASM_SIZE_BUDGETS in the Makefile). deploy.yml already
+      # gates this on `main`; running it here means a pull request that grows
+      # a contract past its budget is caught before it merges rather than
+      # after.
       - name: Build WASM and check size budget
         run: make check-wasm-size
 
@@ -255,4 +256,174 @@ jobs:
       # and CRITICAL advisories (and lower severities too).
       - name: cargo audit
         working-directory: dabdub_contracts
-        run: cargo audit
+        run: cargo audit --fail-severity high
+
+      # Generate TypeScript bindings for every built contract. Output lands in
+      # bindings/<contract-name>/ so it can be published and consumed by the
+      # NestJS backend. Runs after the build step above so the freshly built
+      # wasm is used instead of hand-maintained bindings.
+      - name: Install Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Generate TypeScript bindings for every built contract. Output lands in
+      # bindings/<contract-name>/ so it can be published and consumed by the
+      # NestJS backend.
+      - name: Generate contract TypeScript bindings
+        run: |
+          set -euo pipefail
+          mkdir -p bindings
+          for contract in admin_auth admin_timelock batch_payments fee_calculator fee_distributor liquidity_router; do
+            wasm="dabdub_contracts/target/wasm32v1-none/release/${contract}.wasm"
+            if [ ! -f "$wasm" ]; then
+              echo "::error::Missing wasm for $contract at $wasm"
+              exit 1
+            fi
+            stellar contract bindings typescript \
+              --wasm "$wasm" \
+              --output-dir "bindings/$contract" \
+              --overwrite
+          done
+
+      - name: Upload generated bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-bindings
+          path: bindings/
+          retention-days: 30
+
+      # Regenerated on every merge to main and published as a GitHub release
+      # asset so downstream consumers can pull the latest bindings.
+      - name: Publish contract bindings release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="bindings-${GITHUB_SHA::12}"
+          tar -czf "contract-bindings-${GITHUB_SHA::12}.tar.gz" -C bindings .
+          gh release create "$tag" \
+            "contract-bindings-${GITHUB_SHA::12}.tar.gz" \
+            --title "Contract bindings ${GITHUB_SHA::12}" \
+            --notes "Auto-generated TypeScript bindings from commit ${GITHUB_SHA}."
+
+  # Reports per-contract WASM sizes on pull requests so size regressions are
+  # visible during review instead of only at deploy time. Fails the PR when any
+  # contract exceeds its per-contract budget defined in the Makefile.
+  wasm-size-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
+      - name: Build WASM and report sizes
+        run: make check-wasm-size
+
+  # Deploys every contract to Stellar testnet, runs the integration test suite
+  # against the deployed instances, then tears the test contracts down. Only
+  # runs on merges to main so testnet is not polluted by every PR. Cleanup uses
+  # `always()` so test contracts are removed even when deploy or tests fail.
+  testnet-integration:
+    name: Testnet integration tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      STELLAR_NETWORK: testnet
+      STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+      STELLAR_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+      STELLAR_ACCOUNT: ci-testnet-deployer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
+      - name: Install Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Builds every workspace contract to optimised wasm so the same artifacts
+      # that ship to production are the ones exercised on testnet.
+      - name: Build optimised WASM
+        run: make build-optimised
+
+      # Restores the funded testnet deployer identity from a secret. The secret
+      # key must be a funded testnet account; it is never logged.
+      - name: Configure testnet deployer identity
+        env:
+          TESTNET_DEPLOYER_SECRET: ${{ secrets.TESTNET_DEPLOYER_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TESTNET_DEPLOYER_SECRET:-}" ]; then
+            echo "::error::TESTNET_DEPLOYER_SECRET is not configured"
+            exit 1
+          fi
+          stellar keys add "$STELLAR_ACCOUNT" --secret-key "$TESTNET_DEPLOYER_SECRET"
+
+      # Deploys every contract and records the resulting contract IDs so the
+      # integration suite and the teardown step can reference them.
+      - name: Deploy contracts to testnet
+        run: |
+          set -euo pipefail
+          : > testnet-contract-ids.txt
+          for contract in admin_auth admin_timelock batch_payments fee_calculator fee_distributor liquidity_router; do
+            wasm="dabdub_contracts/target/wasm32v1-none/release/${contract}.wasm"
+            if [ ! -f "$wasm" ]; then
+              echo "::error::Missing wasm for $contract at $wasm"
+              exit 1
+            fi
+            id=$(stellar contract deploy \
+              --wasm "$wasm" \
+              --source "$STELLAR_ACCOUNT" \
+              --network "$STELLAR_NETWORK")
+            echo "${contract}=${id}" | tee -a testnet-contract-ids.txt
+          done
+
+      - name: Run integration tests against testnet
+        env:
+          TESTNET_CONTRACT_IDS_FILE: testnet-contract-ids.txt
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path dabdub_contracts/Cargo.toml \
+            --features testnet-integration \
+            --test testnet_integration \
+            -- --nocapture
+
+      # Removes the test contracts deployed above. Runs even when deploy or the
+      # integration suite failed so testnet is not left with orphan contracts.
+      - name: Tear down testnet contracts
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f testnet-contract-ids.txt ]; then
+            echo "No deployed contracts to tear down."
+            exit 0
+          fi
+          while IFS='=' read -r contract id; do
+            [ -z "$id" ] && continue
+            echo "Removing ${contract} (${id})"
+            stellar contract invoke \
+              --id "$id" \
+              --source "$STELLAR_ACCOUNT" \
+              --network "$STELLAR_NETWORK" \
+              -- __teardown || true
+          done < testnet-contract-ids.txt

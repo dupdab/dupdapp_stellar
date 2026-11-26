@@ -283,6 +283,46 @@ jobs:
     defaults:
       run:
         working-directory: dabdub_contracts
+    env:
+      STELLAR_NETWORK: testnet
+      STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+      STELLAR_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+      ADMIN_AUTH_ID: ${{ needs.deploy-testnet.outputs.admin_auth_id }}
+      ADMIN_TIMELOCK_ID: ${{ needs.deploy-testnet.outputs.admin_timelock_id }}
+      BATCH_PAYMENTS_ID: ${{ needs.deploy-testnet.outputs.batch_payments_id }}
+      FEE_CALCULATOR_ID: ${{ needs.deploy-testnet.outputs.fee_calculator_id }}
+      FEE_DISTRIBUTOR_ID: ${{ needs.deploy-testnet.outputs.fee_distributor_id }}
+      LIQUIDITY_ROUTER_ID: ${{ needs.deploy-testnet.outputs.liquidity_router_id }}
+      MERCHANT_REGISTRY_ID: ${{ needs.deploy-testnet.outputs.merchant_registry_id }}
+      MULTISIG_ADMIN_ID: ${{ needs.deploy-testnet.outputs.multisig_admin_id }}
+      PAYMENT_ESCROW_ID: ${{ needs.deploy-testnet.outputs.payment_escrow_id }}
+      PAYMENT_REQUEST_ID: ${{ needs.deploy-testnet.outputs.payment_request_id }}
+      PLATFORM_STATS_ID: ${{ needs.deploy-testnet.outputs.platform_stats_id }}
+      RBAC_ACCESS_ID: ${{ needs.deploy-testnet.outputs.rbac_access_id }}
+      RECONCILIATION_ID: ${{ needs.deploy-testnet.outputs.reconciliation_id }}
+      SETTLEMENT_LEDGER_ID: ${{ needs.deploy-testnet.outputs.settlement_ledger_id }}
+      SLIPPAGE_PROTECTION_ID: ${{ needs.deploy-testnet.outputs.slippage_protection_id }}
+      STELLAR_CONFIRMATIONS_ID: ${{ needs.deploy-testnet.outputs.stellar_confirmations_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Stellar CLI
+        run: |
+          cargo install --locked stellar-cli --features opt
+
+      - name: Configure testnet network
+        run: |
+
+      - name: Download deployed contract IDs
+        uses: actions/download-artifact@v4
+        with:
+          name: deployed-contracts-${{ github.sha }}
+          path: dabdub_contracts/
+
     steps:
       - uses: actions/checkout@v4
 

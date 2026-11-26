@@ -14,6 +14,18 @@ COVERAGE_REPORT := $(CONTRACTS_DIR)/coverage-report.md
 # Contracts that have per-contract test/build targets.
 CONTRACTS := admin_auth admin_timelock batch_payments escrow fee_calculator fee_distributor liquidity_router registry
 
+# Per-contract WASM size budgets (bytes). Each contract must stay at or below
+# its own budget; the check fails if any contract exceeds it. Budgets default
+# to WASM_SIZE_LIMIT and can be tightened per contract as needed.
+WASM_SIZE_BUDGET_admin_auth       ?= $(WASM_SIZE_LIMIT)
+WASM_SIZE_BUDGET_admin_timelock   ?= $(WASM_SIZE_LIMIT)
+WASM_SIZE_BUDGET_batch_payments   ?= $(WASM_SIZE_LIMIT)
+WASM_SIZE_BUDGET_escrow           ?= $(WASM_SIZE_LIMIT)
+WASM_SIZE_BUDGET_fee_calculator   ?= $(WASM_SIZE_LIMIT)
+WASM_SIZE_BUDGET_fee_distributor  ?= $(WASM_SIZE_LIMIT)
+WASM_SIZE_BUDGET_liquidity_router ?= $(WASM_SIZE_LIMIT)
+WASM_SIZE_BUDGET_registry         ?= $(WASM_SIZE_LIMIT)
+
 .PHONY: all build build-optimised check-wasm-size wasm-size-report test integration-test verify-deployment lint lint-clippy lint-fmt lint-audit \
         coverage coverage-report \
         $(addprefix build-,$(CONTRACTS)) $(addprefix test-,$(CONTRACTS)) \
@@ -27,7 +39,7 @@ help:
 	@echo "  make build              Build all contracts"
 	@echo "  make test               Run all contract tests"
 	@echo "  make clean              Remove all build artifacts"
-	@echo "  make check-wasm-size    Enforce 64KB WASM size budget on all contracts"
+	@echo "  make check-wasm-size    Enforce per-contract WASM size budgets"
 	@echo "  make coverage           Run per-contract coverage and enforce threshold"
 	@echo "  make help               Show this help message"
 	@echo "  make deploy-testnet     Build and deploy all contracts to Stellar testnet"
@@ -151,10 +163,33 @@ build-optimised: build
 	done
 	@echo "Done."
 
-# Enforce the per-contract WASM size budget (WASM_SIZE_LIMIT). Reports the
-# size of every contract and fails if any exceeds the limit.
+# Enforce the per-contract WASM size budget. Reports the size of every
+# contract against its own budget and fails (non-zero exit) if any contract
+# exceeds it, so PR CI fails before a size violation reaches deploy.
 check-wasm-size: build-optimised
-	@WASM_DIR=$(WASM_DIR) WASM_SIZE_LIMIT=$(WASM_SIZE_LIMIT) WASM_SIZE_WARN=$(WASM_SIZE_WARN) bash $(WASM_SIZE_CHECK)
+	@status=0; \
+	for contract in $(CONTRACTS); do \
+		wasm=$(WASM_DIR)/$$contract.wasm; \
+		budget=$$(echo "$(foreach c,$(CONTRACTS),$(c)=$(WASM_SIZE_BUDGET_$(c));)" | tr ';' '\n' | awk -F= -v c=$$contract '$$1==c{print $$2}'); \
+		if [ -z "$$budget" ]; then budget=$(WASM_SIZE_LIMIT); fi; \
+		if [ ! -f $$wasm ]; then \
+			echo "ERROR: missing WASM for $$contract ($$wasm)" >&2; \
+			status=1; \
+			continue; \
+		fi; \
+		size=$$(wc -c < $$wasm); \
+		if [ $$size -gt $$budget ]; then \
+			echo "FAIL  $$contract: $$size bytes exceeds budget of $$budget bytes" >&2; \
+			status=1; \
+		else \
+			echo "OK    $$contract: $$size / $$budget bytes"; \
+		fi; \
+	done; \
+	if [ $$status -ne 0 ]; then \
+		echo "WASM size check failed: one or more contracts exceed their budget." >&2; \
+		exit 1; \
+	fi; \
+	echo "All contracts within their WASM size budgets."
 
 lint-clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
