@@ -285,6 +285,5 @@ impl AdminAuthContract {
         caller.require_auth();
         Self::require_super_admin(&env, &caller);
 
-        let key = DataKey::Admin(admin.clone()
+        let key = DataKey::Admin(admin.clone());
 
-/* … truncated 1438 chars — edit only what you need near the top … */
