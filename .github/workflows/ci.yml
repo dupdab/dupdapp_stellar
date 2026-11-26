@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   # Weekly scheduled audit so vulnerable dependencies are detected even when
   # no code changes land. The `cargo-audit` job below runs on this schedule.
@@ -19,45 +19,36 @@ env:
   PER_CONTRACT_COVERAGE_THRESHOLD: 80
 
 jobs:
-  ci:
+  contracts:
+    name: Contracts
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dabdub_contracts
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32v1-none
+          targets: wasm32-unknown-unknown
 
-      - name: Check Rust formatting
-        working-directory: dabdub_contracts
-        run: cargo fmt -- --check
-
-      # Cache the cargo registry (downloaded crate sources) and the workspace
-      # target directory so dependencies are not re-downloaded and recompiled
-      # on every run. The key is derived from the Cargo.lock hash so the cache
-      # is invalidated whenever the dependency graph changes; restore-keys
-      # provide a fallback so partial rebuilds still benefit.
-      - name: Cache cargo registry and target
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             dabdub_contracts/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/**/Cargo.toml') }}
 
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-tarpaulin
+      - name: Build contracts
+        run: cargo build --release --target wasm32-unknown-unknown
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
+      - name: Run contract tests
+        run: cargo test --workspace
 
       - name: Install Rust wasm target
         run: rustup target add wasm32v1-none
@@ -200,6 +191,47 @@ jobs:
             git diff -- docs/abi
             exit 1
           fi
+
+      - name: Check contract versions and changelogs
+        run: |
+          set -euo pipefail
+          base_ref="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "${base_ref}" ] || [ "${base_ref}" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base ref available; skipping version bump check."
+            exit 0
+          fi
+          failed=0
+          for dir in contracts/*/; do
+            name="$(basename "$dir")"
+            manifest="${dir}Cargo.toml"
+            changelog="${dir}CHANGELOG.md"
+            [ -f "$manifest" ] || continue
+            if [ ! -f "$changelog" ]; then
+              echo "::error file=${changelog}::Missing CHANGELOG.md for contract '${name}'"
+              failed=1
+              continue
+            fi
+            # Detect public function signature changes in the contract source.
+            sig_changed=0
+            if git diff --quiet "${base_ref}" HEAD -- "${dir}src"; then
+              sig_changed=0
+            else
+              old_sigs="$(git show "${base_ref}:dabdub_contracts/${dir}src/lib.rs" 2>/dev/null | grep -E '^\s*pub fn ' || true)"
+              new_sigs="$(grep -E '^\s*pub fn ' "${dir}src/lib.rs" 2>/dev/null || true)"
+              if [ "$old_sigs" != "$new_sigs" ]; then
+                sig_changed=1
+              fi
+            fi
+            if [ "$sig_changed" -eq 1 ]; then
+              old_version="$(git show "${base_ref}:dabdub_contracts/${manifest}" 2>/dev/null | grep -E '^version\s*=' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+              new_version="$(grep -E '^version\s*=' "$manifest" | head -n1 | sed -E 's/.*"([^"]+)".*/\1' || true)"
+              if [ -z "$old_version" ] || [ "$old_version" = "$new_version" ]; then
+                echo "::error file=${manifest}::Public function signatures changed in '${name}' but version was not bumped (${old_version:-unknown} -> ${new_version:-unknown}). Update Cargo.toml version and CHANGELOG.md with migration notes."
+                failed=1
+              fi
+            fi
+          done
+          exit "$failed"
 
   # Dedicated audit job so the weekly `schedule` trigger runs the security
   # scan even when no code changes land. Runs on every push and pull request

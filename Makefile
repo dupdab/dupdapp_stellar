@@ -17,7 +17,8 @@ CONTRACTS := admin_auth admin_timelock batch_payments escrow fee_calculator fee_
 .PHONY: all build build-optimised check-wasm-size wasm-size-report test integration-test verify-deployment lint lint-clippy lint-fmt lint-audit \
         coverage coverage-report \
         $(addprefix build-,$(CONTRACTS)) $(addprefix test-,$(CONTRACTS)) \
-        deploy-testnet local-testnet-start local-testnet-stop local-testnet-deploy
+        deploy-testnet local-testnet-start local-testnet-stop local-testnet-deploy \
+        monitoring monitoring-stop
 
 all: build
 
@@ -35,6 +36,10 @@ help:
 	@echo "  make local-testnet-start   Start local Soroban testnet (Docker)"
 	@echo "  make local-testnet-stop    Stop local Soroban testnet"
 	@echo "  make local-testnet-deploy  Deploy contracts to local testnet"
+	@echo ""
+	@echo "Local observability stack targets:"
+	@echo "  make monitoring            Start Grafana + Loki + Promtail (Docker)"
+	@echo "  make monitoring-stop       Stop the local observability stack"
 	@echo ""
 	@echo "Per-contract build targets:"
 	@$(foreach c,$(CONTRACTS),echo "  make build-$(c)";)
@@ -112,6 +117,17 @@ local-testnet-stop:
 
 local-testnet-deploy:
 	./scripts/deploy-local-testnet.sh
+
+# Start the local observability stack (Grafana + Loki + Promtail) defined in
+# grafana/docker-compose.yml. Grafana is exposed at http://localhost:3000.
+monitoring:
+	docker compose -f grafana/docker-compose.yml up -d
+	@echo "Waiting for Grafana to become healthy..."
+	@until curl -sf http://localhost:3000/api/health >/dev/null 2>&1; do sleep 2; done
+	@echo "Grafana is up at http://localhost:3000 (admin/admin)"
+
+monitoring-stop:
+	docker compose -f grafana/docker-compose.yml down -v
 
 deploy-testnet:
 	./scripts/deploy-testnet.sh
