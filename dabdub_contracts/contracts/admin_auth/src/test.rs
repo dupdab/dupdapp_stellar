@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env, Vec};
+use soroban_sdk::{testutils::{Address as _, Events}, Env, IntoVal, Symbol, Vec};
 
 fn setup() -> (Env, AdminAuthContractClient<'static>, Address) {
     let env = Env::default();
@@ -161,6 +161,140 @@ fn test_revoke_then_readd_admin_restores_access() {
     assert!(user.active);
 }
 
+// Issue #1554 — end-to-end admin key rotation: old key works, rotate, new key
+// works, and the old key is rejected afterwards.
+#[test]
+fn test_admin_key_rotation_end_to_end() {
+    let (env, client, super_admin) = setup();
+    let old_key = Address::generate(&env);
+    let new_key = Address::generate(&env);
+
+    // Old key is a valid admin and can perform an admin action.
+    client.add_admin(&super_admin, &old_key, &AdminRole::Admin);
+    assert!(client.is_admin(&old_key));
+    client.authorize(&old_key);
+
+    // Rotate: revoke the old key and grant the new key.
+    client.revoke_admin(&super_admin, &old_key);
+    client.add_admin(&super_admin, &new_key, &AdminRole::Admin);
+
+    // New key can perform an admin action.
+    assert!(client.is_admin(&new_key));
+    client.authorize(&new_key);
+
+    // Old key is rejected after rotation.
+    assert!(!client.is_admin(&old_key));
+    assert!(client.get_admin(&old_key).is_none());
+}
+
+#[test]
+#[should_panic(expected = "unauthorized admin")]
+fn test_old_key_rejected_after_rotation() {
+    let (env, client, super_admin) = setup();
+    let old_key = Address::generate(&env);
+    let new_key = Address::generate(&env);
+
+    client.add_admin(&super_admin, &old_key, &AdminRole::Admin);
+    client.authorize(&old_key);
+
+    client.revoke_admin(&super_admin, &old_key);
+    client.add_admin(&super_admin, &new_key, &AdminRole::Admin);
+
+    // Old key must no longer be authorized after rotation.
+    client.authorize(&old_key);
+}
+
+// Issue #1555 — a failed admin authentication must emit an AdminAuthFailed
+// event carrying the caller, the attempted function name, and the ledger
+// timestamp so brute-force attempts are visible on-chain.
+#[test]
+fn test_admin_auth_failure_emits_event() {
+    let (env, client, _super_admin) = setup();
+    let attacker = Address::generate(&env);
+
+    // Record the ledger timestamp the failure will be stamped with.
+    let timestamp = env.ledger().timestamp();
+
+    // Attempt an admin-only action from a non-admin address. The contract
+    // emits the failure event before panicking, so catch the panic.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.authorize(&attacker);
+    }));
+    assert!(result.is_err(), "expected auth failure to panic");
+
+    // The failure event must be present in the emitted events.
+    let expected = AdminAuthFailed {
+        caller: attacker.clone(),
+        function: Symbol::new(&env, "authorize"),
+        timestamp,
+    };
+    let expected_topics = (Symbol::new(&env, "admin_auth"), Symbol::new(&env, "auth_failed")).into_val(&env);
+    let expected_data = expected.into_val(&env);
+    assert!(env.events().all().iter().any(|(_, topics, data)| {
+        topics == expected_topics && data == expected_data
+    }));
+}
+
+// Issue #1556 — admin credentials are stored as derived keys (a hash of the
+// public key) rather than the raw public key. The derived key must be stable
+// and must not equal the raw address, so credential rotation can be reasoned
+// about without exposing the raw key in storage.
+#[test]
+fn test_admin_credential_is_derived_not_raw() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+
+    let derived = client.derive_admin_key(&admin);
+    // The stored credential is a derivation of the public key, not the key itself.
+    assert_ne!(derived, admin);
+    // Derivation is deterministic.
+    assert_eq!(derived, client.derive_admin_key(&admin));
+    // The derived credential is what the contract stores and checks.
+    assert!(client.has_admin_key(&derived));
+    assert!(!client.has_admin_key(&admin));
+}
+
+// Issue #1556 — multiple admin keys can be active simultaneously so a new key
+// can be added before an old one is removed, enabling rotation without downtime.
+#[test]
+fn test_multiple_admin_keys_active_during_rotation() {
+    let (env, client, super_admin) = setup();
+    let old_key = Address::generate(&env);
+    let new_key = Address::generate(&env);
+
+    // Grant the old key.
+    client.add_admin(&super_admin, &old_key, &AdminRole::Admin);
+    assert!(client.is_admin(&old_key));
+
+    // Add the new key BEFORE removing the old one — both must be authorized.
+    client.add_admin(&super_admin, &new_key, &AdminRole::Admin);
+    assert!(client.is_admin(&old_key));
+    assert!(client.is_admin(&new_key));
+    client.authorize(&old_key);
+    client.authorize(&new_key);
+
+    // Now retire the old key; the new key remains authorized.
+    client.revoke_admin(&super_admin, &old_key);
+    assert!(!client.is_admin(&old_key));
+    assert!(client.is_admin(&new_key));
+    client.authorize(&new_key);
+}
+
+// Issue #1556 — a removed key's derived credential is no longer recognized.
+#[test]
+fn test_removed_admin_key_credential_rejected() {
+    let (env, client, super_admin) = setup();
+    let admin = Address::generate(&env);
+    client.add_admin(&super_admin, &admin, &AdminRole::Admin);
+
+    let derived = client.derive_admin_key(&admin);
+    assert!(client.has_admin_key(&derived));
+
+    client.revoke_admin(&super_admin, &admin);
+    assert!(!client.has_admin_key(&derived));
+}
+
 // Issue #1540 — quorum must be validated on initialization: quorum >= 1 and
 // quorum <= signers.len(). A 0-of-N threshold must be rejected.
 fn signers(env: &Env, n: u32) -> Vec<Address> {
@@ -201,4 +335,5 @@ fn test_init_rejects_quorum_above_signers() {
     let (env, client, super_admin) = setup();
     let signers = signers(&env, 3);
     client.init_multisig(&super_admin, &signers, &4);
+}
 }
