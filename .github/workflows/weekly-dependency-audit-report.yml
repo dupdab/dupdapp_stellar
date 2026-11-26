@@ -26,15 +26,45 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      - name: Generate Rust contracts audit report
-        working-directory: dabdub_contracts
-        run: cargo audit --format json > rust-audit-report.txt 2>&1 || true
+      - name: Run cargo audit (contracts)
+        id: cargo_audit
+        continue-on-error: true
+        run: |
+          set +e
+          if [ -f dabdub_contracts/Cargo.toml ]; then
+            (cd dabdub_contracts && cargo audit --json > ../cargo-audit.json 2>/dev/null)
+            echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          else
+            echo '{"vulnerabilities":{"list":[]}}' > cargo-audit.json
+            echo "exit_code=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail on high/critical Rust advisories
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          let cargo;
+          try { cargo = JSON.parse(fs.readFileSync('cargo-audit.json', 'utf8')); } catch { cargo = { vulnerabilities: { list: [] } }; }
+          const list = (cargo.vulnerabilities && cargo.vulnerabilities.list) || [];
+          const severe = list.filter((item) => {
+            const adv = item.advisory || {};
+            const sev = String(adv.severity || '').toLowerCase();
+            return sev === 'high' || sev === 'critical';
+          });
+          if (severe.length > 0) {
+            console.error(`Found ${severe.length} high/critical Rust advisory(ies):`);
+            for (const item of severe) {
+              const adv = item.advisory || {};
+              const pkg = item.package || {};
+              console.error(`- ${pkg.name || 'unknown'} ${pkg.version || ''}: ${adv.id || 'advisory'} (${adv.severity})`);
+            }
+            process.exit(1);
+          }
+          console.log('No high/critical Rust advisories found.');
+          NODE
 
       - name: Generate backend audit report
         run: node scripts/dependency-audit-report.js backend --output backend-audit-report.txt
@@ -49,19 +79,6 @@ jobs:
             echo "exit_code=$?" >> "$GITHUB_OUTPUT"
           else
             echo '{"vulnerabilities":{},"metadata":{"vulnerabilities":{"total":0}}}' > npm-audit.json
-            echo "exit_code=0" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run cargo audit (contracts)
-        id: cargo_audit
-        continue-on-error: true
-        run: |
-          set +e
-          if [ -f dabdub_contracts/Cargo.toml ]; then
-            (cd dabdub_contracts && cargo audit --json > ../cargo-audit.json 2>/dev/null)
-            echo "exit_code=$?" >> "$GITHUB_OUTPUT"
-          else
-            echo '{"vulnerabilities":{"list":[]}}' > cargo-audit.json
             echo "exit_code=0" >> "$GITHUB_OUTPUT"
           fi
 
@@ -214,7 +231,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issue.number,
-                body: 'Dependencies have been updated and the audit now passes. Closing automatically.',
+                body: 'Dependencies have been updated and the audit is now clean. Closing this issue.',
               });
               await github.rest.issues.update({
                 owner: context.repo.owner,
