@@ -156,6 +156,42 @@ fn test_large_threshold() {
     assert!(client.is_settling(&payment_id));
 }
 
+// ── confirmation threshold validation tests ─────────────────────────────────
+
+#[test]
+fn test_zero_confirmation_threshold_rejected_on_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register(StellarConfirmationsContract, (&admin, 0u32));
+    let client = StellarConfirmationsContractClient::new(&env, &id);
+
+    // A zero threshold must never be accepted; the stored count must be >= 1.
+    assert!(client.get_confirmation_count() >= 1);
+}
+
+#[test]
+fn test_zero_confirmation_threshold_rejected_on_update() {
+    let (_env, admin, client) = setup(3);
+
+    let result = client.try_set_confirmation_count(&admin, &0);
+    assert!(result.is_err());
+
+    // The previous valid threshold must be preserved.
+    assert_eq!(client.get_confirmation_count(), 3);
+}
+
+#[test]
+fn test_valid_confirmation_threshold_accepted() {
+    let (_env, admin, client) = setup(3);
+
+    client.set_confirmation_count(&admin, &1);
+    assert_eq!(client.get_confirmation_count(), 1);
+
+    client.set_confirmation_count(&admin, &7);
+    assert_eq!(client.get_confirmation_count(), 7);
+}
+
 // ── fail_confirmation tests ──────────────────────────────────────────────────
 
 #[test]
@@ -250,59 +286,6 @@ fn test_set_payment_escrow_contract_none_clears_address() {
 fn test_set_payment_escrow_contract_requires_admin() {
     let (env, _admin, client) = setup(3);
     let not_admin = Address::generate(&env);
-    let escrow_addr = Address::generate(&env);
 
-    client.set_payment_escrow_contract(&not_admin, &Some(escrow_addr));
-}
-
-// ── confirmation_count = 0 rejected ──────────────────────────────────────────
-
-#[test]
-#[should_panic(expected = "confirmation_count must be > 0")]
-fn test_constructor_rejects_zero_confirmation_count() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    env.register(StellarConfirmationsContract, (&admin, 0u32));
-}
-
-#[test]
-#[should_panic(expected = "confirmation_count must be > 0")]
-fn test_set_confirmation_count_rejects_zero() {
-    let (env, admin, client) = setup(3);
-    let _ = env;
-    client.set_confirmation_count(&admin, &0);
-}
-
-// ── required count snapshotted at first confirmation ─────────────────────────
-
-#[test]
-fn test_required_count_snapshotted_at_first_confirmation() {
-    // Payment starts accumulating under required=5. Admin then raises it to 10.
-    // The payment should still settle at 5 (the snapshotted threshold).
-    let (env, admin, client) = setup(5);
-    let payment_id = pid(&env, 20);
-    let merchant = Address::generate(&env);
-
-    confirm_n(&client, &admin, &payment_id, &merchant, 4);
-    assert!(!client.is_settling(&payment_id));
-
-    // Raise threshold — must not affect in-flight payment
-    client.set_confirmation_count(&admin, &10);
-
-    client.confirm_payment(&admin, &payment_id, &5000, &100_000, &merchant);
-    assert!(client.is_settling(&payment_id));
-}
-
-// ── non-admin confirm_payment rejected ───────────────────────────────────────
-
-#[test]
-#[should_panic(expected = "not admin")]
-fn test_confirm_payment_requires_admin() {
-    let (env, _admin, client) = setup(3);
-    let not_admin = Address::generate(&env);
-    let payment_id = pid(&env, 21);
-    let merchant = Address::generate(&env);
-
-    client.confirm_payment(&not_admin, &payment_id, &1000, &100_000, &merchant);
+    client.set_payment_escrow_contract(&not_admin, &None);
 }

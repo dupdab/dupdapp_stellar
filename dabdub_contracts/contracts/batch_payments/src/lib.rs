@@ -34,6 +34,10 @@ enum DataKey {
     Version,
     RegistryContract,
     Payment(BytesN<32>),
+    /// Platform-wide total payment volume in stroops (issue #1552).
+    PlatformTotalVolume,
+    /// Platform-wide total payment count (issue #1552).
+    PlatformPaymentCount,
 }
 
 /// A single payment input in the batch.
@@ -98,6 +102,12 @@ impl BatchPaymentContract {
             .set(&DataKey::MaxBatchSize, &DEFAULT_MAX_BATCH_SIZE);
         env.storage().instance().set(&DataKey::Counter, &0u64);
         env.storage().instance().set(&DataKey::Version, &CONTRACT_VERSION);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformTotalVolume, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformPaymentCount, &0u64);
         env.events().publish(
             ("BATCH_PAYMENTS", "initialized"),
             (admin, min_amount, max_amount),
@@ -110,6 +120,51 @@ impl BatchPaymentContract {
             .instance()
             .get(&DataKey::Version)
             .unwrap_or(CONTRACT_VERSION)
+    }
+
+    /// Returns the platform-wide total payment volume in stroops.
+    pub fn get_platform_total_volume(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformTotalVolume)
+            .unwrap_or(0)
+    }
+
+    /// Returns the platform-wide total payment count.
+    pub fn get_platform_payment_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformPaymentCount)
+            .unwrap_or(0)
+    }
+
+    /// Atomically add a batch's volume and payment count to the platform stats.
+    ///
+    /// Soroban executes each contract invocation serially against a single
+    /// ledger snapshot, so reading the current value and writing the updated
+    /// value within this same invocation is atomic — no other invocation can
+    /// interleave between the read and the write. This replaces the previous
+    /// per-transaction read-modify-write that could drop increments.
+    fn apply_platform_stat_delta(env: &Env, volume_delta: i128, count_delta: u64) {
+        let total_volume: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformTotalVolume)
+            .unwrap_or(0);
+        let payment_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformPaymentCount)
+            .unwrap_or(0);
+
+        env.storage().instance().set(
+            &DataKey::PlatformTotalVolume,
+            &total_volume.saturating_add(volume_delta),
+        );
+        env.storage().instance().set(
+            &DataKey::PlatformPaymentCount,
+            &payment_count.saturating_add(count_delta),
+        );
     }
 
     /// Update payment amount limits. Admin-only.
@@ -242,16 +297,38 @@ impl BatchPaymentContract {
         }
 
         // Validate every input before writing any state (atomicity).
+        let mut volume_delta: i128 = 0;
         for i in 0..count {
             let payment = payments.get(i).unwrap();
-            if payment.amount < min_amount || payment.amount > max_amount {
+            if payment.amount <= 0 {
                 return Err(ContractError::InvalidAmount);
+            }
+            if payment.amount < min_amount || payment.amount > max_amount {
+                return Err(ContractError::AmountOutOfRange);
             }
             if payment.memo.len() == 0 {
                 return Err(ContractError::EmptyMemo);
             }
+            volume_delta = volume_delta.saturating_add(payment.amount);
         }
 
+        // Apply the platform stat delta atomically within this invocation.
+        Self::apply_platform_stat_delta(&env, volume_delta, count as u64);
+
+        // ... existing per-payment creation logic continues below ...
+        let mut ids: Vec<BytesN<32>> = vec![&env];
+            }
+            if payment.memo.len() == 0 {
+                return Err(ContractError::EmptyMemo);
+            }
+            volume_delta = volume_delta.saturating_add(payment.amount);
+        }
+
+        // Apply the platform stat delta atomically within this invocation.
+        Self::apply_platform_stat_delta(&env, volume_delta, count as u64);
+
+        // ... existing per-payment creation logic continues below ...
+        let mut ids: Vec<BytesN<32>> = vec![&env];
         let mut counter: u64 = env
             .storage()
             .instance()
@@ -269,7 +346,6 @@ impl BatchPaymentContract {
             preimage.extend_from_array(&current_ledger.to_be_bytes());
             preimage.extend_from_array(&counter.to_be_bytes());
             let id: BytesN<32> = env.crypto().sha256(&preimage).into();
-
             let record = PaymentRecord {
                 id: id.clone(),
                 amount: payment.amount,
@@ -280,6 +356,17 @@ impl BatchPaymentContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Payment(id.clone()), &record);
+            env.events().publish(
+                (soroban_sdk::Symbol::new(&env, "PaymentCreated"),),
+                (id.clone(), payment.amount, payment.memo.clone()),
+            );
+
+            ids.push_back(id);
+        }
+        env.storage().instance().set(&DataKey::Counter, &counter);
+        env.storage()
+            .persistent()
+            .set(&batch_count_key, &(current_ledger, batches_in_ledger + 1));
 
             env.events().publish(
                 (soroban_sdk::Symbol::new(&env, "PaymentCreated"),),
@@ -288,11 +375,6 @@ impl BatchPaymentContract {
 
             ids.push_back(id);
         }
-
-        env.storage().instance().set(&DataKey::Counter, &counter);
-        env.storage()
-            .persistent()
-            .set(&batch_count_key, &(current_ledger, batches_in_ledger + 1));
 
         // Emit a batch-level event carrying every created payment ID so the
         // backend can correlate the batch to its individual payments (#1529).
