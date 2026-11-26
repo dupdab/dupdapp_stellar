@@ -94,6 +94,29 @@ rounded down and differs from the exact percentage by less than one smallest
 unit. For example, a 150 bps fee on 900 units is 13 units, with 887 units net.
 Settlement records must use the exact fee and net returned by the calculator.
 
+## WASM optimization level (`wasm-opt`)
+
+Release builds run `wasm-opt` on each contract. The Makefile uses **`-Oz`**
+(size-optimized) rather than `-O3` (speed-optimized). The tradeoff:
+
+- **`-Oz`** minimizes WASM byte size. Smaller contracts cost less to upload,
+  store, and instantiate on-chain, and stay comfortably under the 64 KB
+  per-contract limit enforced by `make check-wasm-size`. The cost is slightly
+  more instructions per call, which is negligible for these contracts because
+  their execution is dominated by host functions (storage, token transfers,
+  crypto) rather than guest CPU.
+- **`-O3`** maximizes guest execution speed but produces larger WASM. For
+  Soroban contracts the extra size increases upload/storage/instantiation cost
+  and risks breaching the size limit, while the runtime savings are small
+  relative to host-function cost.
+
+**Chosen level: `-Oz`.** Contract execution cost is dominated by host calls,
+so the size savings outweigh the marginal guest-CPU difference. `make
+build-optimised` prints the resulting per-contract WASM sizes so the size
+impact of the optimization level is visible in build output. If a future
+contract becomes guest-CPU bound, benchmark `-O3` against `-Oz` before
+switching.
+
 ## Development
 
 ### Prerequisites
@@ -121,12 +144,11 @@ rustup target add wasm32v1-none
 
 ```bash
 make build              # debug build of all contracts
-make build-optimised    # release build + wasm-opt -Oz
+make build-optimised    # release build + wasm-opt -Oz (prints WASM sizes)
 make check-wasm-size    # enforce the 64 KB per-contract WASM limit
 make test               # cargo test across the workspace
-make deploy-testnet     # deploy and initialize all contracts on Stellar testnet
+make deploy-testnet     # deploy and initialize contracts on testnet
 ```
-
 ### Manual testnet deployment
 
 `make deploy-testnet` builds all contract WASMs and deploys all 17 contracts to

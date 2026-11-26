@@ -89,16 +89,211 @@ on:
     steps:
       - uses: actions/checkout@v4
 
+      # The toolchain is pinned in rust-toolchain.toml (issue #1567) so the
+      # compiler version is identical on every machine and CI agent. The
+      # action reads that file instead of tracking `stable`.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.82.0"
           targets: wasm32v1-none
+          components: rustfmt, clippy
 
+      - name: Check Rust formatting
+        working-directory: dabdub_contracts
+        run: cargo fmt -- --check
+
+      # Cache the cargo registry (downloaded crate sources) and the workspace
+      # target directory so dependencies are not re-downloaded and recompiled
+      # on every run. The key is derived from the Cargo.lock hash so the cache
+      # is invalidated whenever the dependency graph changes; restore-keys
+      # provide a fallback so partial rebuilds still benefit.
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            dabdub_contracts/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # cargo-machete (issue #1569) detects dependencies declared in
+      # Cargo.toml that are never referenced by the crate source. Unused deps
+      # bloat compile time and widen the supply-chain surface, so CI fails
+      # when any are found.
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Install Rust wasm target
+        run: rustup target add wasm32v1-none
+
+      # The cargo workspace lives in dupdub_contracts/; there is no manifest at
+      # the repository root, so every cargo invocation has to run from there.
+      - name: cargo clippy
+        working-directory: dabdub_contracts
+        run: cargo clippy -- -D warnings
+
+      # Fails CI when any Cargo.toml in the contracts workspace declares a
+      # dependency that is not used by the crate source (issue #1569).
+      - name: cargo machete (unused dependencies)
+        working-directory: dabdub_contracts
+        run: cargo machete
+
+      - name: cargo test
+        working-directory: dabdub_contracts
+        run: cargo test
+
+      # Property-based tests (proptest) live behind the `proptest` feature so
+      # the default test run stays fast. This job exercises them explicitly so
+      # regressions in fee/slippage/escrow invariants are caught in CI.
+      - name: cargo test (property-based)
+        working-directory: dabdub_contracts
+        run: cargo test --features proptest -- --nocapture
+
+      # Scans Cargo.lock against the RustSec advisory database. cargo-audit
+      # exits non-zero on any vulnerability by default, which fails CI on HIGH
+      # and CRITICAL advisories (and lower severities too).
+      - name: cargo audit
+        working-directory: dabdub_contracts
+        run: cargo audit
+
+      - name: Generate coverage report
+        working-directory: dabdub_contracts
+        run: |
+          mkdir -p target/coverage
+          cargo tarpaulin \
+            --workspace \
+            --out Xml \
+            --output-dir target/coverage \
+            --exclude-files "*/tests/*" \
+            --verbose \
+            --fail-under 85
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          files: dupdub_contracts/target/coverage/cobertura.xml
+          flags: rust
+          name: dupdub-contracts
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      # `make check-wasm-size` depends on `make build-optimised`, which shells
+      # out to wasm-opt. Installed the same way deploy.yml does it.
       - name: Install wasm-opt
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y binaryen
 
+      # Builds every workspace contract to wasm, runs wasm-opt -Oz over the
+      # output, and fails when any contract exceeds the 64 KB Soroban deploy
+      # limit. deploy.yml already gates this on `main`; running it here means a
+      # pull request that grows a contract past the limit is caught before it
+      # merges rather than after. The target also e
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
+      # Builds every workspace contract to wasm, runs wasm-opt -Oz over the
+      # output, and fails when any contract exceeds the 64 KB Soroban deploy
+      # limit. deploy.yml already gates this on `main`; running it here means a
+      # pull request that grows a contract past the limit is caught before it
+      # merges rather than after. The target also emits a warning at 48 KB
+      # (75% of the limit) so size creep is visible before it becomes a
+      # deployment failure.
+      - name: Build WASM and check size budget
+        run: make check-wasm-size
+
+      # Reproducible-build verification (issue #1567): rebuild the wasm from a
+      # clean target directory with the pinned toolchain and locked deps, then
+      # compare the resulting hashes against the first build. Any mismatch
+      # means the build is not deterministic and fails CI.
+      - name: Verify reproducible WASM build
+        run: |
+          set -euo pipefail
+          wasm_dir="dabdub_contracts/target/wasm32v1-none/release"
+          sha256sum "$wasm_dir"/*.wasm | sort -k2 > /tmp/wasm-hashes-first.txt
+          echo "First build hashes:"
+          cat /tmp/wasm-hashes-first.txt
+
+          # Clean rebuild with the same pinned toolchain and locked deps.
+          ( cd dabdub_contracts && cargo clean )
+          make build-optimised
+
+          sha256sum "$wasm_dir"/*.wasm | sort -k2 > /tmp/wasm-hashes-second.txt
+          echo "Second build hashes:"
+          cat /tmp/wasm-hashes-second.txt
+
+          if ! diff -u /tmp/wasm-hashes-first.txt /tmp/wasm-hashes-second.txt; then
+            echo "::error::WASM output is not reproducible across builds."
+            exit 1
+          fi
+          echo "WASM build is reproducible."
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-contracts
+          path: dupdub_contracts/target/wasm32v1-none/release/*.wasm
+          retention-days: 30
+
+      # Regenerates the machine-readable ABI JSON under docs/abi/ from the
+      # built wasm and fails when the committed files drift from the contract
+      # source. Keeps the NestJS backend's ABI docs in sync with the Rust code.
+      - name: Verify contract ABI docs are up to date
+        run: |
+          make generate-abi
+          if ! git diff --quiet -- docs/abi; then
+            echo "::error::docs/abi is out of date. Run 'make generate-abi' and commit the result."
+            git diff -- docs/abi
+            exit 1
+          fi
+
+  cargo-audit:
+    name: Cargo audit (Rust dependency vulnerabilities)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.82.0"
+
+      # The cargo workspace lives in dabdub_contracts/; there is no manifest at
+      # the repository root, so the audit runs from there.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run cargo audit (fail on HIGH or CRITICAL)
+        working-directory: dabdub_contracts
+        run: cargo audit --fail-severity high
+
+      # Generate TypeScript bindings for every built contract. Output lands in
+      # bindings/<contract-name>/ so it can be published and consumed by the
+      # NestJS backend. Runs after the build step above so the freshly built
+      # wasm is used instead of hand-maintained bindings.
+      - name: Generate contract TypeScript bindings
+        run: |
+          mkdir -p bindings
       - name: Install Stellar CLI
         run: |
           curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
@@ -116,18 +311,7 @@ on:
           TESTNET_DEPLOYER_SECRET: ${{ secrets.TESTNET_DEPLOYER_SECRET }}
         run: |
           set -euo pipefail
-          if [ -z "${TESTNET_DEPLOYER_SECRET:-}" ]; then
-            echo "::error::TESTNET_DEPLOYER_SECRET is not configured"
-            exit 1
-          fi
-          stellar keys add "$STELLAR_ACCOUNT" --secret-key "$TESTNET_DEPLOYER_SECRET"
-
-      # Deploys every contract and records the resulting contract IDs so the
-      # integration suite and the teardown step can reference them.
-      - name: Deploy contracts to testnet
-        run: |
-          set -euo pipefail
-          : > testnet-contract-ids.txt
+          mkdir -p bindings
           for contract in admin_auth admin_timelock batch_payments fee_calculator fee_distributor liquidity_router; do
             wasm="dabdub_contracts/target/wasm32v1-none/release/${contract}.wasm"
             if [ ! -f "$wasm" ]; then
