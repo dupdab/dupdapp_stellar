@@ -16,7 +16,7 @@ payment records are created in batches and settled downstream.
 | --- | --- | --- |
 | `Admin` | `Address` | Address allowed to configure the contract (see Admin operations). |
 | `MinAmount` / `MaxAmount` | `i128` | Inclusive allowed amount range for each payment. |
-| `MaxBatchSize` | `u32` | Configured upper bound; at most 100. |
+| `MaxBatchSize` | `u32` | Admin-configurable upper bound; defaults to 20 and is capped at 100. |
 | `Counter` | `u64` | Monotonic counter used when deriving payment ids. |
 | `Version` | `u32` | Contract ABI version. |
 | `RegistryContract` | `Address` | Optional merchant registry used to gate batch creation. |
@@ -36,7 +36,8 @@ One event is emitted per payment record.
 ## Admin operations
 
 - `init(admin, min_amount, max_amount)` — one-time setup of the administrator
-  and per-payment amount limits.
+  and per-payment amount limits. `MaxBatchSize` is initialized to the default
+  of 20.
 - `set_limits(min_amount, max_amount)` — admin-only amount-limit update.
 - `set_max_batch_size(new_max)` — admin-only limit update, capped at 100.
 - `set_registry(registry)` — admin-only; configure or clear the optional
@@ -44,11 +45,21 @@ One event is emitted per payment record.
 
 All admin entry points require `admin.require_auth()`.
 
+## Batch size enforcement
+
+Every batch is checked against the configured `MaxBatchSize` before any
+validation or storage work. A batch larger than the configured limit is
+rejected with `Error::BatchTooLarge` and the entire call reverts, so no
+partial state is written.
+
+The default limit is 20 items. The admin can raise or lower it via
+`set_max_batch_size`, but the value is capped at a hard maximum of 100 items.
+
 ## Batch size and instruction benchmark
 
-The default and hard maximum batch size is 100 items. The admin can lower the
-configured limit but cannot raise it above this ceiling. The limit is based on
-the Soroban test-host CPU instruction benchmark in
+The default batch size is 20 items and the hard maximum is 100 items. The
+admin can lower the configured limit but cannot raise it above this ceiling.
+The limit is based on the Soroban test-host CPU instruction benchmark in
 `src/test.rs::benchmark_batch_instruction_cost_per_item`, which measures the
 contract call separately from setup at 20 and 100 items. In the current test
 host run, 20 items used 849,890 instructions (42,494 per item), and 100 items
@@ -64,6 +75,17 @@ materially increases cost. The benchmark is a reproducible test-host
 measurement, not a substitute for network simulation or a guarantee for
 arbitrary future code changes.
 
+### Maximum safe batch size
+
+The benchmark enforces a safety margin: the measured instruction usage for a
+batch must stay below **80% of the Soroban instruction limit**
+(`INSTRUCTION_LIMIT * 80 / 100`). At the current per-item cost, the maximum
+safe batch size is **100 items** — the contract's hard ceiling — which uses
+about 6.9% of the 100,000,000-instruction budget, well within the 80% margin.
+The CI benchmark step (`cargo test -p batch-payments benchmark_`) fails the
+build if any benchmarked batch size exceeds this 80% threshold, so the
+maximum safe batch size cannot silently regress.
+
 Run the measurement with:
 
 ```sh
@@ -71,13 +93,46 @@ cd dabdub_contracts
 cargo test -p batch-payments benchmark_batch_instruction_cost_per_item -- --nocapture
 ```
 
+## wasm-opt optimization level (Oz vs O3)
+
+Release builds run `wasm-opt` on the compiled contract WASM. The build uses
+`-Oz` (size-optimized) rather than `-O3` (speed-optimized). The tradeoff is
+code size versus execution cost:
+
+- **`-Oz` (chosen).** Produces the smallest WASM, which lowers the on-chain
+  upload/storage cost and keeps the artifact well under the CI WASM size
+  limit. The cost is slightly more CPU instructions per call because the
+  optimizer favors size over inlining and loop unrolling.
+- **`-O3`.** Produces faster-executing WASM (fewer instructions per call) but
+  a larger artifact, increasing upload/storage cost and risking the size
+  limit.
+
+For `batch_payments` the execution-cost difference is small relative to the
+100,000,000-instruction transaction budget: the 100-item benchmark above uses
+about 6.9% of the budget, so the extra instructions from `-Oz` do not
+meaningfully change headroom. Because upload/storage cost is paid once per
+deployment while the instruction savings from `-O3` are marginal here, `-Oz`
+is the better default. If a future change makes per-call cost dominate, switch
+the Makefile to `-O3` and re-run the benchmark below to confirm the tradeoff.
+
+To compare the two levels, build with each and re-run the instruction
+benchmark:
+
+```sh
+cd dabdub_contracts
+# default build uses -Oz
+cargo test -p batch-payments benchmark_batch_instruction_cost_per_item -- --nocapture
+# then rebuild with -O3 (edit the wasm-opt flags in the Makefile) and re-run
+```
+
 ## Known limitations
 
 - **No token transfer.** The contract records payment instructions; settlement
   is handled by the downstream payment flow.
 - **No partial success.** A single invalid item reverts the entire batch.
-- **Batch size is bounded** by the contract's 100-item ceiling; larger payment
-  lists must be chunked across multiple transactions.
+- **Batch size is bounded** by the configured `MaxBatchSize` (default 20, hard
+  ceiling 100); larger payment lists must be chunked across multiple
+  transactions.
 - **No batch deletion.** Created payment records are immutable and have no
   admin clawback or refund path.
 
