@@ -169,3 +169,89 @@ fn test_active_payments_24h_resets_after_bucket_rollover() {
     assert_eq!(stats.total_payments, 3);
     assert_eq!(stats.total_settled_volume_usd, 6_000_000);
 }
+
+#[test]
+fn test_stats_history_snapshot_creation_and_retrieval() {
+    let (env, client, admin) = setup();
+
+    // Day 0: record some activity and take a snapshot.
+    client.record_merchant(&admin);
+    client.record_payment(&admin, &10_000_000i128, &true);
+    client.snapshot_stats(&admin);
+
+    let history = client.get_stats_history(&1u32);
+    assert_eq!(history.len(), 1);
+    let snap = history.get(0).unwrap();
+    assert_eq!(snap.total_merchants, 1);
+    assert_eq!(snap.total_payments, 1);
+    assert_eq!(snap.total_settled_volume_usd, 10_000_000);
+
+    // Advance one day and take another snapshot with more activity.
+    env.ledger().set_sequence_number(DAY_LEDGERS);
+    client.record_payment(&admin, &5_000_000i128, &true);
+    client.snapshot_stats(&admin);
+
+    let history = client.get_stats_history(&2u32);
+    assert_eq!(history.len(), 2);
+    let latest = history.get(1).unwrap();
+    assert_eq!(latest.total_payments, 2);
+    assert_eq!(latest.total_settled_volume_usd, 15_000_000);
+
+    // Requesting more days than exist returns only what is stored.
+    let history = client.get_stats_history(&30u32);
+    assert_eq!(history.len(), 2);
+}
+
+#[test]
+fn test_stats_history_rolling_window_caps_at_30_days() {
+    let (env, client, admin) = setup();
+
+    // Create 35 daily snapshots; only the most recent 30 should be retained.
+    for day in 0..35u32 {
+        env.ledger().set_sequence_number(day * DAY_LEDGERS);
+        client.record_payment(&admin, &1_000_000i128, &true);
+        client.snapshot_stats(&admin);
+    }
+
+    let history = client.get_stats_history(&30u32);
+    assert_eq!(history.len(), 30);
+
+    // The oldest retained snapshot should reflect day 5 (35 - 30).
+    let oldest = history.get(0).unwrap();
+    assert_eq!(oldest.total_payments, 6);
+}
+
+#[test]
+fn test_prune_stats_history_removes_old_snapshots() {
+    let (env, client, admin) = setup();
+
+    for day in 0..10u32 {
+        env.ledger().set_sequence_number(day * DAY_LEDGERS);
+        client.record_payment(&admin, &1_000_000i128, &true);
+        client.snapshot_stats(&admin);
+    }
+    assert_eq!(client.get_stats_history(&30u32).len(), 10);
+
+    // Prune snapshots older than 5 days relative to the current ledger.
+    env.ledger().set_sequence_number(9 * DAY_LEDGERS);
+    client.prune_stats_history(&admin, &5u32);
+
+    let history = client.get_stats_history(&30u32);
+    assert_eq!(history.len(), 5);
+}
+
+#[test]
+#[should_panic(expected = "not admin")]
+fn test_snapshot_stats_requires_admin() {
+    let (env, client, _admin) = setup();
+    let attacker = Address::generate(&env);
+    client.snapshot_stats(&attacker);
+}
+
+#[test]
+#[should_panic(expected = "not admin")]
+fn test_prune_stats_history_requires_admin() {
+    let (env, client, _admin) = setup();
+    let attacker = Address::generate(&env);
+    client.prune_stats_history(&attacker, &5u32);
+}

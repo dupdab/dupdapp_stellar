@@ -16,7 +16,7 @@ API work tracked in this repository is implemented in the backend; see [the back
 All contracts live under [`dabdub_contracts/contracts/`](dabdub_contracts/contracts/):
 
 | Contract | Purpose | Coverage |
-|---|---|
+|---|---|---|
 | `admin_timelock` | Timelocked admin actions | [![admin_timelock](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=admin_timelock)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 | `batch_payments` | Batched payment processing | [![batch_payments](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=batch_payments)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
 | `fee_calculator` | Fee computation logic | [![fee_calculator](https://codecov.io/gh/dupdab/dupdapp_stellar/branch/main/graph/badge.svg?flag=fee_calculator)](https://codecov.io/gh/dupdab/dupdapp_stellar) |
@@ -231,3 +231,16 @@ Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.
 
 <!-- handsoff-issue-1215 -->
 - #1215: [P1] merchant_registry: add merchant metadata fields (website, contact, country)
+
+<!-- handsoff-issue-1547 -->
+- #1547: slippage_protection: no event when slippage limit exceeded — silent failure
+
+<!-- handsoff-issue-1561 -->
+- #1561: testing: slippage_protection not tested with real AMM price calculations
+
+<!-- handsoff-issue-1525 -->
+- #1525: reconciliation: no mechanism to report discrepancies on-chain — only logs them
+
+<!-- handsoff-issue-1526 -->
+- #1526: reconciliation: reconciliation not protected against running during active settlements
+

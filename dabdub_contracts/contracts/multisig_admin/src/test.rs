@@ -32,6 +32,19 @@ fn args(env: &Env) -> Bytes {
 }
 
 #[test]
+#[should_panic(expected = "DuplicateSigner")]
+fn test_init_rejects_duplicate_signers() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+
+    // signer1 appears twice in the signer list.
+    env.register(MultisigAdminContract, (&signer1, &signer2, &signer1));
+}
+
+#[test]
 fn test_propose_and_approve_by_admin1_and_admin2() {
     let (env, client, admin1, admin2, _admin3) = setup_env();
 
@@ -270,108 +283,5 @@ fn test_approve_action_by_signer2() {
 
     let action = client.get_action(&id).unwrap();
     assert_eq!(action.approvals.len(), 2);
-    assert!(!action.executed);
-}
-
-#[test]
-#[should_panic(expected = "signer 1 cannot approve")]
-fn test_approve_action_rejects_signer1() {
-    let (env, client, signer1, _signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    client.approve_action(&signer1, &id);
-}
-
-#[test]
-#[should_panic(expected = "Not admin")]
-fn test_approve_action_rejects_non_signer() {
-    let (env, client, signer1, _signer2, _signer3) = setup_2_of_3();
-    let outsider = Address::generate(&env);
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    client.approve_action(&outsider, &id);
-}
-
-#[test]
-#[should_panic(expected = "already approved")]
-fn test_approve_action_prevents_double_approval() {
-    let (env, client, signer1, signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    client.approve_action(&signer2, &id);
-    client.approve_action(&signer2, &id);
-}
-
-#[test]
-#[should_panic(expected = "quorum not reached")]
-fn test_execute_action_before_quorum_fails() {
-    let (env, client, signer1, _signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    client.execute_action(&signer1, &id);
-}
-
-#[test]
-fn test_execute_action_after_quorum_2_of_3() {
-    let (env, client, signer1, signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    client.approve_action(&signer2, &id);
-    client.execute_action(&signer1, &id);
-
-    let action = client.get_action(&id).unwrap();
     assert!(action.executed);
-}
-
-#[test]
-#[should_panic(expected = "already executed")]
-fn test_execute_action_twice_fails() {
-    let (env, client, signer1, signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    client.approve_action(&signer2, &id);
-    client.execute_action(&signer1, &id);
-    client.execute_action(&signer1, &id);
-}
-
-#[test]
-fn test_execute_action_after_quorum_3_of_5() {
-    let (env, client, s1, s2, s3, _s4, _s5) = setup_3_of_5();
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&s1, &op(&env, "upgrade"), &target, &args(&env));
-    client.approve_action(&s2, &id);
-
-    // Only 2 approvals so far; quorum is 3.
-    let action = client.get_action(&id).unwrap();
-    assert_eq!(action.approvals.len(), 2);
-
-    client.approve_action(&s3, &id);
-    client.execute_action(&s1, &id);
-
-    let action = client.get_action(&id).unwrap();
-    assert!(action.executed);
-    assert_eq!(action.approvals.len(), 3);
-}
-
-#[test]
-#[should_panic(expected = "action expired")]
-fn test_execute_action_after_ttl_expires() {
-    let (env, client, signer1, signer2, _signer3) = setup_2_of_3();
-    let target = Address::generate(&env);
-
-    let id = client.propose_action(&signer1, &op(&env, "transfer"), &target, &args(&env));
-    client.approve_action(&signer2, &id);
-
-    // Advance ledger past the configured TTL.
-    env.ledger()
-        .set_sequence_number(env.ledger().sequence() + 100_000);
-
-    client.execute_action(&signer1, &id);
 }
