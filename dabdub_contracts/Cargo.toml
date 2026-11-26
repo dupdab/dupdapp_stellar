@@ -3,10 +3,42 @@ resolver = "2"
 members = [
     "contracts/*",
     "integration-tests",
+    "test-utils",
 ]
 
 [workspace.dependencies]
 soroban-sdk = { version = "22.0.0" }
+
+# Feature flags
+#
+# The workspace itself does not define any features; feature flags are declared
+# per-contract in each `contracts/*/Cargo.toml`. CI runs the test suite twice:
+# once with default features and once with `--all-features` so that
+# feature-gated code paths are compiled and tested.
+#
+# To exercise a specific combination locally, run from this directory:
+#   cargo test                          # default features
+#   cargo test --all-features           # every feature enabled
+#   cargo test -p <contract> --features <feature>
+
+# Code coverage (issue #1603)
+#
+# Coverage is enforced PER CONTRACT, not workspace-wide: a well-tested contract
+# must not mask a poorly tested one. CI iterates over every crate under
+# `contracts/*` and runs tarpaulin for each crate individually, failing the job
+# when any single contract falls below the threshold below. The same threshold
+# is consumed by `.github/workflows/ci.yml` (via `COVERAGE_THRESHOLD`) so the
+# value lives in one place.
+#
+# To reproduce locally, from this directory:
+#   cargo tarpaulin --out Xml --out Html --output-dir target/coverage/<contract> \
+#       -p <contract>
+[workspace.metadata.coverage]
+# Minimum line coverage percentage required for EACH contract crate.
+per-contract-threshold = 80
+# Directory (relative to this file) whose immediate subdirectories are the
+# contract crates that must each meet the threshold above.
+contracts-dir = "contracts"
 
 [profile.release]
 opt-level = "z"

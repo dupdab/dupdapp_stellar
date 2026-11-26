@@ -4,11 +4,24 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly scheduled audit so vulnerable dependencies are detected even when
+  # no code changes land. The `cargo-audit` job below runs on this schedule.
+  schedule:
+    - cron: '0 6 * * 1'
 
-jobs:
-  unit-tests:
-    name: Unit tests
+      - name: Install Clarinet
+        run: |
+          curl -sSL https://github.com/hirosystems/clarinet/releases/latest/download/clarinet-linux-x64.tar.gz | tar -xz
+          sudo mv clarinet /usr/local/bin/clarinet
+      - name: Run unit tests
+        run: clarinet test
+
+  integration-tests:
+    name: Integration tests (payment_escrow + mer
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dabdub_contracts
     steps:
       - uses: actions/checkout@v4
       - name: Install Clarinet
@@ -37,7 +50,134 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
       - name: Run batch_payments instruction benchmark
         working-directory: dabdub_contracts
         run: |
           cargo test -p batch_payments benchmark_max_batch_instruction_usage -- --nocapture --exact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run batch_payments instruction benchmark
+        working-directory: dabdub_contracts
+        run: |
+          cargo test -p batch_payments benchmark_max_batch_instruction_usage -- --nocapture --exact
+
+  # Deploys every contract to Stellar testnet, runs the integration test suite
+  # against the deployed instances, then tears the test contracts down. Only
+  # runs on merges to main so testnet is not polluted by every PR. Cleanup uses
+  # `always()` so test contracts are removed even when deploy or tests fail.
+  testnet-integration:
+    name: Testnet integration tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      STELLAR_NETWORK: testnet
+      STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+      STELLAR_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+      STELLAR_ACCOUNT: ci-testnet-deployer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
+      - name: Install Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | bash -s -- --version 22.0.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Builds every workspace contract to optimised wasm so the same artifacts
+      # that ship to production are the ones exercised on testnet.
+      - name: Build optimised WASM
+        run: make build-optimised
+
+      # Restores the funded testnet deployer identity from a secret. The secret
+      # key must be a funded testnet account; it is never logged.
+      - name: Configure testnet deployer identity
+        env:
+          TESTNET_DEPLOYER_SECRET: ${{ secrets.TESTNET_DEPLOYER_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TESTNET_DEPLOYER_SECRET:-}" ]; then
+            echo "::error::TESTNET_DEPLOYER_SECRET is not configured"
+            exit 1
+          fi
+          stellar keys add "$STELLAR_ACCOUNT" --secret-key "$TESTNET_DEPLOYER_SECRET"
+
+      # Deploys every contract and records the resulting contract IDs so the
+      # integration suite and the teardown step can reference them.
+      - name: Deploy contracts to testnet
+        run: |
+          set -euo pipefail
+          : > testnet-contract-ids.txt
+          for contract in admin_auth admin_timelock batch_payments fee_calculator fee_distributor liquidity_router; do
+            wasm="dabdub_contracts/target/wasm32v1-none/release/${contract}.wasm"
+            if [ ! -f "$wasm" ]; then
+              echo "::error::Missing wasm for $contract at $wasm"
+              exit 1
+            fi
+            id=$(stellar contract deploy \
+              --wasm "$wasm" \
+              --source "$STELLAR_ACCOUNT" \
+              --network "$STELLAR_NETWORK")
+            echo "${contract}=${id}" | tee -a testnet-contract-ids.txt
+          done
+
+      - name: Run integration tests against testnet
+        env:
+          TESTNET_CONTRACT_IDS_FILE: testnet-contract-ids.txt
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path dabdub_contracts/Cargo.toml \
+            --features testnet-integration \
+            --test testnet_integration \
+            -- --nocapture
+
+      # Removes the test contracts deployed above. Runs even when deploy or the
+      # integration suite failed so testnet is not left with orphan contracts.
+      - name: Tear down testnet contracts
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f testnet-contract-ids.txt ]; then
+            echo "No deployed contracts to tear down."
+            exit 0
+          fi
+          while IFS='=' read -r contract id; do
+            [ -z "$id" ] && continue
+            echo "Removing ${contract} (${id})"
+            stellar contract invoke \
+              --id "$id" \
+              --source "$STELLAR_ACCOUNT" \
+              --network "$STELLAR_NETWORK" \
+              -- __teardown || true
+          done < testnet-contract-ids.txt
+
+  # Reports per-contract WASM sizes on pull requests so size regressions are
+  # visible during review instead of only at deploy time. Fails the PR when any
+  # contract exceeds its per-contract budget defined in the Makefile.
+  wasm-size-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+

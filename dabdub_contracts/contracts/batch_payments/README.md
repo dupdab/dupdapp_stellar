@@ -16,7 +16,7 @@ payment records are created in batches and settled downstream.
 | --- | --- | --- |
 | `Admin` | `Address` | Address allowed to configure the contract (see Admin operations). |
 | `MinAmount` / `MaxAmount` | `i128` | Inclusive allowed amount range for each payment. |
-| `MaxBatchSize` | `u32` | Configured upper bound; at most 100. |
+| `MaxBatchSize` | `u32` | Admin-configurable upper bound; defaults to 20 and is capped at 100. |
 | `Counter` | `u64` | Monotonic counter used when deriving payment ids. |
 | `Version` | `u32` | Contract ABI version. |
 | `RegistryContract` | `Address` | Optional merchant registry used to gate batch creation. |
@@ -36,7 +36,8 @@ One event is emitted per payment record.
 ## Admin operations
 
 - `init(admin, min_amount, max_amount)` — one-time setup of the administrator
-  and per-payment amount limits.
+  and per-payment amount limits. `MaxBatchSize` is initialized to the default
+  of 20.
 - `set_limits(min_amount, max_amount)` — admin-only amount-limit update.
 - `set_max_batch_size(new_max)` — admin-only limit update, capped at 100.
 - `set_registry(registry)` — admin-only; configure or clear the optional
@@ -44,11 +45,21 @@ One event is emitted per payment record.
 
 All admin entry points require `admin.require_auth()`.
 
+## Batch size enforcement
+
+Every batch is checked against the configured `MaxBatchSize` before any
+validation or storage work. A batch larger than the configured limit is
+rejected with `Error::BatchTooLarge` and the entire call reverts, so no
+partial state is written.
+
+The default limit is 20 items. The admin can raise or lower it via
+`set_max_batch_size`, but the value is capped at a hard maximum of 100 items.
+
 ## Batch size and instruction benchmark
 
-The default and hard maximum batch size is 100 items. The admin can lower the
-configured limit but cannot raise it above this ceiling. The limit is based on
-the Soroban test-host CPU instruction benchmark in
+The default batch size is 20 items and the hard maximum is 100 items. The
+admin can lower the configured limit but cannot raise it above this ceiling.
+The limit is based on the Soroban test-host CPU instruction benchmark in
 `src/test.rs::benchmark_batch_instruction_cost_per_item`, which measures the
 contract call separately from setup at 20 and 100 items. In the current test
 host run, 20 items used 849,890 instructions (42,494 per item), and 100 items
@@ -87,8 +98,9 @@ cargo test -p batch-payments benchmark_batch_instruction_cost_per_item -- --noca
 - **No token transfer.** The contract records payment instructions; settlement
   is handled by the downstream payment flow.
 - **No partial success.** A single invalid item reverts the entire batch.
-- **Batch size is bounded** by the contract's 100-item ceiling; larger payment
-  lists must be chunked across multiple transactions.
+- **Batch size is bounded** by the configured `MaxBatchSize` (default 20, hard
+  ceiling 100); larger payment lists must be chunked across multiple
+  transactions.
 - **No batch deletion.** Created payment records are immutable and have no
   admin clawback or refund path.
 
