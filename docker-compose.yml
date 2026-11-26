@@ -1,42 +1,34 @@
-version: "3"
-
-networks:
-  monitoring:
-
 services:
-  loki:
-    image: grafana/loki:latest
+  stellar:
+    image: stellar/quickstart:latest
+    container_name: dabdub-local-testnet
+    command: --local --enable-soroban-rpc
     ports:
-      - "3100:3100"
-    command: -config.file=/etc/loki/local-config.yaml
-    networks:
-      - monitoring
-
-  promtail:
-    image: grafana/promtail:latest
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/soroban/rpc", "-X", "POST", "-H", "Content-Type: application/json", "-d", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
     volumes:
-      - ./grafana/promtail-config.yaml:/etc/promtail/config.yml
-    command: -config.file=/etc/promtail/config.yml
-    networks:
-      - monitoring
-    depends_on:
-      - loki
+      - stellar-data:/opt/stellar
 
-  grafana:
-    image: grafana/grafana:latest
+  stellar-quickstart:
+    image: stellar/quickstart:latest
     ports:
-      - "3000:3000"
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
-      - grafana-data:/var/lib/grafana
+      - "8000:8000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    networks:
-      - monitoring
-    depends_on:
-      - loki
+      - NETWORK=local
+      - ENABLE_SOROBAN_RPC=true
+    volumes:
+      - stellar-quickstart-data:/opt/stellar
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/soroban/rpc"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
 volumes:
+  stellar-data:
   grafana-data:
+  stellar-quickstart-data:

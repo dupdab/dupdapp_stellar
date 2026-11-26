@@ -1,0 +1,23 @@
+# Local development environment for dabdub.
+#
+# Start everything (including a local Stellar simnet) with a single command:
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#
+# The Stellar simnet exposes the Soroban RPC on http://localhost:8000/soroban/rpc
+# and the Horizon-compatible API on http://localhost:8000. Point your local
+# stellar-cli / backend at these endpoints to test contracts without testnet.
+
+services:
+  stellar-simnet:
+    image: stellar/quickstart:latest
+    container_name: dabdub-stellar-simnet
+    command: --local
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/soroban/rpc"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped

@@ -41,6 +41,19 @@ pub struct PaymentRecord {
     pub merchant: Address,
 }
 
+/// Summary event emitted once per `create_batch` call after all individual
+/// `PaymentCreated` events have been published (issue #1485).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchCreatedEvent {
+    /// The merchant that created the batch.
+    pub merchant: Address,
+    /// Total number of payments created in this batch.
+    pub batch_size: u32,
+    /// The IDs of every payment created, in creation order.
+    pub payment_ids: Vec<BytesN<32>>,
+}
+
 #[contract]
 pub struct BatchPaymentContract;
 
@@ -93,7 +106,10 @@ impl BatchPaymentContract {
     ///
     /// Validates every input before any state is written — if any item is
     /// invalid the entire batch reverts. Emits a `PaymentCreated` event for
-    /// each created payment, matching the NestJS service event log.
+    /// each created payment, matching the NestJS service event log. After all
+    /// per-payment events, emits a single `BatchCreated` summary event
+    /// (issue #1485) so the indexer can confirm a batch in one event rather
+    /// than correlating N individual `PaymentCreated` events.
     ///
     /// Returns a `Vec<BytesN<32>>` of the created payment IDs.
     pub fn create_batch(
@@ -135,7 +151,6 @@ impl BatchPaymentContract {
 
         // ── Creation pass ─────────────────────────────────────────────────────
         let mut payment_ids: Vec<BytesN<32>> = vec![&env];
-        let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap();
 
         // Issue #1024: a monotonically increasing per-contract counter,
         // hashed together with the merchant and payment contents, so two
@@ -172,6 +187,18 @@ impl BatchPaymentContract {
 
         let final_counter = counter + count as u64;
         env.storage().instance().set(&DataKey::Counter, &final_counter);
+
+        // Emit a single BatchCreated summary event (issue #1485): the indexer
+        // can rely on this one event to confirm the entire batch, instead of
+        // correlating N individual PaymentCreated events.
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "BatchCreated"),),
+            BatchCreatedEvent {
+                merchant: merchant.clone(),
+                batch_size: count,
+                payment_ids: payment_ids.clone(),
+            },
+        );
 
         payment_ids
     }
