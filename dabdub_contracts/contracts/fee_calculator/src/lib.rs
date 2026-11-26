@@ -173,6 +173,14 @@ impl FeeCalculatorContract {
             .unwrap_or(DEFAULT_MIN_FEE_BPS)
     }
 
+    pub fn set_settlement_caller(env: Env, caller: Address, settlement_caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::SettlementCaller, &settlement_caller);
+    }
+
     pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
         env.storage()
             .instance()
@@ -212,8 +220,12 @@ impl FeeCalculatorContract {
             }
         }
 
-        let mut fee = amount
-            .checked_mul(fee_bps as i128)
+        // Fee is rounded UP (ceiling) so the platform is always favoured and a
+        // fractional-cents fee is never rounded down to zero. For positive
+        // `numerator` and `BPS_DENOMINATOR`, ceil(a / b) == (a + b - 1) / b.
+        let numerator = amount.checked_mul(fee_bps as i128).expect("overflow");
+        let mut fee = numerator
+            .checked_add(BPS_DENOMINATOR - 1)
             .expect("overflow")
             .checked_div(BPS_DENOMINATOR)
             .expect("division failure");

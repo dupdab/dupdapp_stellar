@@ -52,7 +52,7 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
 /// Lifecycle states for a registered merchant.
 #[contracttype]
@@ -117,6 +117,18 @@ const DEFAULT_FEE_BPS: u32 = 150;
 /// Upper bound on the fee rate an admin can set for a merchant: 1000 bps (10%).
 const MAX_FEE_BPS: u32 = 1000;
 
+/// Maximum combined size, in bytes, of a merchant's metadata fields. Larger
+/// payloads would create oversized ledger entries, so registration rejects them.
+const MAX_METADATA_BYTES: u32 = 1024;
+
+/// Errors surfaced by the registry.
+#[contracterror]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Error {
+    /// Merchant metadata exceeded {@link MAX_METADATA_BYTES} (1KB).
+    MetadataTooLarge = 1,
+}
+
 /// Storage keys used by the registry.
 #[contracttype]
 #[derive(Clone)]
@@ -144,11 +156,19 @@ pub enum DataKey {
 struct MerchantRegisteredEvent {
     merchant: Address,
     name: String,
+    /// The merchant's public key (the address that controls the merchant).
+    public_key: Address,
+    /// Ledger close time, in seconds, when registration happened.
+    timestamp: u64,
 }
 
 #[contracttype]
 struct MerchantSuspendedEvent {
     merchant: Address,
+    /// Why the merchant was suspended (e.g. `"suspended_by_admin"`).
+    reason: String,
+    /// Ledger close time, in seconds, when the suspension happened.
+    suspended_at: u64,
 }
 
 #[contracttype]
@@ -290,6 +310,12 @@ impl MerchantRegistryContract {
         caller.require_auth();
         Self::require_admin(&env, &caller);
 
+        // Reject oversized metadata before writing anything, so a single
+        // registration can never create an unbounded ledger entry.
+        if Self::metadata_len(&name) > MAX_METADATA_BYTES {
+            panic!("{:?}", Error::MetadataTooLarge);
+        }
+
         let key = DataKey::Merchant(merchant.clone());
         if env.storage().persistent().has(&key) {
             panic!("Merchant already registered");
@@ -324,6 +350,8 @@ impl MerchantRegistryContract {
             MerchantRegisteredEvent {
                 merchant: merchant.clone(),
                 name: name.clone(),
+                public_key: merchant.clone(),
+                timestamp: env.ledger().timestamp(),
             },
         );
     }
@@ -386,6 +414,8 @@ impl MerchantRegistryContract {
             ("REGISTRY", "merchant_suspended"),
             MerchantSuspendedEvent {
                 merchant: merchant.clone(),
+                reason: String::from_str(&env, "suspended_by_admin"),
+                suspended_at: env.ledger().timestamp(),
             },
         );
     }
@@ -534,6 +564,20 @@ impl MerchantRegistryContract {
     }
 
     /// Return the current fee tier for a merchant.
+    pub fn get_fee_tier(env: Env, 
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Queries
+    // ------------------------------------------------------------------
+
+    /// Fetch a single merchant record. Returns `None` if not registered.
+    pub fn get_merchant(env: Env, merchant: Address) -> Option<MerchantRecord> {
+        env.storage().persistent().get(&DataKey::Merchant(merchant))
+    }
+
+    /// Return the current fee tier for a merchant.
     pub fn get_fee_tier(env: Env, merchant: Address) -> u32 {
         env.storage()
             .persistent()
@@ -642,7 +686,21 @@ impl MerchantRegistryContract {
             i += 1;
         }
 
-        result
+        let start = page.min(total);
+        let end = start.saturating_add(page_size).min(total);
+        let mut i = start;
+        while i < end {
+            if let Some(addr) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::MerchantAt(i))
+            {
+                result.push_back(addr);
+            }
+            i += 1;
+        }
+
+
     }
 
     // ------------------------------------------------------------------
@@ -658,5 +716,12 @@ impl MerchantRegistryContract {
         if &admin != caller {
             panic!("Not admin");
         }
+    }
+
+    /// Combined byte length of every merchant metadata field. Today the only
+    /// metadata field is `name`; the helper exists so the limit covers all
+    /// fields as more are added.
+    fn metadata_len(name: &String) -> u32 {
+        name.len()
     }
 }

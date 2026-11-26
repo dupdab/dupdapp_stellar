@@ -218,3 +218,23 @@ fn test_fee_calculation_no_precision_loss_across_decimals() {
         assert_fee_no_precision_loss(&client, &settlement_caller, &merchant, *amount, 150);
     }
 }
+
+#[test]
+fn test_fee_rounds_up_to_favor_platform() {
+    // 100 USDC at 1.5% (150 bps) = 1.5 USDC, which must round UP to 2 USDC.
+    let (_env, client, _admin, merchant) = setup_env();
+
+    let (fee, net, bps) = client.calculate_fee(&merchant, &100);
+    assert_eq!(bps, 150);
+    assert_eq!(fee, 2);
+    assert_eq!(net, 98);
+}
+
+#[test]
+fn test_fee_ceiling_never_rounds_fractional_cent_down() {
+    // 1 USDC at 150 bps = 0.015 USDC -> rounds up to 1 (never 0).
+    let (_env, client, _admin, merchant) = setup_env();
+
+    let (fee, _net, _bps) = client.calculate_fee(&merchant, &1);
+    assert_eq!(fee, 1);
+}
