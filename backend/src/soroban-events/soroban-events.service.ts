@@ -28,16 +28,38 @@ interface RpcResponse {
   error?: { code: number; message: string };
 }
 
+interface RbacAuditEntry {
+  event: 'RoleAssigned' | 'RoleRevoked';
+  account: string;
+  role: string;
+  actor: string;
+  timestamp: number;
+}
+
 interface DeploymentEvent {
   contract_name: string;
   wasm_hash: string;
   deployer: string;
   timestamp: string;
 }
+}
 
 const INDEXER_STATE_ID = 'contract-events';
 const PAGE_SIZE = 100;
-const DEPLOYMENT_TOPIC = 'contract_deployed';
+interface RbacAuditEntry {
+  event: 'RoleAssigned' | 'RoleRevoked';
+  account: string;
+  role: string;
+  actor: string;
+  timestamp: number;
+}
+
+interface DeploymentEvent {
+  contract_name: string;
+  wasm_hash: string;
+  deployer: string;
+  timestamp: string;
+}
 
 @Injectable()
 export class SorobanEventsService {
@@ -335,6 +357,7 @@ export class SorobanEventsService {
       await this.events.upsert(page, ['id']);
 
       for (const event of result.events) {
+        this.indexRbacAuditEvent(event);
         await this.recordDeployment(event);
       }
 
@@ -346,6 +369,90 @@ export class SorobanEventsService {
       state.pagingCursor = nextCursor;
       await this.states.save(state);
     }
+  }
+
+  /**
+   * Indexes RBAC role assignment/revocation events into the audit log so that
+   * off-chain monitoring can observe permission changes made via `rbac_access`.
+   */
+  private indexRbacAuditEvent(event: RpcEvent): void {
+    const entry = this.parseRbacAuditEntry(event);
+    if (!entry) return;
+    this.logger.log(
+      `RBAC audit: ${entry.event} account=${entry.account} role=${entry.role} ` +
+        `actor=${entry.actor} timestamp=${entry.timestamp} tx=${event.txHash}`,
+    );
+  }
+
+  private parseRbacAuditEntry(event: RpcEvent): RbacAuditEntry | null {
+    const topics = Array.isArray(event.topic) ? event.topic : [];
+    const name = topics.map((topic) => this.decodeSymbol(topic)).find((topic) => topic !== null);
+    if (!name || !RBAC_EVENT_NAMES.has(name)) return null;
+
+    const value = this.decodeMap(event.value);
+    if (!value) return null;
+
+    const account = this.decodeAddress(value.account);
+    const role = this.decodeSymbol(value.role);
+    const actor = this.decodeAddress(
+      name === 'RoleAssigned' ? value.assigned_by : value.revoked_by,
+    );
+    const timestamp = this.decodeTimestamp(value.timestamp);
+    if (!account || !role || !actor || timestamp === null) return null;
+
+    return {
+      event: name as RbacAuditEntry['event'],
+      account,
+      role,
+      actor,
+      timestamp,
+    };
+  }
+
+  private decodeMap(value: unknown): Record<string, unknown> | null {
+    if (!value || typeof value !== 'object') return null;
+    if (Array.isArray(value)) {
+      const entries = value as unknown[];
+      const map: Record<string, unknown> = {};
+      for (let i = 0; i + 1 < entries.length; i += 2) {
+        const key = this.decodeSymbol(entries[i]);
+        if (key) map[key] = entries[i + 1];
+      }
+      return map;
+    }
+    return value as Record<string, unknown>;
+  }
+
+  private decodeSymbol(value: unknown): string | null {
+    if (typeof value === 'string') return value;
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if (typeof record.symbol === 'string') return record.symbol;
+      if (typeof record.value === 'string') return record.value;
+    }
+    return null;
+  }
+
+  private decodeAddress(value: unknown): string | null {
+    if (typeof value === 'string') return value;
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if (typeof record.address === 'string') return record.address;
+      if (typeof record.value === 'string') return record.value;
+    }
+    return null;
+  }
+
+  private decodeTimestamp(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim() !== '' && !Number.isNaN(Number(value))) {
+      return Number(value);
+    }
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if (record.value !== undefined) return this.decodeTimestamp(record.value);
+    }
+    return null;
   }
 
   private async getEvents(startLedger: number, cursor: string | null): Promise<GetEventsResult> {
