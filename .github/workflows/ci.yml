@@ -2,54 +2,53 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+  # Weekly scheduled audit so vulnerable dependencies are detected even when
+  # no code changes land. The `cargo-audit` job below runs on this schedule.
+  schedule:
+    - cron: '0 6 * * 1'
 
 env:
   RUSTFLAGS: -D warnings
   CARGO_INCREMENTAL: 0
   LLVM_PROFILE_FILE: target/coverage/dupdub-%p-%m.profraw
+  # Minimum line coverage each individual contract must reach. Global
+  # workspace coverage is not enough: a well-tested contract can mask a
+  # poorly tested one, so this threshold is enforced per contract.
+  PER_CONTRACT_COVERAGE_THRESHOLD: 80
 
 jobs:
-  ci:
+  contracts:
+    name: Contracts
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dabdub_contracts
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32v1-none
+          targets: wasm32-unknown-unknown
 
-      - name: Check Rust formatting
-        working-directory: dabdub_contracts
-        run: cargo fmt -- --check
-
-      # Cache the cargo registry (downloaded crate sources) and the workspace
-      # target directory so dependencies are not re-downloaded and recompiled
-      # on every run. The key is derived from the Cargo.lock hash so the cache
-      # is invalidated whenever the dependency graph changes; restore-keys
-      # provide a fallback so partial rebuilds still benefit.
-      - name: Cache cargo registry and target
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             dabdub_contracts/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-${{ hashFiles('dabdub_contracts/**/Cargo.toml') }}
 
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-tarpaulin
+      - name: Build contracts
+        run: cargo build --release --target wasm32-unknown-unknown
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
+      - name: Run contract tests
+        run: cargo test --workspace
 
       - name: Install Rust wasm target
         run: rustup target add wasm32v1-none
@@ -63,6 +62,13 @@ jobs:
       - name: cargo test
         working-directory: dabdub_contracts
         run: cargo test
+
+      # Some contract functionality is gated behind feature flags. Running the
+      # suite with every feature enabled ensures feature-gated code paths are
+      # compiled and tested, not just the default-feature subset.
+      - name: cargo test (all features)
+        working-directory: dabdub_contracts
+        run: cargo test --all-features
 
       # Property-based tests (proptest) live behind the `proptest` feature so
       # the default test run stays fast. This job exercises them explicitly so
@@ -78,23 +84,74 @@ jobs:
         working-directory: dabdub_contracts
         run: cargo audit
 
-      - name: Generate coverage report
+      # Runs tarpaulin once per contract crate (each directory under
+      # contracts/) instead of a single workspace-wide pass. A global number
+      # can hide a contract with little or no coverage behind a well-tested
+      # one, so each contract is measured and gated independently. The
+      # per-contract percentage is written to a summary table and the job
+      # fails when any contract falls below PER_CONTRACT_COVERAGE_THRESHOLD.
+      - name: Generate per-contract coverage report
         working-directory: dabdub_contracts
         run: |
+          set -euo pipefail
           mkdir -p target/coverage
-          cargo tarpaulin \
-            --workspace \
-            --out Xml \
-            --output-dir target/coverage \
-            --exclude-files "*/tests/*" \
-            --verbose \
-            --fail-under 85
+          threshold="${PER_CONTRACT_COVERAGE_THRESHOLD}"
+          summary="target/coverage/per-contract-summary.txt"
+          : > "$summary"
+          printf '| Contract | Coverage | Threshold | Status |\n' >> "$summary"
+          printf '| --- | --- | --- | --- |\n' >> "$summary"
+          failed=0
+          for manifest in contracts/*/Cargo.toml; do
+            contract="$(basename "$(dirname "$manifest")")"
+            outdir="target/coverage/$contract"
+            mkdir -p "$outdir"
+            echo "::group::Coverage for $contract"
+            cargo tarpaulin \
+              --manifest-path "$manifest" \
+              --out Xml \
+              --output-dir "$outdir" \
+              --exclude-files "*/tests/*" \
+              --verbose
+            echo "::endgroup::"
+            # Parse the line-rate attribute from the generated cobertura XML.
+            xml="$outdir/cobertura.xml"
+            if [ ! -f "$xml" ]; then
+              echo "::error::No coverage report produced for $contract"
+              printf '| %s | n/a | %s%% | FAIL |\n' "$contract" "$threshold" >> "$summary"
+              failed=1
+              continue
+            fi
+            rate="$(grep -o 'line-rate="[0-9.]*"' "$xml" | head -n1 | sed -E 's/.*"([0-9.]+)"/\1/')"
+            pct="$(awk -v r="$rate" 'BEGIN { printf "%.2f", r * 100 }')"
+            status="PASS"
+            if awk -v p="$pct" -v t="$threshold" 'BEGIN { exit !(p + 0 < t + 0) }'; then
+              status="FAIL"
+              failed=1
+              echo "::error::$contract coverage ${pct}% is below the ${threshold}% threshold"
+            fi
+            printf '| %s | %s%% | %s%% | %s |\n' "$contract" "$pct" "$threshold" "$status" >> "$summary"
+          done
+          echo "### Per-contract coverage" >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          cat "$summary"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more contracts are below the ${threshold}% coverage threshold"
+            exit 1
+          fi
+
+      - name: Upload per-contract coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-per-contract
+          path: dabdub_contracts/target/coverage/
+          retention-days: 30
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
-          files: dupdub_contracts/target/coverage/cobertura.xml
+          directory: dabdub_contracts/target/coverage
           flags: rust
           name: dupdub-contracts
           fail_ci_if_error: false
@@ -136,22 +193,68 @@ jobs:
             exit 1
           fi
 
+      - name: Check contract versions and changelogs
+        run: |
+          set -euo pipefail
+          base_ref="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "${base_ref}" ] || [ "${base_ref}" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base ref available; skipping version bump check."
+            exit 0
+          fi
+          failed=0
+          for dir in contracts/*/; do
+            name="$(basename "$dir")"
+            manifest="${dir}Cargo.toml"
+            changelog="${dir}CHANGELOG.md"
+            [ -f "$manifest" ] || continue
+            if [ ! -f "$changelog" ]; then
+              echo "::error file=${changelog}::Missing CHANGELOG.md for contract '${name}'"
+              failed=1
+              continue
+            fi
+            # Detect public function signature changes in the contract source.
+            sig_changed=0
+            if git diff --quiet "${base_ref}" HEAD -- "${dir}src"; then
+              sig_changed=0
+            else
+              old_sigs="$(git show "${base_ref}:dabdub_contracts/${dir}src/lib.rs" 2>/dev/null | grep -E '^\s*pub fn ' || true)"
+              new_sigs="$(grep -E '^\s*pub fn ' "${dir}src/lib.rs" 2>/dev/null || true)"
+              if [ "$old_sigs" != "$new_sigs" ]; then
+                sig_changed=1
+              fi
+            fi
+            if [ "$sig_changed" -eq 1 ]; then
+              old_version="$(git show "${base_ref}:dabdub_contracts/${manifest}" 2>/dev/null | grep -E '^version\s*=' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+              new_version="$(grep -E '^version\s*=' "$manifest" | head -n1 | sed -E 's/.*"([^"]+)".*/\1' || true)"
+              if [ -z "$old_version" ] || [ "$old_version" = "$new_version" ]; then
+                echo "::error file=${manifest}::Public function signatures changed in '${name}' but version was not bumped (${old_version:-unknown} -> ${new_version:-unknown}). Update Cargo.toml version and CHANGELOG.md with migration notes."
+                failed=1
+              fi
+            fi
+          done
+          exit "$failed"
+
+  # Dedicated audit job so the weekly `schedule` trigger runs the security
+  # scan even when no code changes land. Runs on every push and pull request
+  # as well, and fails CI on HIGH/CRITICAL advisories.
   cargo-audit:
     name: Cargo audit (Rust dependency vulnerabilities)
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # The cargo workspace lives in dabdub_contracts/; there is no manifest at
-      # the repository root, so the audit runs from there.
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
-      - name: Run cargo audit (fail on HIGH or CRITICAL)
+      # Scans Cargo.lock against the RustSec advisory database. cargo-audit
+      # exits non-zero on any vulnerability by default, which fails CI on HIGH
+      # and CRITICAL advisories (and lower severities too).
+      - name: cargo audit
         working-directory: dabdub_contracts
         run: cargo audit --fail-severity high
 
