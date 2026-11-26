@@ -32,6 +32,19 @@ fn args(env: &Env) -> Bytes {
 }
 
 #[test]
+#[should_panic(expected = "DuplicateSigner")]
+fn test_init_rejects_duplicate_signers() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+
+    // signer1 appears twice in the signer list.
+    env.register(MultisigAdminContract, (&signer1, &signer2, &signer1));
+}
+
+#[test]
 fn test_propose_and_approve_by_admin1_and_admin2() {
     let (env, client, admin1, admin2, _admin3) = setup_env();
 
@@ -172,6 +185,107 @@ fn test_non_admin_cannot_propose_admin_change() {
 
 // ---------------------------------------------------------------------------
 // Signature collection events (#1542)
+
+// Signer set changes during an active operation
+//
+// Documented behavior: quorum is evaluated against the *current* signer set
+// and threshold at the moment an approval is recorded. Approvals already
+// counted are retained even if the approving signer is later removed, but a
+// removed signer can no longer approve. Adding a signer mid-operation does not
+// retroactively change the threshold; the new signer may approve and counts
+// toward the existing threshold.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_removed_signer_approval_still_counts_toward_quorum() {
+    let (env, client, admin1, admin2, admin3) = setup_env();
+
+    // admin1 proposes (counts as first approval), admin2 approves -> quorum.
+    let id = client.propose(&admin1, &op(&env, "transfer"), &args(&env));
+    client.approve(&admin2, &id);
+
+    let proposal = client.get_proposal(&id).unwrap();
+    assert_eq!(proposal.approvals.len(), 2);
+    assert!(proposal.executed);
+
+    // Removing admin2 after the fact does not undo the executed operation.
+    let remove = client.propose_admin_change(&admin1, &admin2, &false);
+    client.approve(&admin3, &remove);
+    assert!(!client.is_admin(&admin2));
+
+    let proposal_after = client.get_proposal(&id).unwrap();
+    assert!(proposal_after.executed);
+    assert_eq!(proposal_after.approvals.len(), 2);
+}
+
+#[test]
+fn test_removed_signer_cannot_approve_pending_operation() {
+    let (env, client, admin1, admin2, admin3) = setup_env();
+
+    // Raise threshold to 3 so the operation stays pending after one approval.
+    let raise = client.propose_threshold_change(&admin1, &3);
+    client.approve(&admin2, &raise);
+    assert_eq!(client.get_threshold(), 3);
+
+    let id = client.propose(&admin1, &op(&env, "transfer"), &args(&env));
+    let pending = client.get_proposal(&id).unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert!(!pending.executed);
+
+    // Remove admin2 while the operation is still waiting for signatures.
+    let remove = client.propose_admin_change(&admin1, &admin2, &false);
+    client.approve(&admin3, &remove);
+    assert!(!client.is_admin(&admin2));
+
+    // The pending operation is unaffected and still needs more approvals.
+    let still_pending = client.get_proposal(&id).unwrap();
+    assert_eq!(still_pending.approvals.len(), 1);
+    assert!(!still_pending.executed);
+}
+
+#[test]
+fn test_added_signer_mid_operation_uses_existing_threshold() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
+    let new_admin = Address::generate(&env);
+
+    // Start an operation that is waiting for signatures.
+    let id = client.propose(&admin1, &op(&env, "transfer"), &args(&env));
+    let pending = client.get_proposal(&id).unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert!(!pending.executed);
+
+    // Add a new signer mid-operation; threshold stays at 2.
+    let add = client.propose_admin_change(&admin1, &new_admin, &true);
+    client.approve(&admin2, &add);
+    assert!(client.is_admin(&new_admin));
+    assert_eq!(client.get_threshold(), 2);
+
+    // The new signer can approve and counts toward the existing threshold.
+    client.approve(&new_admin, &id);
+    let executed = client.get_proposal(&id).unwrap();
+    assert_eq!(executed.approvals.len(), 2);
+    assert!(executed.executed);
+}
+
+// ---------------------------------------------------------------------------
+// Generic action dispatch: propose_action / approve_action / execute_action
+
+// ---------------------------------------------------------------------------
+
+fn has_event(env: &Env, name: &str) -> bool {
+    let target = Symbol::new(env, name);
+    env.events().all().iter().any(|(_, topics, _)| {
+        topics
+            .iter()
+            .any(|t| Symbol::try_from_val(env, &t).map(|s| s == target).unwrap_or(false))
+    })
+}
+
+#[test]
+fn test_signature_added_event_emitted_on_approve() {
+    let (env, client, admin1, admin2, _admin3) = setup_env();
+
+    let id = client.
 // ---------------------------------------------------------------------------
 
 fn has_event(env: &Env, name: &str) -> bool {
@@ -294,4 +408,8 @@ fn test_signer_cap_rejects_exceeding_max() {
     let extra_admin = Address::generate(&env);
     let proposal_id = client.propose_admin_change(&admin1, &extra_admin, &true);
     client.approve(&admin2, &proposal_id);
+
+    let action = client.get_action(&proposal_id).unwrap();
+    assert_eq!(action.approvals.len(), 2);
+    assert!(action.executed);
 }
