@@ -18,3 +18,8 @@ admin-timelock = { path = "../admin_timelock" }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 merchant-registry = { path = "../merchant_registry", features = ["testutils"] }
 admin-timelock = { path = "../admin_timelock", features = ["testutils"] }
+
+[[test]]
+name = "fuzz_input_validation"
+path = "tests/fuzz_input_validation.rs"
+harness = false

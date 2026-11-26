@@ -22,4 +22,22 @@ export class SorobanIndexedEvent {
 
   @Column({ type: 'jsonb' })
   rawEvent: Record<string, unknown>;
+
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  eventType: string | null;
+
+  @Column({ type: 'varchar', length: 128, nullable: true })
+  contractName: string | null;
+
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  wasmHash: string | null;
+
+  @Column({ type: 'varchar', length: 56, nullable: true })
+  deployer: string | null;
+
+  @Column({ type: 'varchar', length: 16, nullable: true })
+  network: string | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  deployedAt: Date | null;
 }

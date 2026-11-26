@@ -424,3 +424,104 @@ fn test_fee_deducted_before_swap() {
     let net_in = amount_in - fee;
     assert_eq!(net_in, 997);
 }
+
+// Issue #1515: slippage tolerance is enforced by the contract itself.
+#[test]
+fn test_slippage_within_tolerance_routes() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+    // 1% slippage against a 2% tolerance
+    let route = client.check_and_route_with_slippage(&pool, &1_000, &10_000_000, &9_900_000, &200, &env.ledger().timestamp());
+    assert_eq!(route, Route::SorobanAMM);
+}
+
+#[test]
+fn test_slippage_exceeded_rejected() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+    // 5% slippage against a 2% tolerance
+    let res = client.try_check_and_route_with_slippage(&pool, &1_000, &10_000_000, &9_500_000, &200, &env.ledger().timestamp());
+    assert_eq!(res, Err(Ok(Error::SlippageExceeded)));
+}
+
+// Issue #1516: circuit breaker opens after 5 consecutive failures.
+#[test]
+fn test_circuit_opens_after_five_failures_and_reenables() {
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+
+    for _ in 0..4 {
+        client.record_route_failure(&admin, &Route::SorobanAMM);
+    }
+    assert!(!client.is_route_disabled(&Route::SorobanAMM));
+    client.record_route_failure(&admin, &Route::SorobanAMM);
+    assert!(client.is_route_disabled(&Route::SorobanAMM));
+
+    let res = client.try_check_and_route_with_slippage(&pool, &1_000, &10_000_000, &10_000_000, &100, &env.ledger().timestamp());
+    assert_eq!(res, Err(Ok(Error::RouteDisabled)));
+
+    client.reenable_route(&admin, &Route::SorobanAMM);
+    assert!(!client.is_route_disabled(&Route::SorobanAMM));
+    assert_eq!(client.get_route_failures(&Route::SorobanAMM), 0);
+}
+
+#[test]
+fn test_success_resets_failure_streak() {
+    let (_env, client, admin) = setup();
+    client.record_route_failure(&admin, &Route::StellarClassicDEX);
+    client.record_route_success(&admin, &Route::StellarClassicDEX);
+    assert_eq!(client.get_route_failures(&Route::StellarClassicDEX), 0);
+}
+
+#[test]
+fn test_record_route_failure_non_admin_rejected() {
+    let (env, client, _admin) = setup();
+    let other = Address::generate(&env);
+    let res = client.try_record_route_failure(&other, &Route::SorobanAMM);
+    assert_eq!(res, Err(Ok(Error::NotAdmin)));
+}
+
+// Issue #1517: oracle freshness validation.
+#[test]
+fn test_stale_oracle_price_rejected() {
+    use soroban_sdk::testutils::Ledger;
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+    client.set_max_oracle_age_seconds(&admin, &60);
+    env.ledger().set_timestamp(10_000);
+
+    // 61 seconds old -> stale
+    let res = client.try_check_and_route_with_slippage(&pool, &1_000, &10_000_000, &10_000_000, &100, &9_939);
+    assert_eq!(res, Err(Ok(Error::OraclePriceTooOld)));
+
+    // exactly 60 seconds old -> fresh
+    let route = client.check_and_route_with_slippage(&pool, &1_000, &10_000_000, &10_000_000, &100, &9_940);
+    assert_eq!(route, Route::SorobanAMM);
+}
+
+#[test]
+fn test_set_max_oracle_age_non_admin_rejected() {
+    let (env, client, _admin) = setup();
+    let other = Address::generate(&env);
+    let res = client.try_set_max_oracle_age_seconds(&other, &60);
+    assert_eq!(res, Err(Ok(Error::NotAdmin)));
+}
+
+// Issue #1518: RouteSelected event carries route id, rate and amounts.
+#[test]
+fn test_route_selected_event_emitted() {
+    use soroban_sdk::{testutils::Events, IntoVal};
+    let (env, client, admin) = setup();
+    let pool = env.register(MockAmm, ());
+    client.add_pool(&admin, &pool);
+    client.check_and_route_with_slippage(&pool, &1_000, &10_000_000, &20_000_000, &100, &env.ledger().timestamp());
+
+    let expected = RouteSelected { route_id: 0, rate: 20_000_000, amount_in: 1_000, amount_out: 2_000 };
+    let events = env.events().all();
+    let found = events.iter().any(|(_, _, data)| data == expected.clone().into_val(&env));
+    assert!(found);
+}

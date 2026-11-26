@@ -28,6 +28,12 @@ pub enum DataKey {
     DepthThresholdBps,
     // Issue #1223: Address of the slippage_protection contract
     SlippageProtection,
+    // Issue #1516: Consecutive failure count per route
+    RouteFailures(Route),
+    // Issue #1516: Circuit-breaker flag per route (true = disabled)
+    RouteDisabled(Route),
+    // Issue #1517: Admin-configurable max oracle price age in seconds
+    MaxOracleAgeSeconds,
 }
 
 #[contracttype]
@@ -50,6 +56,18 @@ pub struct PoolAddedEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PoolRemovedEvent {
     pub pool_id: Address,
+}
+
+// Issue #1518: Event emitted when a route is selected for a conversion so the
+// backend can audit which route was used and at what rate.
+// route_id: 0 = SorobanAMM, 1 = StellarClassicDEX. rate is scaled by RATE_SCALE.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteSelected {
+    pub route_id: u32,
+    pub rate: i128,
+    pub amount_in: i128,
+    pub amount_out: i128,
 }
 
 #[soroban_sdk::contractclient(name = "AmmClient")]
@@ -78,6 +96,38 @@ pub trait TokenInterface {
     fn balance(env: Env, id: Address) -> i128;
     fn transfer(env: Env, from: Address, to: Address, amount: i128);
 }
+
+// Issue #1515: Contract-level errors returned by the slippage-aware routing entrypoint.
+#[soroban_sdk::contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    SlippageExceeded = 1,
+    InvalidInput = 2,
+    // Issue #1516
+    NotAdmin = 3,
+    RouteDisabled = 4,
+    // Issue #1517
+    OraclePriceTooOld = 5,
+}
+
+// Issue #1517: Default max oracle age (5 minutes) used until the admin configures one.
+const DEFAULT_MAX_ORACLE_AGE_SECONDS: u64 = 300;
+
+// Issue #1516: Consecutive failures after which a route's circuit opens.
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+
+fn require_router_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    admin.require_auth();
+    let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+    match stored_admin {
+        Some(a) if a == *admin => Ok(()),
+        _ => Err(Error::NotAdmin),
+    }
+}
+
+// Issue #1515: Fixed-point scale for quoted/actual rates (7 decimals, as on Stellar).
+const RATE_SCALE: i128 = 10_000_000;
 
 #[contract]
 pub struct LiquidityRouter;
@@ -377,5 +427,139 @@ impl LiquidityRouter {
             );
             Route::StellarClassicDEX
         }
+    }
+
+    /// Issue #1515: Slippage-enforcing variant of `check_and_route`. The caller
+    /// supplies the quoted rate, the actual rate and `max_slippage_bps`; the
+    /// contract itself rejects the route with `Error::SlippageExceeded` when the
+    /// actual rate is worse than the quote by more than the tolerance, so the
+    /// backend cannot bypass protection. Rates are scaled by `RATE_SCALE`.
+    pub fn check_and_route_with_slippage(
+        env: Env,
+        pool_address: Address,
+        amount_in: i128,
+        quoted_rate: i128,
+        actual_rate: i128,
+        max_slippage_bps: u32,
+        oracle_timestamp: u64,
+    ) -> Result<Route, Error> {
+        // Issue #1517: Reject stale oracle prices before routing.
+        Self::validate_oracle_freshness(env.clone(), oracle_timestamp)?;
+        if amount_in <= 0 || quoted_rate <= 0 || actual_rate <= 0 || max_slippage_bps > 10_000 {
+            return Err(Error::InvalidInput);
+        }
+        if actual_rate < quoted_rate {
+            let slippage_bps = (quoted_rate - actual_rate) * 10_000 / quoted_rate;
+            if slippage_bps > (max_slippage_bps as i128) {
+                return Err(Error::SlippageExceeded);
+            }
+        }
+        let route = Self::check_and_route(env.clone(), pool_address, amount_in);
+        // Issue #1516: Refuse a route whose circuit breaker is open.
+        if Self::is_route_disabled(env, route.clone()) {
+            return Err(Error::RouteDisabled);
+        }
+        // Issue #1518: Emit the selected route, executed rate and amounts.
+        let route_id: u32 = match route {
+            Route::SorobanAMM => 0,
+            Route::StellarClassicDEX => 1,
+        };
+        env.events().publish(
+            (Symbol::new(&env, "RouteSelected"),),
+            RouteSelected {
+                route_id,
+                rate: actual_rate,
+                amount_in,
+                amount_out: amount_in * actual_rate / RATE_SCALE,
+            },
+        );
+        Ok(route)
+    }
+
+    /// Issue #1517: Admin-gated setter for the maximum accepted oracle price age.
+    pub fn set_max_oracle_age_seconds(env: Env, admin: Address, seconds: u64) -> Result<(), Error> {
+        require_router_admin(&env, &admin)?;
+        if seconds == 0 {
+            return Err(Error::InvalidInput);
+        }
+        env.storage().instance().set(&DataKey::MaxOracleAgeSeconds, &seconds);
+        env.events()
+            .publish(("LIQUIDITY_ROUTER", "max_oracle_age_updated"), (seconds,));
+        Ok(())
+    }
+
+    /// Issue #1517: Currently configured max oracle age in seconds.
+    pub fn get_max_oracle_age_seconds(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxOracleAgeSeconds)
+            .unwrap_or(DEFAULT_MAX_ORACLE_AGE_SECONDS)
+    }
+
+    /// Issue #1517: Returns `Error::OraclePriceTooOld` when `oracle_timestamp`
+    /// is older than `max_oracle_age_seconds` relative to the ledger time.
+    pub fn validate_oracle_freshness(env: Env, oracle_timestamp: u64) -> Result<(), Error> {
+        let max_age = Self::get_max_oracle_age_seconds(env.clone());
+        let age = env.ledger().timestamp().saturating_sub(oracle_timestamp);
+        if age > max_age {
+            return Err(Error::OraclePriceTooOld);
+        }
+        Ok(())
+    }
+
+    /// Issue #1516: Whether the circuit breaker for `route` is open.
+    pub fn is_route_disabled(env: Env, route: Route) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::RouteDisabled(route))
+            .unwrap_or(false)
+    }
+
+    /// Issue #1516: Consecutive failure count currently tracked for `route`.
+    pub fn get_route_failures(env: Env, route: Route) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RouteFailures(route))
+            .unwrap_or(0)
+    }
+
+    /// Issue #1516: Records a failed execution on `route` (admin/backend
+    /// reporter). After `MAX_CONSECUTIVE_FAILURES` consecutive failures the
+    /// route is disabled and a `route_circuit_open` event is emitted.
+    pub fn record_route_failure(env: Env, admin: Address, route: Route) -> Result<u32, Error> {
+        require_router_admin(&env, &admin)?;
+        let failures = Self::get_route_failures(env.clone(), route.clone()) + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::RouteFailures(route.clone()), &failures);
+        if failures >= MAX_CONSECUTIVE_FAILURES
+            && !Self::is_route_disabled(env.clone(), route.clone())
+        {
+            env.storage()
+                .instance()
+                .set(&DataKey::RouteDisabled(route.clone()), &true);
+            env.events().publish(
+                ("LIQUIDITY_ROUTER", "route_circuit_open"),
+                (route, failures),
+            );
+        }
+        Ok(failures)
+    }
+
+    /// Issue #1516: Records a successful execution, resetting the failure streak.
+    pub fn record_route_success(env: Env, admin: Address, route: Route) -> Result<(), Error> {
+        require_router_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::RouteFailures(route), &0u32);
+        Ok(())
+    }
+
+    /// Issue #1516: Admin re-enables a route and clears its failure count.
+    pub fn reenable_route(env: Env, admin: Address, route: Route) -> Result<(), Error> {
+        require_router_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::RouteDisabled(route.clone()), &false);
+        env.storage().instance().set(&DataKey::RouteFailures(route.clone()), &0u32);
+        env.events()
+            .publish(("LIQUIDITY_ROUTER", "route_reenabled"), (route,));
+        Ok(())
     }
 }

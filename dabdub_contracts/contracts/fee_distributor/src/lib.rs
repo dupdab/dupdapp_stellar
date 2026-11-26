@@ -2,7 +2,10 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env,
+    Vec,
+};
 
 const BPS_DENOMINATOR: i128 = 10_000;
 const MAX_FEE_RECIPIENTS: u32 = 10;
@@ -29,6 +32,15 @@ pub struct PendingRecipientUpdate {
     pub execute_after: u32,
 }
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    InvalidRecipient = 1,
+    SharesMustSum100Percent = 2,
+    TooManyRecipients = 3,
+}
+
 #[contracttype]
 enum DataKey {
     Admin,
@@ -36,12 +48,24 @@ enum DataKey {
     UsdcToken,
     AllowedCaller,
     PendingRecipients,
+    AllowedRecipient(Address),
+    MaxRecipients,
 }
 
 #[contracttype]
 struct FeeDistributedEvent {
     total_amount: i128,
     payouts: Vec<FeePayout>,
+}
+
+/// Emitted once per recipient transfer so indexers can track fee flows
+/// without diffing contract state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeDistributed {
+    pub recipient: Address,
+    pub amount: i128,
+    pub payment_id: u64,
 }
 
 #[contract]
@@ -56,7 +80,7 @@ impl FeeDistributorContract {
         usdc_token: Address,
         allowed_caller: Address,
     ) {
-        Self::validate_recipients(&recipients);
+        Self::validate_recipients(&env, &recipients);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -67,11 +91,28 @@ impl FeeDistributorContract {
         env.storage()
             .instance()
             .set(&DataKey::AllowedCaller, &allowed_caller);
+        // Seed the allowlist with the initial recipients.
+        for recipient in recipients.iter() {
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedRecipient(recipient.address), &true);
+        }
     }
 
     /// Pull and split a fee atomically. The final recipient receives any
     /// integer-division remainder so the full amount is always distributed.
     pub fn distribute(env: Env, caller: Address, total_amount: i128) {
+        Self::distribute_for_payment(env, caller, total_amount, 0)
+    }
+
+    /// Same as `distribute`, tagging each per-recipient `FeeDistributed`
+    /// event with the originating `payment_id`.
+    pub fn distribute_for_payment(
+        env: Env,
+        caller: Address,
+        total_amount: i128,
+        payment_id: u64,
+    ) {
         caller.require_auth();
         Self::require_allowed_caller(&env, &caller);
         assert!(total_amount > 0, "total_amount must be > 0");
@@ -81,6 +122,11 @@ impl FeeDistributorContract {
             .instance()
             .get(&DataKey::Recipients)
             .expect("recipients not configured");
+        for recipient in recipients.iter() {
+            if !Self::is_allowed_recipient(env.clone(), recipient.address) {
+                panic_with_error!(&env, Error::InvalidRecipient);
+            }
+        }
         let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
         let token = token::Client::new(&env, &usdc_token);
         let contract_address = env.current_contract_address();
@@ -99,6 +145,14 @@ impl FeeDistributorContract {
 
             if payout_amount > 0 {
                 token.transfer(&contract_address, &recipient.address, &payout_amount);
+                env.events().publish(
+                    ("FEE_DISTRIBUTOR", "FeeDistributed"),
+                    FeeDistributed {
+                        recipient: recipient.address.clone(),
+                        amount: payout_amount,
+                        payment_id,
+                    },
+                );
             }
             distributed = distributed
                 .checked_add(payout_amount)
@@ -128,7 +182,7 @@ impl FeeDistributorContract {
     pub fn schedule_recipients(env: Env, caller: Address, recipients: Vec<FeeRecipient>) {
         caller.require_auth();
         Self::require_admin(&env, &caller);
-        Self::validate_recipients(&recipients);
+        Self::validate_recipients(&env, &recipients);
         let execute_after = env
             .ledger()
             .sequence()
@@ -189,6 +243,34 @@ impl FeeDistributorContract {
             .publish(("FEE_DISTRIBUTOR", "recipients_update_cancelled"), ());
     }
 
+    /// Add an address to the recipient allowlist. Admin-only.
+    pub fn add_allowed_recipient(env: Env, caller: Address, recipient: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedRecipient(recipient.clone()), &true);
+        env.events()
+            .publish(("FEE_DISTRIBUTOR", "recipient_allowed"), recipient);
+    }
+
+    /// Remove an address from the recipient allowlist. Admin-only.
+    pub fn remove_allowed_recipient(env: Env, caller: Address, recipient: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedRecipient(recipient.clone()));
+        env.events()
+            .publish(("FEE_DISTRIBUTOR", "recipient_disallowed"), recipient);
+    }
+
+    pub fn is_allowed_recipient(env: Env, recipient: Address) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::AllowedRecipient(recipient))
+    }
+
     /// Rotate the address permitted to invoke `distribute`. Admin-only.
     pub fn set_allowed_caller(env: Env, caller: Address, allowed_caller: Address) {
         caller.require_auth();
@@ -211,6 +293,22 @@ impl FeeDistributorContract {
             .publish(("FEE_DISTRIBUTOR", "admin_updated"), (previous, new_admin));
     }
 
+    /// Set the maximum number of fee recipients (default 10). Admin-only.
+    pub fn set_max_recipients(env: Env, caller: Address, max_recipients: u32) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        assert!(max_recipients > 0, "max recipients must be > 0");
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxRecipients, &max_recipients);
+        env.events()
+            .publish(("FEE_DISTRIBUTOR", "max_recipients_updated"), max_recipients);
+    }
+
+    pub fn get_max_recipients(env: Env) -> u32 {
+        Self::max_recipients(&env)
+    }
+
     pub fn get_recipients(env: Env) -> Vec<FeeRecipient> {
         env.storage()
             .instance()
@@ -229,8 +327,11 @@ impl FeeDistributorContract {
             .unwrap()
     }
 
-    fn validate_recipients(recipients: &Vec<FeeRecipient>) {
-        if recipients.len() == 0 || recipients.len() > MAX_FEE_RECIPIENTS {
+    fn validate_recipients(env: &Env, recipients: &Vec<FeeRecipient>) {
+        if recipients.len() > Self::max_recipients(env) {
+            panic_with_error!(env, Error::TooManyRecipients);
+        }
+        if recipients.len() == 0 {
             panic!(
                 "recipient count must be between 1 and {}",
                 MAX_FEE_RECIPIENTS
@@ -251,8 +352,15 @@ impl FeeDistributorContract {
                 .expect("recipient share total overflow");
         }
         if total_share != BPS_DENOMINATOR as u32 {
-            panic!("recipient shares must total 10000 bps");
+            panic_with_error!(env, Error::SharesMustSum100Percent);
         }
+    }
+
+    fn max_recipients(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxRecipients)
+            .unwrap_or(MAX_FEE_RECIPIENTS)
     }
 
     fn share_amount(amount: i128, share_bps: u32) -> i128 {
