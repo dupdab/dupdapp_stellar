@@ -149,12 +149,6 @@ impl FeeCalculatorContract {
             .unwrap_or(DEFAULT_MIN_FEE_BPS)
     }
 
-    pub fn set_settlement_caller(env: Env, caller: Address, settlement_caller: Address) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        env.storage().instance().set(&DataKey::SettlementCaller, &settlement_caller);
-    }
-
     pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
         env.storage()
             .instance()
@@ -283,17 +277,14 @@ impl FeeCalculatorContract {
 
         for i in 0..tiers.len() {
             let tier = tiers.get(i).unwrap();
-            if tier.threshold_usdc < 0 {
-                panic!("threshold must be >= 0");
-            }
-            if tier.fee_bps > 10_000 {
-                panic!("fee_bps must be <= 10000");
-            }
             if tier.threshold_usdc <= prev_threshold {
-                panic!("thresholds must be strictly increasing");
+                panic!("tiers must be sorted by ascending threshold");
             }
             if tier.fee_bps > prev_bps {
                 panic!("fee_bps must be non-increasing");
+            }
+            if tier.fee_bps > 10_000 {
+                panic!("fee_bps must be <= 10000");
             }
             prev_threshold = tier.threshold_usdc;
             prev_bps = tier.fee_bps;
@@ -307,22 +298,16 @@ impl FeeCalculatorContract {
             .get(&DataKey::FeeTiers)
             .expect("tiers not initialized");
 
-        let len = tiers.len();
-        let mut lo: u32 = 0;
-        let mut hi: u32 = len;
-
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let tier = tiers.get(mid).unwrap();
-            if tier.threshold_usdc <= volume {
-                lo = mid + 1;
+        let mut selected = tiers.get(0).unwrap().fee_bps;
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if volume >= tier.threshold_usdc {
+                selected = tier.fee_bps;
             } else {
-                hi = mid;
+                break;
             }
         }
-
-        let idx = if lo == 0 { 0 } else { lo - 1 };
-        tiers.get(idx).unwrap().fee_bps
+        selected
     }
 
     fn update_and_get_volume(env: &Env, merchant: &Address, amount: i128) -> i128 {
@@ -345,7 +330,7 @@ impl FeeCalculatorContract {
             data.volume_usdc = 0;
         }
 
-        data.volume_usdc = data.volume_usdc.checked_add(amount).expect("overflow");
+        data.volume_usdc = data.volume_usdc.saturating_add(amount);
         env.storage().persistent().set(&key, &data);
         data.volume_usdc
     }
