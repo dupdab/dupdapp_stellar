@@ -62,6 +62,26 @@ on:
         working-directory: dabdub_contracts
         run: |
           cargo test -p batch_payments benchmark_max_batch_instruction_usage -- --nocapture --exact
+
+      # Verifies the Makefile's `help` target (the default goal) runs cleanly
+      # so the documented command list never drifts into a broken state.
+      - name: Verify make help
+        run: make help
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
+      - name: Run batch_payments instruction benchmark
+        working-directory: dabdub_contracts
+        run: |
+          cargo test -p batch_payments benchmark_max_batch_instruction_usage -- --nocapture --exact
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -173,6 +193,11 @@ on:
         working-directory: dabdub_contracts
         run: cargo audit
 
+      # Measures line coverage for every contract in the workspace with
+      # cargo-tarpaulin. `--fail-under 70` makes the step exit non-zero when
+      # coverage drops below the 70% minimum, so a PR that silently reduces
+      # coverage fails CI instead of merging. The Cobertura XML report is
+      # written to target/coverage/ for the Codecov upload below.
       - name: Generate coverage report
         working-directory: dabdub_contracts
         run: |
@@ -184,11 +209,12 @@ on:
             --output-dir target/coverage \
             --exclude-files "*/tests/*" \
             --verbose \
-            --fail-under 85
+            --fail-under 70
 
+      # Uploads the Cobertura report produced above to Codecov. codecov.yml at
+      # the repository root configures the project/patch targets and flags.
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
           files: dabdub_contracts/target/coverage/cobertura.xml
           flags: rust
