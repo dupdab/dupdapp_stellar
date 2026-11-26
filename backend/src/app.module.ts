@@ -13,6 +13,7 @@ import { SorobanIndexerState } from './soroban-events/soroban-indexer-state.enti
 import { CreateSorobanEventIndexerTables1760000000000 } from './soroban-events/soroban-events.migration';
 import { MetricsModule } from './metrics/metrics.module';
 import { SorobanIndexerLagAlertService } from './soroban-events/soroban-indexer-lag-alert.service';
+import { ContractMetricsModule } from './observability/contract-metrics.module';
 
 @Module({
   imports: [
@@ -35,6 +36,7 @@ import { SorobanIndexerLagAlertService } from './soroban-events/soroban-indexer-
     AdminModule,
     SorobanEventsModule,
     MetricsModule,
+    ContractMetricsModule,
   ],
   providers: [
     {
