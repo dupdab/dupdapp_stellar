@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{testutils::Address as _, Env, Vec};
 
 fn setup() -> (Env, AdminAuthContractClient<'static>, Address) {
     let env = Env::default();
@@ -159,4 +159,46 @@ fn test_revoke_then_readd_admin_restores_access() {
     let user = client.get_admin(&admin).unwrap();
     assert_eq!(user.role, AdminRole::SuperAdmin);
     assert!(user.active);
+}
+
+// Issue #1540 — quorum must be validated on initialization: quorum >= 1 and
+// quorum <= signers.len(). A 0-of-N threshold must be rejected.
+fn signers(env: &Env, n: u32) -> Vec<Address> {
+    let mut v = Vec::new(env);
+    for _ in 0..n {
+        v.push_back(Address::generate(env));
+    }
+    v
+}
+
+#[test]
+#[should_panic(expected = "InvalidQuorum")]
+fn test_init_rejects_zero_quorum() {
+    let (env, client, super_admin) = setup();
+    let signers = signers(&env, 3);
+    client.init_multisig(&super_admin, &signers, &0);
+}
+
+#[test]
+fn test_init_accepts_quorum_one() {
+    let (env, client, super_admin) = setup();
+    let signers = signers(&env, 3);
+    client.init_multisig(&super_admin, &signers, &1);
+    assert_eq!(client.get_quorum(), 1);
+}
+
+#[test]
+fn test_init_accepts_quorum_n() {
+    let (env, client, super_admin) = setup();
+    let signers = signers(&env, 3);
+    client.init_multisig(&super_admin, &signers, &3);
+    assert_eq!(client.get_quorum(), 3);
+}
+
+#[test]
+#[should_panic(expected = "InvalidQuorum")]
+fn test_init_rejects_quorum_above_signers() {
+    let (env, client, super_admin) = setup();
+    let signers = signers(&env, 3);
+    client.init_multisig(&super_admin, &signers, &4);
 }
