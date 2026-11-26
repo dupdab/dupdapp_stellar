@@ -7,6 +7,7 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 const DEFAULT_MIN_DELAY_SECONDS: u64 = 48 * 60 * 60;
 const MIN_GOVERNANCE_DELAY_SECONDS: u64 = 24 * 60 * 60;
 const MAX_EXECUTION_WINDOW_SECONDS: u64 = 48 * 60 * 60;
+const DEFAULT_EXECUTION_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -20,7 +21,15 @@ pub struct TimelockAction {
     pub action_id: BytesN<32>,
     pub queued_at: u64,
     pub execute_after: u64,
-    pub execute_by: u64,
+const DEFAULT_EXECUTION_WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
+const MIN_GOVERNANCE_DELAY_SECONDS: u64 = 24 * 60 * 60;
+const MAX_EXECUTION_WINDOW_SECONDS: u64 = 48 * 60 * 60;
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Error {
+    OperationExpired = 1,
+}
 }
 
 #[contracttype]
@@ -28,6 +37,7 @@ pub struct TimelockAction {
 pub enum DataKey {
     Admin,
     MinDelay,
+    ExecutionWindow,
     PendingAction(BytesN<32>),
     PendingBatch(BytesN<32>),
 }
@@ -42,6 +52,9 @@ impl AdminTimelockContract {
         env.storage()
             .instance()
             .set(&DataKey::MinDelay, &min_delay_seconds.max(DEFAULT_MIN_DELAY_SECONDS));
+        env.storage()
+            .instance()
+            .set(&DataKey::ExecutionWindow, &DEFAULT_EXECUTION_WINDOW_SECONDS);
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -55,8 +68,16 @@ impl AdminTimelockContract {
             .unwrap_or(DEFAULT_MIN_DELAY_SECONDS)
     }
 
+    pub fn get_execution_window(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ExecutionWindow)
+            .unwrap_or(DEFAULT_EXECUTION_WINDOW_SECONDS)
+    }
+
     pub fn get_max_execution_window(_env: Env) -> u64 {
         MAX_EXECUTION_WINDOW_SECONDS
+    }
     }
 
     pub fn set_min_delay(env: Env, caller: Address, min_delay_seconds: u64) {
@@ -75,12 +96,27 @@ impl AdminTimelockContract {
         Self::require_admin(&env, &caller);
         let now = env.ledger().timestamp();
         let delay = Self::get_min_delay(env.clone());
+        let window = Self::get_execution_window(env.clone());
+
         let execute_after = now.saturating_add(delay);
         let action = TimelockAction {
             action_id: action_id.clone(),
             queued_at: now,
             execute_after,
-            execute_by: execute_after.saturating_add(MAX_EXECUTION_WINDOW_SECONDS),
+            expires_at: execute_after.saturating_add(window),
+        };
+        let execute_after = now.saturating_add(delay);
+        let action = TimelockAction {
+            action_id: action_id.clone(),
+            queued_at: now,
+            execute_after,
+        let window = Self::get_execution_window(env.clone());
+        let execute_after = now.saturating_add(delay);
+        let action = TimelockAction {
+            action_id: action_id.clone(),
+            queued_at: now,
+            execute_after,
+            expires_at: execute_after.saturating_add(window),
         };
         env.storage()
             .persistent()
@@ -274,8 +310,12 @@ impl AdminTimelockContract {
             .persistent()
             .get(&key)
             .expect("pending action not found");
-        if env.ledger().timestamp() < action.execute_after {
+        let now = env.ledger().timestamp();
+        if now < action.execute_after {
             panic!("timelock has not elapsed");
+        }
+        if now > action.expires_at {
+            panic!("timelock execution window has expired");
         }
         env.storage().persistent().remove(&key);
         env.events().publish(

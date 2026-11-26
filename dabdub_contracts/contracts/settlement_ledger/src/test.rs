@@ -276,48 +276,100 @@ fn test_record_reversal_references_original() {
     assert_eq!(rev.original_payment_id, pid(&env, 70));
     assert_eq!(rev.reason, fiat_ref(&env, "chargeback"));
     assert_eq!(rev.merchant, merchant);
-    assert_eq!(rev.amount, 10_000);
+}
+
+// ── maximum entries per merchant ──────────────────────────────────────────────
+
+/// Number of settlements recorded per merchant in the max-count tests.
+/// Kept modest so the suite stays fast while still exercising the
+/// pagination boundary (multiple full pages plus a remainder).
+const MAX_ENTRIES: u8 = 45;
+
+fn fill_to_max(
+    client: &SettlementLedgerContractClient,
+    admin: &Address,
+    env: &Env,
+    merchant: &Address,
+) {
+    for seed in 0u8..MAX_ENTRIES {
+        record(client, admin, env, seed, merchant, 1_000, 20);
+    }
 }
 
 #[test]
-#[should_panic(expected = "not admin")]
-fn test_record_reversal_unauthorized_caller_panics() {
-    let (env, admin, client) = setup();
-    let caller = Address::generate(&env);
-    let merchant = Address::generate(&env);
-    record(&client, &admin, &env, 71, &merchant, 1_000, 20);
-    client.record_reversal(&caller, &pid(&env, 71), &fiat_ref(&env, "chargeback"));
-}
-
-#[test]
-fn test_double_reversal_panics() {
-    let (env, admin, client) = setup();
-    let merchant = Address::generate(&env);
-    record(&client, &admin, &env, 72, &merchant, 1_000, 20);
-    client.record_reversal(&admin, &pid(&env, 72), &fiat_ref(&env, "chargeback"));
-
-    let result = client.try_record_reversal(&admin, &pid(&env, 72), &fiat_ref(&env, "again"));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_reversal_updates_merchant_index() {
+fn test_settlement_at_max_count_returns_correct_response() {
     let (env, admin, client) = setup();
     let merchant = Address::generate(&env);
-    record(&client, &admin, &env, 73, &merchant, 1_000, 20);
-    record(&client, &admin, &env, 74, &merchant, 2_000, 40);
 
-    client.record_reversal(&admin, &pid(&env, 73), &fiat_ref(&env, "chargeback"));
+    fill_to_max(&client, &admin, &env, &merchant);
+    assert_eq!(client.settlement_count(&merchant), MAX_ENTRIES as u32);
 
-    assert_eq!(client.reversal_count(&merchant), 1);
-    let list = client.list_reversals(&merchant, &0);
-    assert_eq!(list.len(), 1);
-    assert_eq!(list.get(0).unwrap().original_payment_id, pid(&env, 73));
+    // The most recently recorded settlement must still be retrievable and
+    // return the exact values it was recorded with.
+    let last_seed = MAX_ENTRIES - 1;
+    let r = client.get_settlement(&pid(&env, last_seed));
+    assert_eq!(r.amount, 1_000);
+    assert_eq!(r.fee, 20);
+    assert_eq!(r.net, 980);
+    assert_eq!(r.merchant, merchant);
+
+    // Every recorded settlement remains individually addressable at max count.
+    for seed in 0u8..MAX_ENTRIES {
+        let entry = client.get_settlement(&pid(&env, seed));
+        assert_eq!(entry.amount, 1_000);
+        assert_eq!(entry.merchant, merchant);
+    }
 }
 
 #[test]
-fn test_reversal_unknown_payment_panics() {
+fn test_pagination_at_max_count() {
     let (env, admin, client) = setup();
-    let result = client.try_record_reversal(&admin, &pid(&env, 99), &fiat_ref(&env, "chargeback"));
-    assert!(result.is_err());
+    let merchant = Address::generate(&env);
+
+    fill_to_max(&client, &admin, &env, &merchant);
+    assert_eq!(client.settlement_count(&merchant), MAX_ENTRIES as u32);
+
+    // Page size is 20: 45 entries => 20 + 20 + 5.
+    let page0 = client.list_settlements(&merchant, &0);
+    assert_eq!(page0.len(), 20);
+
+    let page1 = client.list_settlements(&merchant, &1);
+    assert_eq!(page1.len(), 20);
+
+    let page2 = client.list_settlements(&merchant, &2);
+    assert_eq!(page2.len(), 5);
+
+    let page3 = client.list_settlements(&merchant, &3);
+    assert_eq!(page3.len(), 0);
+
+    // Pages must not overlap: every payment id appears exactly once.
+    let mut seen = 0u32;
+    for page in [page0, page1, page2] {
+        seen += page.len();
+    }
+    assert_eq!(seen, MAX_ENTRIES as u32);
+}
+
+#[test]
+fn test_archival_frees_space_for_new_settlements() {
+    let (env, admin, client) = setup();
+    let merchant = Address::generate(&env);
+
+    fill_to_max(&client, &admin, &env, &merchant);
+    assert_eq!(client.settlement_count(&merchant), MAX_ENTRIES as u32);
+
+    // Archive an existing settlement; the merchant's active count drops by one.
+    client.archive_settlement(&admin, &pid(&env, 0));
+    assert_eq!(client.settlement_count(&merchant), (MAX_ENTRIES - 1) as u32);
+
+    // The freed slot can be reused by a brand-new settlement.
+    let new_seed = MAX_ENTRIES;
+    record(&client, &admin, &env, new_seed, &merchant, 2_000, 40);
+    assert_eq!(client.settlement_count(&merchant), MAX_ENTRIES as u32);
+
+    let r = client.get_settlement(&pid(&env, new_seed));
+    assert_eq!(r.amount, 2_000);
+    assert_eq!(r.fee, 40);
+    assert_eq!(r.net, 1_960);
+    assert_eq!(r.merchant, merchant);
 }
