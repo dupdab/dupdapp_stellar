@@ -1,2 +1,19 @@
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
+
+# Reproducible WASM builds (issue #1567).
+# Force a deterministic build environment so the same source produces the
+# same WASM hash across machines and CI agents.
+[build]
+# Never embed absolute paths / machine-specific metadata in artifacts.
+rustflags = ["--remap-path-prefix", "="]
+
+[target.wasm32-unknown-unknown]
+# Deterministic codegen: disable incremental compilation artifacts and
+# keep a stable symbol/panic strategy for the release WASM output.
+rustflags = [
+  "-C", "codegen-units=1",
+  "-C", "debuginfo=0",
+  "-C", "incremental=false",
+  "--remap-path-prefix", "=",
+]

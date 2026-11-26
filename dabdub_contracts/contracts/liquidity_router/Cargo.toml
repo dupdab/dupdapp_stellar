@@ -10,6 +10,8 @@ doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
+slippage-protection = { path = "../slippage_protection" }
+merchant-registry = { path = "../merchant_registry" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
