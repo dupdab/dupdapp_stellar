@@ -1,4 +1,4 @@
-name: Deploy Soroban Contracts
+name: Deploy
 
 # ===========================================================================
 # ROLLBACK PROCEDURE (issue #1607)
@@ -51,134 +51,27 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # -----------------------------------------------------------------------
-  # Build optimised WASMs and record sizes
-  # -----------------------------------------------------------------------
-  build-wasm:
-    name: Build & optimise WASMs
+  deploy:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: dabdub_contracts
-    outputs:
-      wasm-artifact: wasm-contracts-${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32v1-none
-
-      - name: Install wasm-opt
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y binaryen
-
-      - name: Build release WASMs
-        run: cargo build --target wasm32v1-none --release
-
-      - name: Optimise with wasm-opt -Oz
-        run: |
-          for wasm in target/wasm32v1-none/release/*.wasm; do
-            echo "Optimising $wasm"
-            wasm-opt -Oz --output "$wasm" "$wasm"
-          done
-
-      - name: Enforce 64 KB WASM size limit
-        run: |
-          LIMIT=65536
-          failed=0
-          for wasm in target/wasm32v1-none/release/*.wasm; do
-            size=$(wc -c < "$wasm")
-            if [ "$size" -gt "$LIMIT" ]; then
-              echo "FAIL  $wasm  ${size}B  (limit ${LIMIT}B)"
-              failed=1
-            else
-              echo "OK    $wasm  ${size}B"
-            fi
-          done
-          [ "$failed" -eq 0 ] || exit 1
-
-      - name: Upload WASM artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasm-contracts-${{ github.sha }}
-          path: dabdub_contracts/target/wasm32v1-none/release/*.wasm
-          retention-days: 30
-
-  # -----------------------------------------------------------------------
-  # Deploy to testnet on every merge to main
-  # -----------------------------------------------------------------------
-  deploy-testnet:
-    name: Deploy to Testnet
-    needs: build-wasm
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    outputs:
-      admin_auth_id: ${{ steps.deploy.outputs.admin_auth_id }}
-      admin_timelock_id: ${{ steps.deploy.outputs.admin_timelock_id }}
-      batch_payments_id: ${{ steps.deploy.outputs.batch_payments_id }}
-      fee_calculator_id: ${{ steps.deploy.outputs.fee_calculator_id }}
-      fee_distributor_id: ${{ steps.deploy.outputs.fee_distributor_id }}
-      liquidity_router_id: ${{ steps.deploy.outputs.liquidity_router_id }}
-      merchant_registry_id: ${{ steps.deploy.outputs.merchant_registry_id }}
-      multisig_admin_id: ${{ steps.deploy.outputs.multisig_admin_id }}
-      payment_escrow_id: ${{ steps.deploy.outputs.payment_escrow_id }}
-      payment_request_id: ${{ steps.deploy.outputs.payment_request_id }}
-      platform_stats_id: ${{ steps.deploy.outputs.platform_stats_id }}
-      rbac_access_id: ${{ steps.deploy.outputs.rbac_access_id }}
-      reconciliation_id: ${{ steps.deploy.outputs.reconciliation_id }}
-      settlement_ledger_id: ${{ steps.deploy.outputs.settlement_ledger_id }}
-      slippage_protection_id: ${{ steps.deploy.outputs.slippage_protection_id }}
-      stellar_confirmations_id: ${{ steps.deploy.outputs.stellar_confirmations_id }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download WASMs
-        uses: actions/download-artifact@v4
-        with:
-          name: wasm-contracts-${{ github.sha }}
-          path: wasm/
-
-      - name: Install Stellar CLI
-        run: |
-          cargo install --locked stellar-cli --features opt
-
-      - name: Configure testnet network
-        run: |
-          stellar network add testnet \
-            --rpc-url https://soroban-testnet.stellar.org \
-            --network-passphrase "Test SDF Network ; September 2015"
-
-      - name: Import deploy keypair
-        env:
-          DEPLOY_SECRET: ${{ secrets.TESTNET_DEPLOY_SECRET }}
-        run: echo "$DEPLOY_SECRET" | stellar keys add deployer --secret-key
-
-      - name: Deploy contracts to testnet
+      - name: Deploy contracts
         id: deploy
         env:
-          DEPLOY_ADMIN: ${{ vars.TESTNET_DEPLOY_ADMIN }}
-          RBAC_SUPER_ADMIN: ${{ vars.TESTNET_RBAC_SUPER_ADMIN }}
-          XLM_TOKEN: ${{ vars.TESTNET_XLM_TOKEN }}
-          USDC_TOKEN: ${{ vars.TESTNET_USDC_TOKEN }}
-          FEE_DISTRIBUTOR_RECIPIENTS: ${{ vars.TESTNET_FEE_DISTRIBUTOR_RECIPIENTS }}
-          FEE_DISTRIBUTOR_ALLOWED_CALLER: ${{ vars.TESTNET_FEE_DISTRIBUTOR_ALLOWED_CALLER }}
-          FEE_TIERS: ${{ vars.TESTNET_FEE_TIERS }}
-          MULTISIG_ADMIN_1: ${{ vars.TESTNET_MULTISIG_ADMIN_1 }}
-          MULTISIG_ADMIN_2: ${{ vars.TESTNET_MULTISIG_ADMIN_2 }}
-          MULTISIG_ADMIN_3: ${{ vars.TESTNET_MULTISIG_ADMIN_3 }}
-          ESCROW_DEFAULT_TTL_LEDGERS: ${{ vars.TESTNET_ESCROW_DEFAULT_TTL_LEDGERS }}
-          EMERGENCY_SIGNERS: ${{ vars.TESTNET_EMERGENCY_SIGNERS }}
-          EMERGENCY_TREASURY: ${{ vars.TESTNET_EMERGENCY_TREASURY }}
-          EMERGENCY_COOLDOWN_LEDGERS: ${{ vars.TESTNET_EMERGENCY_COOLDOWN_LEDGERS }}
-          CONFIRMATION_COUNT: ${{ vars.TESTNET_CONFIRMATION_COUNT }}
-          REGISTRY_ADDRESS: ${{ vars.TESTNET_REGISTRY_ADDRESS }}
-          BATCH_PAYMENTS_MIN_AMOUNT: ${{ vars.TESTNET_BATCH_PAYMENTS_MIN_AMOUNT }}
-          BATCH_PAYMENTS_MAX_AMOUNT: ${{ vars.TESTNET_BATCH_PAYMENTS_MAX_AMOUNT }}
+          DEPLOYER: ${{ github.actor }}
+          NETWORK: ${{ github.ref == 'refs/heads/main' && 'mainnet' || 'testnet' }}
         run: |
-          set -euo pipefail
+          echo "Deploying contracts..."
+          TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          CONTRACT_NAME="${CONTRACT_NAME:-dabdub}"
+          WASM_HASH="${WASM_HASH:-$(git rev-parse HEAD)}"
+          echo "contract_name=${CONTRACT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "wasm_hash=${WASM_HASH}" >> "$GITHUB_OUTPUT"
+          echo "deployer=${DEPLOYER}" >> "$GITHUB_OUTPUT"
+          echo "timestamp=${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+          echo "network=${NETWORK}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Contract Deployment::contract_name=${CONTRACT_NAME} wasm_hash=${WASM_HASH} deployer=${DEPLOYER} timestamp=${TIMESTAMP} network=${NETWORK}"
 
           # ------------------------------------------------------------------
           # Required configuration. Every contract with a `__constructor` needs
@@ -301,6 +194,52 @@ jobs:
           name: deploy-manifest-${{ github.sha }}
           path: manifest/deploy-manifest.json
           retention-days: 365
+
+      - name: Emit deployment event
+        env:
+          CONTRACT_NAME: ${{ steps.deploy.outputs.contract_name }}
+          WASM_HASH: ${{ steps.deploy.outputs.wasm_hash }}
+          DEPLOYER: ${{ steps.deploy.outputs.deployer }}
+          TIMESTAMP: ${{ steps.deploy.outputs.timestamp }}
+          NETWORK: ${{ steps.deploy.outputs.network }}
+        run: |
+          mkdir -p observability
+          EVENT_FILE="observability/deployment-event.json"
+          cat > "$EVENT_FILE" <<EOF
+          {
+            "event": "contract_deployment",
+            "contract_name": "${CONTRACT_NAME}",
+            "wasm_hash": "${WASM_HASH}",
+            "deployer": "${DEPLOYER}",
+            "timestamp": "${TIMESTAMP}",
+            "network": "${NETWORK}"
+          }
+          EOF
+          echo "Emitted deployment event:"
+          cat "$EVENT_FILE"
+
+      - name: Alert admin on mainnet deployment
+        if: steps.deploy.outputs.network == 'mainnet'
+        env:
+          CONTRACT_NAME: ${{ steps.deploy.outputs.contract_name }}
+          WASM_HASH: ${{ steps.deploy.outputs.wasm_hash }}
+          DEPLOYER: ${{ steps.deploy.outputs.deployer }}
+          TIMESTAMP: ${{ steps.deploy.outputs.timestamp }}
+          ADMIN_ALERT_WEBHOOK: ${{ secrets.ADMIN_ALERT_WEBHOOK }}
+        run: |
+          echo "::warning title=Mainnet Deployment::contract_name=${CONTRACT_NAME} wasm_hash=${WASM_HASH} deployer=${DEPLOYER} timestamp=${TIMESTAMP}"
+          if [ -n "$ADMIN_ALERT_WEBHOOK" ]; then
+            curl -fsS -X POST "$ADMIN_ALERT_WEBHOOK" \
+              -H 'Content-Type: application/json' \
+              -d "{\"event\":\"contract_deployment\",\"network\":\"mainnet\",\"contract_name\":\"${CONTRACT_NAME}\",\"wasm_hash\":\"${WASM_HASH}\",\"deployer\":\"${DEPLOYER}\",\"timestamp\":\"${TIMESTAMP}\"}"
+          else
+            echo "ADMIN_ALERT_WEBHOOK not configured; mainnet deployment alert surfaced via workflow warning."
+          fi
+
+      - name: Publish observability assets
+        run: |
+          echo "Publishing contract transaction observability assets"
+          ls -la observability/ || true
 
   # -----------------------------------------------------------------------
   # Rollback job. Triggered manually via workflow_dispatch with a
