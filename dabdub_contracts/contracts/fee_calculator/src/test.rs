@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use crate::{FeeCalculatorContract, FeeCalculatorContractClient, FeeTier};
-use soroban_sdk::{testutils::{Address as _, Ledger}, vec, Address, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    vec, Address, Env,
+};
 
 fn setup_env() -> (Env, FeeCalculatorContractClient<'static>, Address, Address) {
     let env = Env::default();
@@ -109,4 +112,24 @@ fn test_non_admin_cannot_update_fee_tiers() {
     ];
 
     client.set_fee_tiers(&random, &new_tiers);
+}
+
+#[test]
+fn test_fee_rounds_up_to_favor_platform() {
+    // 100 USDC at 1.5% (150 bps) = 1.5 USDC, which must round UP to 2 USDC.
+    let (_env, client, _admin, merchant) = setup_env();
+
+    let (fee, net, bps) = client.calculate_fee(&merchant, &100);
+    assert_eq!(bps, 150);
+    assert_eq!(fee, 2);
+    assert_eq!(net, 98);
+}
+
+#[test]
+fn test_fee_ceiling_never_rounds_fractional_cent_down() {
+    // 1 USDC at 150 bps = 0.015 USDC -> rounds up to 1 (never 0).
+    let (_env, client, _admin, merchant) = setup_env();
+
+    let (fee, _net, _bps) = client.calculate_fee(&merchant, &1);
+    assert_eq!(fee, 1);
 }

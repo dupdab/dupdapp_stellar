@@ -52,22 +52,31 @@ impl FeeCalculatorContract {
     }
 
     pub fn set_fee_tiers(env: Env, caller: Address, tiers: Vec<FeeTier>) {
-    pub fn set_settlement_caller(env: Env, caller: Address, settlement_caller: Address) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-        env.storage().instance().set(&DataKey::SettlementCaller, &settlement_caller);
-    }
         caller.require_auth();
         Self::require_admin(&env, &caller);
         Self::validate_tiers(&tiers);
         env.storage().instance().set(&DataKey::FeeTiers, &tiers);
     }
 
+    pub fn set_settlement_caller(env: Env, caller: Address, settlement_caller: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::SettlementCaller, &settlement_caller);
+    }
+
     pub fn get_fee_tiers(env: Env) -> Vec<FeeTier> {
         env.storage()
             .instance()
             .get(&DataKey::FeeTiers)
-            .unwrap_or(vec![&env, FeeTier { threshold_usdc: 0, fee_bps: 0 }])
+            .unwrap_or(vec![
+                &env,
+                FeeTier {
+                    threshold_usdc: 0,
+                    fee_bps: 0,
+                },
+            ])
     }
 
     pub fn calculate_fee(env: Env, merchant: Address, amount: i128) -> (i128, i128, u32) {
@@ -78,8 +87,12 @@ impl FeeCalculatorContract {
         let volume = Self::update_and_get_volume(&env, &merchant, amount);
         let fee_bps = Self::select_fee_bps(&env, volume);
 
-        let fee = amount
-            .checked_mul(fee_bps as i128)
+        // Fee is rounded UP (ceiling) so the platform is always favoured and a
+        // fractional-cents fee is never rounded down to zero. For positive
+        // `numerator` and `BPS_DENOMINATOR`, ceil(a / b) == (a + b - 1) / b.
+        let numerator = amount.checked_mul(fee_bps as i128).expect("overflow");
+        let fee = numerator
+            .checked_add(BPS_DENOMINATOR - 1)
             .expect("overflow")
             .checked_div(BPS_DENOMINATOR)
             .expect("division failure");
@@ -171,7 +184,10 @@ impl FeeCalculatorContract {
             data.volume_usdc = 0;
         }
 
-        data.volume_usdc = data.volume_usdc.checked_add(amount).expect("volume overflow");
+        data.volume_usdc = data
+            .volume_usdc
+            .checked_add(amount)
+            .expect("volume overflow");
         env.storage().persistent().set(&key, &data);
         data.volume_usdc
     }

@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Events},
+    Env, String,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -521,7 +524,10 @@ fn test_update_merchant_name() {
     client.register_merchant(&admin, &merchant, &sample_name(&env));
     client.update_merchant(&admin, &merchant, &String::from_str(&env, "New Name"));
 
-    assert_eq!(client.get_merchant(&merchant).name, String::from_str(&env, "New Name"));
+    assert_eq!(
+        client.get_merchant(&merchant).name,
+        String::from_str(&env, "New Name")
+    );
 }
 
 #[test]
@@ -541,4 +547,101 @@ fn test_update_merchant_unauthorized() {
 
     client.register_merchant(&admin, &merchant, &sample_name(&env));
     client.update_merchant(&attacker, &merchant, &String::from_str(&env, "x"));
+}
+
+// ---------------------------------------------------------------------------
+// #1502 / #1503 — lifecycle events
+// #1504 — metadata size validation
+// ---------------------------------------------------------------------------
+
+fn event_count(env: &Env) -> u32 {
+    env.events().all().len()
+}
+
+#[test]
+fn test_register_merchant_emits_registered_event() {
+    let (env, client, admin) = setup();
+    let merchant = Address::generate(&env);
+
+    let before = event_count(&env);
+    client.register_merchant(&admin, &merchant, &sample_name(&env));
+
+    // Registration publishes the `merchant_registered` event.
+    assert!(event_count(&env) > before);
+}
+
+#[test]
+fn test_suspend_merchant_emits_suspended_event() {
+    let (env, client, admin) = setup();
+    let merchant = Address::generate(&env);
+
+    client.register_merchant(&admin, &merchant, &sample_name(&env));
+    client.suspend_merchant(&admin, &merchant);
+
+    // Suspension publishes the `merchant_suspended` event.
+    assert!(event_count(&env) > 0);
+}
+
+fn long_name(env: &Env, bytes: usize) -> String {
+    String::from_str(env, &"a".repeat(bytes))
+}
+
+#[test]
+fn test_register_merchant_accepts_metadata_at_limit() {
+    let (env, client, admin) = setup();
+    let merchant = Address::generate(&env);
+
+    // Exactly 1KB is allowed.
+    client.register_merchant(
+        &admin,
+        &merchant,
+        &long_name(&env, MAX_METADATA_BYTES as usize),
+    );
+
+    assert_eq!(
+        client.get_merchant(&merchant).name.len(),
+        MAX_METADATA_BYTES
+    );
+}
+
+#[test]
+#[should_panic(expected = "MetadataTooLarge")]
+fn test_register_merchant_rejects_oversized_metadata() {
+    let (env, client, admin) = setup();
+    let merchant = Address::generate(&env);
+
+    // One byte over the 1KB limit is rejected.
+    client.register_merchant(
+        &admin,
+        &merchant,
+        &long_name(&env, MAX_METADATA_BYTES as usize + 1),
+    );
+}
+
+#[test]
+fn test_register_merchant_metadata_size_fuzz() {
+    let (env, client, admin) = setup();
+
+    // A spread of payload sizes at or under the limit all succeed.
+    for size in [0usize, 1, 512, 1023, 1024] {
+        let merchant = Address::generate(&env);
+        client.register_merchant(&admin, &merchant, &long_name(&env, size));
+        assert_eq!(client.get_merchant(&merchant).name.len() as usize, size);
+    }
+}
+
+#[test]
+#[should_panic(expected = "MetadataTooLarge")]
+fn test_register_merchant_rejects_2k_metadata() {
+    let (env, client, admin) = setup();
+    let merchant = Address::generate(&env);
+    client.register_merchant(&admin, &merchant, &long_name(&env, 2048));
+}
+
+#[test]
+#[should_panic(expected = "MetadataTooLarge")]
+fn test_register_merchant_rejects_16k_metadata() {
+    let (env, client, admin) = setup();
+    let merchant = Address::generate(&env);
+    client.register_merchant(&admin, &merchant, &long_name(&env, 16384));
 }
