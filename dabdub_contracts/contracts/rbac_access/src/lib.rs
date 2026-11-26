@@ -2,7 +2,9 @@
 
 mod test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, Env, Vec};
+
+// ── Role ────────────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -13,12 +15,7 @@ pub enum Role {
     SuperAdmin,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Role(Address),
-    SuperAdminCount,
-}
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, Env, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +31,10 @@ pub struct RoleRevokedEvent {
     pub account: Address,
     pub revoked_by: Address,
 }
+
+/// Maximum number of roles that may be assigned to a single account.
+/// Issue #1534: cap roles per account to prevent unbounded storage growth.
+pub const MAX_ROLES_PER_ACCOUNT: u32 = 10;
 
 #[contract]
 pub struct RbacAccessContract;
@@ -54,6 +55,16 @@ impl RbacAccessContract {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::SuperAdmin);
 
+        // Issue #1534: enforce a maximum number of roles per account.
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoleCount(account.clone()))
+            .unwrap_or(0);
+        if current_count >= MAX_ROLES_PER_ACCOUNT {
+            panic!("too many roles");
+        }
+
         let is_new_super_admin = role == Role::SuperAdmin
             && !env
                 .storage()
@@ -63,6 +74,9 @@ impl RbacAccessContract {
         env.storage()
             .persistent()
             .set(&DataKey::Role(account.clone()), &role);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleCount(account.clone()), &(current_count + 1));
 
         if is_new_super_admin {
             let count: u32 = env
@@ -113,12 +127,25 @@ impl RbacAccessContract {
             if count <= 1 {
                 panic!("cannot revoke last super admin");
             }
-            env.storage()
-                .persistent()
-                .set(&DataKey::SuperAdminCount, &(count - 1));
+            env.storage().persistent().set(
+                &DataKey::SuperAdminCount,
+                &count.checked_sub(1).expect("SuperAdminCount underflow"),
+            );
         }
 
         env.storage().persistent().remove(&key);
+
+        // Issue #1534: decrement the per-account role count on revoke.
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoleCount(account.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::RoleCount(account.clone()),
+            &current_count.saturating_sub(1),
+        );
+
         env.events().publish(
             ("RBAC", "role_revoked"),
             RoleRevokedEvent {
@@ -133,18 +160,36 @@ impl RbacAccessContract {
     }
 
     /// Sensitive operation requiring minimum `OperationsAdmin`.
+    ///
+    /// Reference implementation of the role-gating pattern: it enforces
+    /// `require_auth()` plus the minimum role and performs no business logic.
+    /// There is intentionally no state mutation or event emission -- integrators
+    /// should model real sensitive operations on this pattern and add their own
+    /// logic after the gate.
     pub fn execute_operations_task(env: Env, caller: Address) {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::OperationsAdmin);
     }
 
     /// Sensitive operation requiring minimum `ComplianceAdmin`.
+    ///
+    /// Reference implementation of the role-gating pattern: it enforces
+    /// `require_auth()` plus the minimum role and performs no business logic.
+    /// There is intentionally no state mutation or event emission -- integrators
+    /// should model real sensitive operations on this pattern and add their own
+    /// logic after the gate.
     pub fn execute_compliance_task(env: Env, caller: Address) {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::ComplianceAdmin);
     }
 
     /// Sensitive operation requiring minimum `ReadOnly`.
+    ///
+    /// Reference implementation of the role-gating pattern: it enforces
+    /// `require_auth()` plus the minimum role and performs no business logic.
+    /// There is intentionally no state mutation or event emission -- integrators
+    /// should model real sensitive operations on this pattern and add their own
+    /// logic after the gate.
     pub fn execute_read_task(env: Env, caller: Address) {
         caller.require_auth();
         Self::require_role(&env, &caller, Role::ReadOnly);
@@ -158,11 +203,9 @@ impl RbacAccessContract {
             panic!("cannot transfer to self");
         }
 
+        // `require_role` above already guarantees the caller has an assigned
+        // role record, so no separate existence check is needed here.
         let caller_key = DataKey::Role(caller.clone());
-        if !env.storage().persistent().has(&caller_key) {
-            panic!("caller is not an admin");
-        }
-
         env.storage()
             .persistent()
             .set(&DataKey::Role(new_admin.clone()), &Role::SuperAdmin);
