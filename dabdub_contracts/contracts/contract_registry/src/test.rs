@@ -124,3 +124,34 @@ fn test_symbol_short_name_supported() {
     client.set_address(&name, &target);
     assert_eq!(client.get_address(&name), Some(target));
 }
+
+#[test]
+fn test_set_address_emits_event() {
+    let (env, client, _admin) = setup();
+    let name = String::from_str(&env, "payment_escrow");
+    let target = Address::generate(&env);
+
+    client.set_address(&name, &target);
+
+    // The registry must publish an event so off-chain consumers can react
+    // to contract ID changes without polling every entry.
+    let events = env.events().all();
+    assert!(!events.is_empty());
+}
+
+#[test]
+fn test_update_emits_event() {
+    let (env, client, _admin) = setup();
+    let name = String::from_str(&env, "payment_escrow");
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+
+    client.set_address(&name, &first);
+    let events_after_first = env.events().all().len();
+
+    client.set_address(&name, &second);
+    let events_after_update = env.events().all().len();
+
+    // An update must also emit an event, not just the initial registration.
+    assert!(events_after_update > events_after_first);
+}

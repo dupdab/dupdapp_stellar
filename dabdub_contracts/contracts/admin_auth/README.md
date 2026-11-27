@@ -10,6 +10,7 @@ Role-based authorization registry used by the other contracts in this workspace 
 
 - Admin set: the collection of addresses currently holding admin rights.
 - Owner / super-admin: the address permitted to add or remove admins.
+- Admin audit log: an append-only, ordered log of sensitive admin operations, stored under a dedicated `admin_audit_log` storage key.
 
 (Exact storage keys are defined in `src/lib.rs`; this section is a summary, not a normative spec.)
 
@@ -61,11 +62,27 @@ Admin key rotation is performed by adding the new admin key and then removing th
 5. An admin action performed with the new key still succeeds.
 6. An admin action performed with the old key fails after removal.
 
+## Admin audit log
+
+Every sensitive admin operation (drain, upgrade, role changes such as `add_admin` / `remove_admin`) appends an entry to the on-chain audit log. Each entry records:
+
+- `op_type` — the kind of operation performed (e.g. `drain`, `upgrade`, `add_admin`, `remove_admin`).
+- `actor` — the address that authorized the operation.
+- `timestamp` — ledger timestamp at the time the entry was appended.
+- `params` — operation-specific parameters (e.g. target address, amount, new wasm hash).
+
+Entries are append-only and ordered by insertion, so the log can be replayed to reconstruct the history of privileged actions.
+
+### Querying
+
+- `get_audit_log(limit, cursor)` — returns a page of audit entries plus a `next_cursor`. Pass `cursor = None` to start from the beginning; pass the returned `next_cursor` to fetch the following page. When `next_cursor` is `None`, the end of the log has been reached.
+
 ## Known limitations
 
 - Admin membership is stored on-chain only; there is no built-in expiry or timelock. Pair with `admin_timelock` if delayed execution is required.
 - Revoking an admin does not retroactively cancel actions already authorized by that admin.
 - No pagination helper for enumerating admins; large admin sets may be expensive to read off-chain.
+- The audit log grows unbounded; consumers should page through it with `get_audit_log` rather than reading it in full.
 
 ## Cross-references
 
