@@ -9,6 +9,7 @@ use soroban_sdk::{
 use crate::{
     FeeDistributorContract, FeeDistributorContractClient, FeeRecipient, PendingRecipientUpdate,
 };
+use soroban_sdk::{IntoVal, Symbol, Val};
 
 struct Setup<'a> {
     env: Env,
@@ -127,7 +128,7 @@ fn test_single_recipient_receives_full_amount() {
 // ── constructor validation ───────────────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "recipient shares must total 10000 bps")]
+#[should_panic(expected = "Error(Contract, #2)")]
 fn test_constructor_rejects_invalid_share_total() {
     let env = Env::default();
     let recipients = vec![
@@ -298,4 +299,175 @@ fn test_allowed_caller_rotation_and_admin_rotation() {
 fn test_zero_amount_rejected() {
     let s = default_setup();
     s.client.distribute(&s.caller, &0);
+}
+
+// ── recipient allowlist ──────────────────────────────────────────────────────
+
+#[test]
+fn test_initial_recipients_are_allowlisted() {
+    let s = default_setup();
+    assert!(s.client.is_allowed_recipient(&s.treasury));
+    assert!(s.client.is_allowed_recipient(&s.lp));
+    assert!(!s.client.is_allowed_recipient(&Address::generate(&s.env)));
+}
+
+#[test]
+fn test_distribute_fails_for_recipient_not_on_allowlist() {
+    let s = default_setup();
+    s.client.remove_allowed_recipient(&s.admin, &s.lp);
+    assert!(s.client.try_distribute(&s.caller, &10_000).is_err());
+    assert_eq!(s.token.balance(&s.treasury), 0);
+
+    s.client.add_allowed_recipient(&s.admin, &s.lp);
+    s.client.distribute(&s.caller, &10_000);
+    assert_eq!(s.token.balance(&s.lp), 5_000);
+}
+
+#[test]
+fn test_distribute_after_update_requires_new_recipient_allowlisted() {
+    let s = default_setup();
+    let replacement = Address::generate(&s.env);
+    let pending = schedule_update(
+        &s,
+        vec![
+            &s.env,
+            FeeRecipient {
+                address: replacement.clone(),
+                share_bps: 10_000,
+            },
+        ],
+    );
+    s.env.ledger().set_sequence_number(pending.execute_after);
+    s.client.apply_recipients(&s.admin);
+    assert!(s.client.try_distribute(&s.caller, &10_000).is_err());
+
+    s.client.add_allowed_recipient(&s.admin, &replacement);
+    s.client.distribute(&s.caller, &10_000);
+    assert_eq!(s.token.balance(&replacement), 10_000);
+}
+
+#[test]
+fn test_non_admin_cannot_manage_allowlist() {
+    let s = default_setup();
+    let stranger = Address::generate(&s.env);
+    assert!(s
+        .client
+        .try_add_allowed_recipient(&stranger, &Address::generate(&s.env))
+        .is_err());
+    assert!(s
+        .client
+        .try_remove_allowed_recipient(&stranger, &s.lp)
+        .is_err());
+}
+
+// ── per-recipient events ─────────────────────────────────────────────────────
+
+#[test]
+fn test_distribute_emits_fee_distributed_event_per_recipient() {
+    let s = default_setup();
+    s.client.distribute_for_payment(&s.caller, &10_000, &42);
+
+    let topic: soroban_sdk::Vec<Val> = vec![
+        &s.env,
+        Symbol::new(&s.env, "FEE_DISTRIBUTOR").into_val(&s.env),
+        Symbol::new(&s.env, "FeeDistributed").into_val(&s.env),
+    ];
+    let per_recipient = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|(contract, topics, _)| *contract == s.contract_id && *topics == topic)
+        .count();
+    assert_eq!(per_recipient, 2);
+}
+
+// ── share sum validation ─────────────────────────────────────────────────────
+
+#[test]
+fn test_schedule_rejects_shares_not_summing_to_10000_bps() {
+    let s = default_setup();
+    let under = vec![
+        &s.env,
+        FeeRecipient {
+            address: Address::generate(&s.env),
+            share_bps: 9_999,
+        },
+    ];
+    let over = vec![
+        &s.env,
+        FeeRecipient {
+            address: Address::generate(&s.env),
+            share_bps: 6_000,
+        },
+        FeeRecipient {
+            address: Address::generate(&s.env),
+            share_bps: 4_001,
+        },
+    ];
+    assert_eq!(
+        s.client.try_schedule_recipients(&s.admin, &under),
+        Err(Ok(crate::Error::SharesMustSum100Percent))
+    );
+    assert_eq!(
+        s.client.try_schedule_recipients(&s.admin, &over),
+        Err(Ok(crate::Error::SharesMustSum100Percent))
+    );
+    assert!(s.client.get_pending_recipients().is_none());
+}
+
+// ── recipient cap ────────────────────────────────────────────────────────────
+
+fn equal_recipients(env: &Env, count: u32) -> soroban_sdk::Vec<FeeRecipient> {
+    let mut recipients = soroban_sdk::Vec::new(env);
+    for index in 0..count {
+        let base = 10_000 / count;
+        recipients.push_back(FeeRecipient {
+            address: Address::generate(env),
+            share_bps: if index + 1 == count {
+                10_000 - base * (count - 1)
+            } else {
+                base
+            },
+        });
+    }
+    recipients
+}
+
+#[test]
+fn test_ten_recipients_distribute_successfully() {
+    let s = setup(&[1_000; 10]);
+    assert_eq!(s.client.get_max_recipients(), 10);
+    s.client.distribute(&s.caller, &100_000);
+    assert_eq!(s.token.balance(&s.contract_id), 0);
+    assert_eq!(s.token.balance(&s.treasury), 10_000);
+}
+
+#[test]
+fn test_schedule_rejects_more_than_default_cap() {
+    let s = default_setup();
+    let eleven = equal_recipients(&s.env, 11);
+    assert_eq!(
+        s.client.try_schedule_recipients(&s.admin, &eleven),
+        Err(Ok(crate::Error::TooManyRecipients))
+    );
+}
+
+#[test]
+fn test_admin_can_adjust_recipient_cap() {
+    let s = default_setup();
+    s.client.set_max_recipients(&s.admin, &2);
+    assert_eq!(s.client.get_max_recipients(), 2);
+    let three = equal_recipients(&s.env, 3);
+    assert_eq!(
+        s.client.try_schedule_recipients(&s.admin, &three),
+        Err(Ok(crate::Error::TooManyRecipients))
+    );
+    s.client.set_max_recipients(&s.admin, &12);
+    s.client
+        .schedule_recipients(&s.admin, &equal_recipients(&s.env, 11));
+    assert!(s
+        .client
+        .try_set_max_recipients(&Address::generate(&s.env), &5)
+        .is_err());
 }

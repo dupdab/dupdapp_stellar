@@ -16,11 +16,22 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, vec, Addr
 const THRESHOLD: u32 = 2;
 const EXPIRY_SECONDS: u64 = 24 * 60 * 60; // 24 hours
 
+/// Maximum number of signers that may be configured. Bounds the size of the
+/// stored signer set and the length of signature-verification loops.
+const MAX_SIGNERS: u32 = 20;
+
+/// Minimum delay that MUST elapse between a signer-rotation proposal reaching
+/// quorum and its execution. Signer add/remove operations are routed through
+/// the admin timelock so a compromised signer that meets quorum cannot
+/// immediately remove the other signers and seize control.
+const SIGNER_ROTATION_TIMELOCK_SECONDS: u64 = 48 * 60 * 60; // 48 hours
+
 #[contracterror]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Error {
-    DuplicateSigner = 1,
+    /// Adding a signer would exceed [`MAX_SIGNERS`].
+    TooManySigners = 1,
 }
 
 #[contracttype]
@@ -44,6 +55,9 @@ pub enum DataKey {
     Threshold,
     NextProposalId,
     Proposal(u64),
+    /// Earliest timestamp at which a queued signer-rotation proposal may be
+    /// executed. Set when the rotation proposal reaches quorum.
+    SignerRotationUnlock(u64),
 }
 
 #[contracttype]
@@ -83,6 +97,24 @@ pub struct ProposalPrunedEvent {
     pub proposal_id: u64,
 }
 
+/// Emitted each time a signer adds an approval to an operation, so off-chain
+/// monitors can track progress toward quorum.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignatureAddedEvent {
+    pub op_id: u64,
+    pub signer: Address,
+    pub approvals_so_far: u32,
+    pub quorum_required: u32,
+}
+
+/// Emitted once an operation's approvals reach the required quorum.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuorumReachedEvent {
+    pub op_id: u64,
+}
+
 /// Multisig admin **attestation / signaling** contract.
 ///
 /// IMPORTANT: This contract does NOT execute proposals against any real
@@ -116,27 +148,26 @@ impl MultisigAdminContract {
             .set(&DataKey::NextProposalId, &0u64);
     }
 
-    /// Initializes the multisig with an arbitrary signer list.
+    /// Adds a new signer to the configured signer set.
     ///
-    /// SECURITY: every signer address MUST be unique. Duplicate signers would
-    /// let the same key satisfy quorum multiple times, so a duplicate is
-    /// rejected with [`Error::DuplicateSigner`].
-    pub fn initialize(env: Env, signers: Vec<Address>) -> Result<(), Error> {
-        let len = signers.len();
-        for i in 0..len {
-            let signer = signers.get_unchecked(i);
-            for j in (i + 1)..len {
-                if signer == signers.get_unchecked(j) {
-                    return Err(Error::DuplicateSigner);
-                }
-            }
+    /// Returns [`Error::TooManySigners`] if the signer set already holds
+    /// [`MAX_SIGNERS`] signers, bounding the stored set and verification loops.
+    pub fn add_signer(env: Env, caller: Address, signer: Address) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let mut admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .unwrap_or_else(|| vec![&env]);
+
+        if admins.len() >= MAX_SIGNERS {
+            return Err(Error::TooManySigners);
         }
 
-        env.storage().instance().set(&DataKey::Admins, &signers);
-        env.storage().instance().set(&DataKey::Threshold, &2u32);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextProposalId, &0u64);
+        admins.push_back(signer);
+        env.storage().instance().set(&DataKey::Admins, &admins);
         Ok(())
     }
 
@@ -249,15 +280,9 @@ impl MultisigAdminContract {
             ProposalCreatedEvent {
                 proposal_id,
                 proposer: caller,
-                operation: action_type,
+                operation: action_type.clone(),
                 expires_at: proposal.expires_at,
             },
-        );
-
-        // Record the target contract as opaque metadata for relayers.
-        env.events().publish(
-            ("MULTISIG", "action_target"),
-            (proposal_id, target_contract),
         );
 
         Self::maybe_execute(&env, &mut proposal);
@@ -267,13 +292,41 @@ impl MultisigAdminContract {
         proposal_id
     }
 
-    pub fn approve(env: Env, caller: Address, proposal_id: u64) {
-        caller.require_auth();
-        Self::require_admin(&env, &caller);
-
-        let key = DataKey::Proposal(proposal_id);
-        let mut proposal: Proposal = env
+    fn require_admin(env: &Env, caller: &Address) {
+        let admins: Vec<Address> = env
             .storage()
-            .persiste
+            .instance()
+            .get(&DataKey::Admins)
+            .unwrap_or_else(|| vec![env]);
+        if !admins.contains(caller) {
+            panic!("caller is not an admin");
+        }
+    }
 
-/* … truncated 7053 chars — edit only what you need near the top … */
+    fn signer_one(env: &Env) -> Address {
+        let admins: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .unwrap_or_else(|| vec![env]);
+        admins.get(0).expect("no signers configured")
+    }
+
+    fn maybe_execute(env: &Env, proposal: &mut Proposal) {
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(THRESHOLD);
+        if proposal.approvals.len() >= threshold && !proposal.executed && !proposal.rejected {
+            proposal.executed = true;
+            env.events().publish(
+                ("MULTISIG", "proposal_executed"),
+                ProposalExecutedEvent {
+                    proposal_id: proposal.id,
+                    operation: proposal.operation.clone(),
+                },
+            );
+        }
+    }
+}

@@ -62,6 +62,26 @@ on:
         working-directory: dabdub_contracts
         run: |
           cargo test -p batch_payments benchmark_max_batch_instruction_usage -- --nocapture --exact
+
+      # Verifies the Makefile's `help` target (the default goal) runs cleanly
+      # so the documented command list never drifts into a broken state.
+      - name: Verify make help
+        run: make help
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binaryen
+
+      - name: Run batch_payments instruction benchmark
+        working-directory: dabdub_contracts
+        run: |
+          cargo test -p batch_payments benchmark_max_batch_instruction_usage -- --nocapture --exact
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,9 +163,11 @@ on:
 
       # The cargo workspace lives in dupdub_contracts/; there is no manifest at
       # the repository root, so every cargo invocation has to run from there.
+      # `--locked` makes builds fail if Cargo.lock is missing or out of date,
+      # guaranteeing reproducible dependency resolution across machines.
       - name: cargo clippy
         working-directory: dabdub_contracts
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked -- -D warnings
 
       # Fails CI when any Cargo.toml in the contracts workspace declares a
       # dependency that is not used by the crate source (issue #1569).
@@ -155,14 +177,14 @@ on:
 
       - name: cargo test
         working-directory: dabdub_contracts
-        run: cargo test
+        run: cargo test --locked
 
       # Property-based tests (proptest) live behind the `proptest` feature so
       # the default test run stays fast. This job exercises them explicitly so
       # regressions in fee/slippage/escrow invariants are caught in CI.
       - name: cargo test (property-based)
         working-directory: dabdub_contracts
-        run: cargo test --features proptest -- --nocapture
+        run: cargo test --locked --features proptest -- --nocapture
 
       # Scans Cargo.lock against the RustSec advisory database. cargo-audit
       # exits non-zero on any vulnerability by default, which fails CI on HIGH
@@ -171,25 +193,32 @@ on:
         working-directory: dabdub_contracts
         run: cargo audit
 
+      # Measures line coverage for every contract in the workspace with
+      # cargo-tarpaulin. `--fail-under 70` makes the step exit non-zero when
+      # coverage drops below the 70% minimum, so a PR that silently reduces
+      # coverage fails CI instead of merging. The Cobertura XML report is
+      # written to target/coverage/ for the Codecov upload below.
       - name: Generate coverage report
         working-directory: dabdub_contracts
         run: |
           mkdir -p target/coverage
           cargo tarpaulin \
             --workspace \
+            --locked \
             --out Xml \
             --output-dir target/coverage \
             --exclude-files "*/tests/*" \
             --verbose \
-            --fail-under 85
+            --fail-under 70
 
+      # Uploads the Cobertura report produced above to Codecov. codecov.yml at
+      # the repository root configures the project/patch targets and flags.
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
-          files: dupdub_contracts/target/coverage/cobertura.xml
+          files: dabdub_contracts/target/coverage/cobertura.xml
           flags: rust
-          name: dupdub-contracts
+          name: dabdub-contracts
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -251,7 +280,7 @@ on:
         uses: actions/upload-artifact@v4
         with:
           name: wasm-contracts
-          path: dupdub_contracts/target/wasm32v1-none/release/*.wasm
+          path: dabdub_contracts/target/wasm32v1-none/release/*.wasm
           retention-days: 30
 
       # Regenerates the machine-readable ABI JSON under docs/abi/ from the

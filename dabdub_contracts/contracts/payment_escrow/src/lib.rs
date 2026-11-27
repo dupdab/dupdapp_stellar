@@ -123,6 +123,11 @@ pub enum DataKey {
     LargeReleaseThreshold,
     Payment(BytesN<32>),
     Version,
+    /// Per-asset-type maximum single-payment amount in stroops (issue #1498).
+    MaxPaymentAmount(AssetType),
+    /// Reentrancy guard flag (issue #1494). Set to `true` while a guarded
+    /// function is executing; any reentrant call will panic.
+    Reentrancy,
     MaxDisputeWindowLedgers,
     MaxTtlLedgers,
 }
@@ -140,6 +145,16 @@ struct DepositEvent {
 struct EscrowStateEvent {
     payment_id: BytesN<32>,
     amount: i128,
+}
+
+/// Emitted when a payment transitions to Expired status (issue #1496).
+/// The backend indexer listens for this event to transition the payment
+/// to EXPIRED status without polling.
+#[contracttype]
+pub struct PaymentExpiredEvent {
+    pub payment_id: BytesN<32>,
+    pub merchant_id: Address,
+    pub amount: i128,
 }
 
 #[contracttype]
@@ -245,6 +260,9 @@ impl PaymentEscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::EmergencyLastDrainLedger, &0u32);
+
+        // Initialize reentrancy guard to false.
+        env.storage().instance().set(&DataKey::Reentrancy, &false);
 
         // Initialize the upgrade timelock delay to a safe default.
         env.storage()
@@ -520,6 +538,26 @@ impl PaymentEscrowContract {
         env.storage().instance().get(&DataKey::RegistryContract)
     }
 
+    /// Set or clear the maximum payment amount for an asset type (issue #1498). Admin-only.
+    pub fn set_max_payment_amount(env: Env, caller: Address, asset_type: AssetType, max_amount: Option<i128>) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+        let key = DataKey::MaxPaymentAmount(asset_type);
+        match max_amount {
+            Some(limit) => {
+                if limit <= 0 {
+                    panic!("Max payment amount must be > 0");
+                }
+                env.storage().instance().set(&key, &limit);
+            }
+            None => { env.storage().instance().remove(&key); }
+        }
+    }
+
+    pub fn get_max_payment_amount(env: Env, asset_type: AssetType) -> Option<i128> {
+        env.storage().instance().get(&DataKey::MaxPaymentAmount(asset_type))
+    }
+
     pub fn deposit(
         env: Env,
         customer: Address,
@@ -529,10 +567,20 @@ impl PaymentEscrowContract {
         ttl_ledgers: u32,
         asset_type: AssetType,
     ) -> Result<BytesN<32>, ContractError> {
+        // Reentrancy guard (issue #1494): prevent reentrant calls via a
+        // malicious or compromised token contract.
+        Self::enter_reentrancy_guard(&env);
+
         customer.require_auth();
 
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
+        }
+        // Enforce per-asset maximum payment amount (issue #1498).
+        if let Some(max) = env.storage().instance().get::<DataKey, i128>(&DataKey::MaxPaymentAmount(asset_type.clone())) {
+            if amount > max {
+                panic!("Amount exceeds maximum allowed payment amount");
+            }
         }
         if ttl_ledgers == 0 {
             return Err(ContractError::InvalidTtl);
@@ -626,11 +674,22 @@ impl PaymentEscrowContract {
         Ok(payment_id)
     }
 
+    /// Release the full remaining escrow balance to the merchant.
+    ///
+    /// The caller must be the admin OR the payment's own merchant (issue #1497).
+    /// A merchant can only release their own payments; calling release on a
+    /// payment belonging to a different merchant panics with "Unauthorized".
     pub fn release(env: Env, caller: Address, payment_id: BytesN<32>) -> Result<(), ContractError> {
+        // Reentrancy guard (issue #1494).
+        Self::enter_reentrancy_guard(&env);
+
         caller.require_auth();
-        Self::require_admin(&env, &caller)?;
 
         let mut payment = Self::get_payment(env.clone(), payment_id.clone())?;
+
+        // Issue #1497: verify the caller is the admin or the payment's own merchant.
+        Self::require_admin_or_payment_merchant(&env, &caller, &payment);
+
         Self::require_releasable(&env, &payment)?;
 
         let remaining = Self::remaining_amount(&payment);
@@ -656,6 +715,9 @@ impl PaymentEscrowContract {
                 amount: remaining,
             },
         );
+
+        Self::exit_reentrancy_guard(&env);
+
         Ok(())
     }
 
@@ -696,6 +758,11 @@ impl PaymentEscrowContract {
         Ok(())
     }
 
+    /// Expire a payment that has passed its TTL and refund the customer.
+    ///
+    /// Emits `PaymentExpired { payment_id, merchant_id, amount }` so the
+    /// backend indexer can transition the payment to EXPIRED status on-chain
+    /// without polling (issue #1496).
     pub fn expire(env: Env, payment_id: BytesN<32>) -> Result<(), ContractError> {
         let mut payment = Self::get_payment(env.clone(), payment_id.clone())?;
         Self::require_expirable(&env, &payment)?;
@@ -714,6 +781,18 @@ impl PaymentEscrowContract {
             .persistent()
             .extend_ttl(&expire_key, MAX_TTL_LEDGERS, MAX_TTL_LEDGERS);
 
+        // Issue #1496: emit a PaymentExpired event so the backend indexer can
+        // detect expired escrows without polling.
+        env.events().publish(
+            ("ESCROW", "PaymentExpired"),
+            PaymentExpiredEvent {
+                payment_id: payment_id.clone(),
+                merchant_id: payment.merchant.clone(),
+                amount: remaining,
+            },
+        );
+
+        // Also emit the legacy event for backward-compatible indexers.
         env.events().publish(
             ("ESCROW", "expired"),
             EscrowStateEvent {
@@ -971,6 +1050,38 @@ impl PaymentEscrowContract {
         }
     }
 
+    /// Allow the merchant to cancel a Pending escrow and return funds to the
+    /// customer before release (issue #1500).  Only callable on a `Pending`
+    /// payment that has not yet expired; the full remaining balance is
+    /// transferred back to the customer.
+    pub fn cancel(env: Env, caller: Address, payment_id: BytesN<32>) {
+        caller.require_auth();
+
+        let mut payment = Self::get_payment(env.clone(), payment_id.clone());
+        if caller != payment.merchant {
+            panic!("Only the merchant can cancel");
+        }
+        if payment.status != PaymentStatus::Pending {
+            panic!("Payment is not pending");
+        }
+
+        let remaining = Self::remaining_amount(&payment);
+        if remaining > 0 {
+            Self::transfer_from_contract(&env, &payment.customer, remaining, &payment.asset_type);
+        }
+
+        payment.released_amount = payment.amount;
+        payment.status = PaymentStatus::Expired;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
+
+        env.events().publish(
+            ("ESCROW", "cancel"),
+            EscrowStateEvent { payment_id, amount: remaining },
+        );
+    }
+
     pub fn get_payment(env: Env, payment_id: BytesN<32>) -> PaymentEscrow {
         let key = DataKey::Payment(payment_id);
         let payment: PaymentEscrow = env
@@ -1099,7 +1210,15 @@ impl PaymentEscrowContract {
         Ok(amount)
     }
 
+    // ── Private helpers ───────────────────────────────────────────────────────
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), ContractError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != &admin {
+            return Err(ContractError::NotAdmin);
+        }
+        Ok(())
+    }
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if caller != &admin {
             return Err(ContractError::NotAdmin);
@@ -1127,6 +1246,38 @@ impl PaymentEscrowContract {
         if multisig.get_threshold() < 2 {
             panic!("Large payout requires 2-of-3 quorum");
         }
+    }
+
+    /// Allow caller if they are the admin OR the payment's own merchant.
+    /// This prevents one merchant from releasing another merchant's escrow
+    /// (issue #1497).
+    fn require_admin_or_payment_merchant(env: &Env, caller: &Address, payment: &PaymentEscrow) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller == &admin {
+            return;
+        }
+        if caller == &payment.merchant {
+            return;
+        }
+        panic!("Unauthorized: caller is not the admin or the payment's merchant");
+    }
+
+    /// Set the reentrancy guard. Panics if the guard is already held (issue #1494).
+    fn enter_reentrancy_guard(env: &Env) {
+        let locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Reentrancy)
+            .unwrap_or(false);
+        if locked {
+            panic!("Reentrant call detected");
+        }
+        env.storage().instance().set(&DataKey::Reentrancy, &true);
+    }
+
+    /// Release the reentrancy guard (issue #1494).
+    fn exit_reentrancy_guard(env: &Env) {
+        env.storage().instance().set(&DataKey::Reentrancy, &false);
     }
 
     fn require_releasable(env: &Env, payment: &PaymentEscrow) -> Result<(), ContractError> {
